@@ -7,9 +7,16 @@ const { getContextMemory } = require('./database');
 
 const DEFAULT_OLLAMA_URL =
   process.env.OLLAMA_URL || 'http://localhost:11434/api/generate';
-const DEFAULT_OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'llama3.3:70b';
+const DEFAULT_OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'deepseek-r1:32b';
+const DEFAULT_OLLAMA_TIMEOUT_MS = Number(process.env.OLLAMA_TIMEOUT_MS || 45_000);
+const MORNING_BRIEFING_MODEL =
+  process.env.MORNING_BRIEFING_MODEL || 'gpt-oss:20b';
+const LEAD_QUALIFIER_MODEL =
+  process.env.LEAD_QUALIFIER_MODEL || 'gpt-oss:20b';
 
 const SKILLS_DIR = path.join(__dirname, '..', 'skills');
+const MEMORY_DIR = path.join(__dirname, '..', 'memory');
+const AGENT_INSIGHTS_PATH = path.join(MEMORY_DIR, 'agent_insights.md');
 const HIGH_VALUE_PATTERNS = [
   /\bprice\b/i,
   /\bpricing\b/i,
@@ -35,13 +42,39 @@ async function loadSkill(skillName) {
   const filePath = path.join(SKILLS_DIR, `${normalizedSkill}.md`);
   const content = await fs.readFile(filePath, 'utf8');
   const phases = extractPhasesFromSkill(content);
+  const manualFallbacks = extractManualFallbacks(content);
 
   return {
     id: normalizedSkill,
     filePath,
     content,
     phases,
+    manualFallbacks,
   };
+}
+
+async function ensureMemoryFile() {
+  await fs.mkdir(MEMORY_DIR, { recursive: true });
+
+  try {
+    await fs.access(AGENT_INSIGHTS_PATH);
+  } catch (_error) {
+    await fs.writeFile(
+      AGENT_INSIGHTS_PATH,
+      '# Agent Insights\n\nLearnings from successful Facebook lead interactions.\n',
+      'utf8'
+    );
+  }
+}
+
+async function readAgentInsights() {
+  await ensureMemoryFile();
+  return fs.readFile(AGENT_INSIGHTS_PATH, 'utf8');
+}
+
+async function appendAgentInsights(entry) {
+  await ensureMemoryFile();
+  await fs.appendFile(AGENT_INSIGHTS_PATH, `${entry}\n`, 'utf8');
 }
 
 function extractPhasesFromSkill(content) {
@@ -57,6 +90,20 @@ function extractPhasesFromSkill(content) {
   }
 
   return phases;
+}
+
+function extractManualFallbacks(content) {
+  const fallbackRegex = /- Q:\s*"([^"]+)"\s*\n\s*- A:\s*"([^"]+)"/g;
+  const manualFallbacks = [];
+
+  for (const match of content.matchAll(fallbackRegex)) {
+    manualFallbacks.push({
+      question: match[1].trim(),
+      answer: match[2].trim(),
+    });
+  }
+
+  return manualFallbacks;
 }
 
 async function resolveSkillForTask(task = {}) {
@@ -82,20 +129,29 @@ async function resolveSkillForTask(task = {}) {
 }
 
 async function callOllama(prompt, options = {}) {
-  const response = await fetch(options.url || DEFAULT_OLLAMA_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      model: options.model || DEFAULT_OLLAMA_MODEL,
-      prompt,
-      stream: false,
-      options: options.generationOptions || {
-        temperature: 0.3,
+  let response;
+
+  try {
+    response = await fetch(options.url || DEFAULT_OLLAMA_URL, {
+      method: 'POST',
+      signal: AbortSignal.timeout(options.timeoutMs || DEFAULT_OLLAMA_TIMEOUT_MS),
+      headers: {
+        'Content-Type': 'application/json',
       },
-    }),
-  });
+      body: JSON.stringify({
+        model: options.model || DEFAULT_OLLAMA_MODEL,
+        prompt,
+        stream: false,
+        options: options.generationOptions || {
+          temperature: 0.1,
+          num_ctx: 2048,
+        },
+      }),
+    });
+  } catch (error) {
+    const reason = error?.cause?.code || error?.name || error?.message || 'unknown_error';
+    throw new Error(`Ollama request failed before response (${reason}).`);
+  }
 
   if (!response.ok) {
     const errorText = await response.text();
@@ -184,33 +240,71 @@ async function getThreadState(threadId) {
 }
 
 async function scorePostAgainstSkill(post, skill, options = {}) {
+  const insights = await readAgentInsights();
   const prompt = [
-    'You are scoring a Facebook post for business relevance.',
-    'Return only a single integer from 0 to 10.',
+    `Analyze this Amazon Seller post: '${post.content || ''}'.`,
+    'Goal: Identify if the seller is losing money or facing financial distress.',
+    'Check for:',
+    '1. Lost/Damaged Inventory (Missing shipments, warehouse losses).',
+    '2. Fee Discrepancies (High FBA/Referral fees, overcharging).',
+    '3. Low Profit/Margins (High sales but low take-home pay).',
+    '4. Settlement/Payout Issues (Negative balance, payment mismatch).',
+    '5. Seeking Recovery/Audit help.',
     '',
-    'Skill instructions:',
-    skill.content,
+    'Read agent_insights.md and apply previous successful tones to this new interaction.',
+    insights,
     '',
-    `Post author: ${post.author || 'Unknown'}`,
-    `Group: ${post.group || 'Unknown'}`,
-    'Post content:',
-    post.content || '',
+    "Output ONLY JSON: {'is_lead': boolean, 'confidence': 1-10, 'category': 'string', 'reason': 'string'}.",
   ].join('\n');
 
-  const raw = await callOllama(prompt, {
-    ...options,
-    generationOptions: {
-      temperature: 0,
-      num_predict: 8,
-      ...options.generationOptions,
-    },
-  });
+  let raw = '';
 
-  const score = Math.max(0, Math.min(10, extractScore(raw)));
+  try {
+    raw = await callOllama(prompt, {
+      ...options,
+      model: LEAD_QUALIFIER_MODEL,
+      timeoutMs: options.timeoutMs || 30_000,
+      generationOptions: {
+        temperature: 0.1,
+        num_ctx: 2048,
+        num_predict: 160,
+        ...options.generationOptions,
+      },
+    });
+  } catch (_error) {
+    return {
+      score: 0,
+      raw: '',
+      shouldInteract: false,
+      is_lead: false,
+      confidence: 0,
+      category: 'unknown',
+      reason: 'AI request failed or timed out.',
+    };
+  }
+
+  const jsonMatch = raw.match(/\{[\s\S]*\}/);
+  let parsed = null;
+
+  try {
+    parsed = jsonMatch ? JSON.parse(jsonMatch[0].replace(/'/g, '"')) : null;
+  } catch (_error) {
+    parsed = null;
+  }
+
+  const confidence = Math.max(
+    0,
+    Math.min(10, Number(parsed?.confidence || extractScore(raw) || 0))
+  );
+
   return {
-    score,
+    score: confidence,
     raw,
-    shouldInteract: score > 7,
+    shouldInteract: Boolean(parsed?.is_lead) && confidence >= 7,
+    is_lead: Boolean(parsed?.is_lead),
+    confidence,
+    category: parsed?.category || 'unknown',
+    reason: parsed?.reason || '',
   };
 }
 
@@ -222,6 +316,7 @@ async function draftReply({
   threadId = null,
   phaseOverride = null,
 }, options = {}) {
+  const insights = await readAgentInsights();
   const threadState = threadId ? await getThreadState(threadId) : {
     context: null,
     threadHistory: [],
@@ -249,6 +344,9 @@ async function draftReply({
     '',
     'Skill instructions:',
     skill.content,
+    '',
+    'Agent insights:',
+    insights,
     '',
     'Thread history:',
     threadState.threadHistory.length
@@ -321,19 +419,27 @@ async function summarizeDiscussion({
 }
 
 module.exports = {
+  AGENT_INSIGHTS_PATH,
   DEFAULT_OLLAMA_MODEL,
+  DEFAULT_OLLAMA_TIMEOUT_MS,
   DEFAULT_OLLAMA_URL,
+  LEAD_QUALIFIER_MODEL,
+  MORNING_BRIEFING_MODEL,
   SKILLS_DIR,
+  appendAgentInsights,
   callOllama,
   determineNextPhase,
   detectHighValueLead,
   draftReply,
+  ensureMemoryFile,
   emitHighValueLeadAlert,
+  extractManualFallbacks,
   extractPhasesFromSkill,
   getThreadState,
   inferPhaseFromUserReply,
   listAvailableSkills,
   loadSkill,
+  readAgentInsights,
   resolveSkillForTask,
   scorePostAgainstSkill,
   summarizeDiscussion,

@@ -13,6 +13,11 @@ const DEFAULT_TASK_INPUT_PATH = path.join(__dirname, '..', 'task_input.json');
 const DEFAULT_USER_DATA_DIR = path.join(__dirname, '..', 'user_data');
 const DEFAULT_HUMAN_JITTER_MIN_MS = Number(process.env.HUMAN_JITTER_MIN_MS || 30_000);
 const DEFAULT_HUMAN_JITTER_MAX_MS = Number(process.env.HUMAN_JITTER_MAX_MS || 120_000);
+const DEFAULT_JOIN_EMAIL =
+  process.env.JOIN_CONTACT_EMAIL || 'nandmonlinellc@gmail.com';
+const DEFAULT_WHATSAPP_NUMBER =
+  process.env.JOIN_WHATSAPP_NUMBER || '8032950456';
+const DEFAULT_LOCATION = process.env.JOIN_LOCATION || 'USA';
 
 function randomBetween(min, max) {
   return Math.floor(Math.random() * (max - min + 1)) + min;
@@ -189,6 +194,7 @@ async function ensureLoggedIn(page, options = {}) {
       );
       const loginTimeout = options.loginTimeout || 10 * 60 * 1000;
       const startTime = Date.now();
+      let securityAlertShown = false;
 
       while (Date.now() - startTime < loginTimeout) {
         await page.waitForTimeout(2_000);
@@ -198,9 +204,19 @@ async function ensureLoggedIn(page, options = {}) {
           (cookie) => cookie.name === 'c_user' || cookie.name === 'xs'
         );
         const currentUrl = page.url();
+        const checkpointVisible =
+          /checkpoint/i.test(currentUrl) ||
+          (await page.getByText(/6-digit code|security code|enter code|checkpoint/i).count()) > 0;
         const stillOnLoginPage =
           /login|checkpoint|recover|device-based/i.test(currentUrl) ||
           (await page.locator('input[name="email"], input[name="pass"]').count()) > 0;
+
+        if (checkpointVisible && !securityAlertShown) {
+          console.log(
+            'ALERT: Facebook needs a security code. Please type it in the browser window now.'
+          );
+          securityAlertShown = true;
+        }
 
         if (hasSessionCookie && !stillOnLoginPage) {
           await page.waitForLoadState('domcontentloaded');
@@ -250,55 +266,150 @@ async function visitGroup(page, groupUrl) {
   return page.url();
 }
 
+async function inspectGroupMembershipStatus(page) {
+  const composerVisible = await isCreatePostComposerVisible(page);
+  if (composerVisible) {
+    return 'joined';
+  }
+
+  const pendingButton = page
+    .getByRole('button', { name: /pending|requested|cancel request/i })
+    .first();
+  if (await pendingButton.count()) {
+    return 'pending';
+  }
+
+  const joinButton = page
+    .getByRole('button', { name: /join group|join/i })
+    .first();
+  if (await joinButton.count()) {
+    return 'not_joined';
+  }
+
+  return 'joined';
+}
+
+async function isCreatePostComposerVisible(page) {
+  const composerCandidates = [
+    page.getByRole('button', { name: /write something|create post|what's on your mind/i }).first(),
+    page.locator('[aria-label*="Write something"]').first(),
+    page.locator('div[role="textbox"][contenteditable="true"]').first(),
+  ];
+
+  for (const candidate of composerCandidates) {
+    if (await candidate.count()) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+async function scrapeJoinApprovalNotifications(page, { limit = 10 } = {}) {
+  const notifications = await scrapeNotifications(page, { limit: 20 });
+  const approvals = [];
+
+  for (const notification of notifications) {
+    const match = notification.text.match(
+      /(?:approved|accepted)(?:\s+your)?\s+(?:request to join|join request(?:\s+for|\s+to)?)\s+(.+?)(?:\.|$)/i
+    );
+
+    if (!match) {
+      continue;
+    }
+
+    approvals.push({
+      groupName: match[1].trim(),
+      text: notification.text,
+      href: notification.href,
+    });
+
+    if (approvals.length >= limit) {
+      break;
+    }
+  }
+
+  return approvals;
+}
+
+async function waitForJoinDialogToSettle(page, joinDialog) {
+  for (let index = 0; index < 10; index += 1) {
+    const pending = await page
+      .getByRole('button', { name: /pending|requested|cancel request/i })
+      .count();
+    if (pending) {
+      return 'pending';
+    }
+
+    const visible = (await joinDialog.count()) && (await joinDialog.isVisible());
+    if (!visible) {
+      return 'closed';
+    }
+
+    await page.waitForTimeout(800);
+  }
+
+  return 'open';
+}
+
 async function scrapeNotifications(page, { limit = 5 } = {}) {
   await page.goto(`${FACEBOOK_BASE_URL}/notifications`, {
     waitUntil: 'domcontentloaded',
     timeout: 90_000,
   });
   await lightHumanPause(page, 1_500, 3_000);
+  await page.evaluate(() => {
+    window.scrollBy(0, 700);
+  });
+  await page.waitForTimeout(1200);
 
-  const links = page.locator('a[href*="/posts/"], a[href*="story_fbid="], a[role="link"]');
-  const count = Math.min(await links.count(), 40);
-  const notifications = [];
-  const seen = new Set();
+  const rawNotifications = await page.evaluate((baseUrl, maxItems) => {
+    const seen = new Set();
+    const results = [];
+    const linkNodes = Array.from(document.querySelectorAll('a[href], [role="link"]'));
 
-  for (let index = 0; index < count; index += 1) {
-    const link = links.nth(index);
-    let text = '';
-    let href = '';
+    for (const node of linkNodes) {
+      const href = node.getAttribute('href') || '';
+      const nearestCard = node.closest('[role="row"], li, div[data-visualcompletion], div[role="listitem"], div[aria-label]');
+      const text = (nearestCard?.innerText || node.innerText || '').trim().replace(/\s+/g, ' ');
 
-    try {
-      text = ((await link.innerText()) || '').trim();
-      href = (await link.getAttribute('href')) || '';
-    } catch (_error) {
-      continue;
+      if (!text || text.length < 5) {
+        continue;
+      }
+
+      if (!/approved|accepted|commented|replied|mentioned|reacted|liked|tagged|sent you a message|message/i.test(text)) {
+        continue;
+      }
+
+      const normalizedHref = href
+        ? (href.startsWith('http') ? href : `${baseUrl}${href}`)
+        : null;
+      const key = `${text}::${normalizedHref || 'none'}`;
+      if (seen.has(key)) {
+        continue;
+      }
+
+      seen.add(key);
+      results.push({
+        text,
+        href: normalizedHref,
+      });
+
+      if (results.length >= maxItems) {
+        break;
+      }
     }
 
-    if (!text || text.length < 5) {
-      continue;
-    }
+    return results;
+  }, FACEBOOK_BASE_URL, Math.max(limit * 3, 12));
 
-    const url = href
-      ? href.startsWith('http') ? href : `${FACEBOOK_BASE_URL}${href}`
-      : null;
-    const key = `${text}::${url || 'none'}`;
-    if (seen.has(key)) {
-      continue;
-    }
-
-    seen.add(key);
-    notifications.push({
-      text,
-      href: url,
-      postId: extractPostIdFromUrl(url || ''),
-    });
-
-    if (notifications.length >= limit) {
-      break;
-    }
-  }
-
-  return notifications;
+  return rawNotifications
+    .slice(0, limit)
+    .map((item) => ({
+      text: item.text,
+      href: item.href,
+      postId: extractPostIdFromUrl(item.href || ''),
+    }));
 }
 
 async function scrapeInboxPreviews(page, { limit = 3 } = {}) {
@@ -367,71 +478,344 @@ async function sendInboxReply(page, threadUrl, text) {
   return true;
 }
 
-async function answerJoinQuestionsInModal(page, joinDialog, answerJoinQuestions) {
-  const questionBlocks = joinDialog.locator('label, div[dir="auto"], span[dir="auto"], legend');
-  const textareas = joinDialog.locator('textarea, div[role="textbox"][contenteditable="true"]');
-  const radioGroups = joinDialog.locator('[role="radiogroup"], fieldset');
-  const questionTexts = [];
+async function scrapeJoinedGroups(page, { limit = 40 } = {}) {
+  await page.goto(`${FACEBOOK_BASE_URL}/groups/feed/`, {
+    waitUntil: 'domcontentloaded',
+    timeout: 90_000,
+  });
+  await lightHumanPause(page, 2_000, 4_000);
 
-  const questionCount = Math.min(await questionBlocks.count(), 30);
-  for (let index = 0; index < questionCount; index += 1) {
-    try {
-      const text = ((await questionBlocks.nth(index).innerText()) || '').trim();
-      if (text && text.length > 6) {
-        questionTexts.push(text);
-      }
-    } catch (_error) {
-      continue;
-    }
-  }
+  const results = [];
+  const seenUrls = new Set();
 
-  const joinQuestions = [...new Set(questionTexts)].slice(0, 8);
-  const structuredAnswers = await answerJoinQuestions(joinQuestions);
+  for (let round = 0; round < 4; round += 1) {
+    const links = page.locator('a[href*="/groups/"]');
+    const count = Math.min(await links.count(), 80);
 
-  const textareaCount = Math.min(await textareas.count(), structuredAnswers.answers.length);
-  for (let index = 0; index < textareaCount; index += 1) {
-    const field = textareas.nth(index);
-    await field.waitFor({ state: 'visible', timeout: 10_000 });
-    await field.click({ delay: randomBetween(50, 120) });
-    await page.keyboard.type(structuredAnswers.answers[index] || '', {
-      delay: randomBetween(25, 70),
-    });
-    await page.waitForTimeout(randomBetween(300, 900));
-  }
+    for (let index = 0; index < count; index += 1) {
+      const link = links.nth(index);
+      let href = '';
+      let name = '';
 
-  const radioCount = Math.min(await radioGroups.count(), structuredAnswers.optionHints.length);
-  for (let index = 0; index < radioCount; index += 1) {
-    const group = radioGroups.nth(index);
-    const options = group.locator('[role="radio"], input[type="radio"]');
-    const optionCount = await options.count();
-    if (!optionCount) {
-      continue;
-    }
-
-    const hint = (structuredAnswers.optionHints[index] || '').toLowerCase();
-    let selected = false;
-
-    for (let optionIndex = 0; optionIndex < optionCount; optionIndex += 1) {
-      const option = options.nth(optionIndex);
-      const optionContainer = option.locator('xpath=ancestor::*[@role="radio" or self::label or self::div][1]');
-      let optionText = '';
       try {
-        optionText = ((await optionContainer.innerText()) || '').trim().toLowerCase();
+        href = (await link.getAttribute('href')) || '';
+        name = ((await link.innerText()) || '').trim();
       } catch (_error) {
-        optionText = '';
+        continue;
       }
 
-      if (!hint || (optionText && optionText.includes(hint))) {
-        await optionContainer.click({ delay: randomBetween(40, 120) });
-        selected = true;
+      if (!href || !name) {
+        continue;
+      }
+
+      const url = href.startsWith('http') ? href : `${FACEBOOK_BASE_URL}${href}`;
+      const normalizedUrl = url.split('?')[0];
+
+      if (
+        seenUrls.has(normalizedUrl) ||
+        !isCanonicalGroupUrl(normalizedUrl) ||
+        !isLikelyGroupName(name)
+      ) {
+        continue;
+      }
+
+      seenUrls.add(normalizedUrl);
+      results.push({
+        name,
+        url: normalizedUrl,
+        id: extractGroupIdFromUrl(normalizedUrl),
+        status: 'joined',
+        source: 'groups_feed',
+      });
+
+      if (results.length >= limit) {
+        return results;
+      }
+    }
+
+    await page.mouse.wheel(0, 1200);
+    await page.waitForTimeout(1200);
+  }
+
+  return results;
+}
+
+function looksLikeEmailQuestion(text = '') {
+  return /\bemail\b|\be-mail\b|\bcontact email\b/.test(text.toLowerCase());
+}
+
+function looksLikeWhatsappQuestion(text = '') {
+  return /\bwhatsapp\b|\bphone number\b|\bmobile number\b|\bcontact number\b/.test(
+    text.toLowerCase()
+  );
+}
+
+function looksLikeLocationQuestion(text = '') {
+  return /\bwhere do you live\b|\blocation\b|\bwhere are you from\b|\bcountry\b|\bwhere are you based\b/.test(
+    text.toLowerCase()
+  );
+}
+
+function pickJoinAnswer(questionText, answers = [], index = 0) {
+  if (looksLikeEmailQuestion(questionText)) {
+    return DEFAULT_JOIN_EMAIL;
+  }
+
+  if (looksLikeWhatsappQuestion(questionText)) {
+    return DEFAULT_WHATSAPP_NUMBER;
+  }
+
+  if (looksLikeLocationQuestion(questionText)) {
+    return DEFAULT_LOCATION;
+  }
+
+  return answers[index]
+    || 'I work with Amazon sellers and would love to contribute and learn from the community.';
+}
+
+function pickCheckboxChoice(questionText) {
+  const text = questionText.toLowerCase();
+
+  if (
+    /follow the rules|agree to the rules|not spam|no spam|abide by/i.test(text)
+  ) {
+    return 'yes';
+  }
+
+  return '';
+}
+
+async function completeRemainingJoinChoices(page, joinDialog) {
+  const radioGroups = joinDialog.locator('[role="radiogroup"], fieldset');
+  const radioGroupCount = await radioGroups.count();
+
+  for (let index = 0; index < radioGroupCount; index += 1) {
+    const group = radioGroups.nth(index);
+    const checked = await group.locator('[aria-checked="true"], input[type="radio"]:checked').count();
+    if (checked) {
+      continue;
+    }
+
+    const options = group.locator('[role="radio"], input[type="radio"]');
+    if (await options.count()) {
+      const first = options.first();
+      const clickable = first.locator(
+        'xpath=ancestor::*[@role="radio" or self::label or self::div][1]'
+      );
+      if (await clickable.count()) {
+        await clickable.click({ delay: randomBetween(40, 120) });
+      } else {
+        await first.click({ delay: randomBetween(40, 120) });
+      }
+      await page.waitForTimeout(300);
+    }
+  }
+
+  const checkboxes = joinDialog.locator('input[type="checkbox"], [role="checkbox"]');
+  const checkboxCount = await checkboxes.count();
+
+  for (let index = 0; index < checkboxCount; index += 1) {
+    const checkbox = checkboxes.nth(index);
+    const ariaChecked = await checkbox.getAttribute('aria-checked').catch(() => null);
+    const isChecked = ariaChecked === 'true'
+      || await checkbox.evaluate((element) => Boolean(element.checked)).catch(() => false);
+
+    if (isChecked) {
+      continue;
+    }
+
+    const clickable = checkbox.locator(
+      'xpath=ancestor::*[@role="checkbox" or self::label or self::div][1]'
+    );
+    if (await clickable.count()) {
+      await clickable.click({ delay: randomBetween(40, 120) });
+    } else {
+      await checkbox.click({ delay: randomBetween(40, 120) });
+    }
+    await page.waitForTimeout(250);
+  }
+}
+
+async function answerJoinQuestionsInModal(page, joinDialog, answerJoinQuestions) {
+  for (let index = 0; index < 4; index += 1) {
+    await joinDialog.evaluate((element, step) => {
+      element.scrollTop = step * 500;
+    }, index);
+    await page.waitForTimeout(350);
+  }
+
+  await joinDialog.evaluate((element) => {
+    element.scrollTop = 0;
+  });
+  await page.waitForTimeout(300);
+
+  const questionEntries = await joinDialog.evaluate(() => {
+    const containers = Array.from(
+      document.querySelectorAll(
+        'div, fieldset, [role="radiogroup"], [role="group"], form'
+      )
+    );
+    const results = [];
+    const seen = new Set();
+
+    for (const container of containers) {
+      const field = container.querySelector(
+        'textarea, input[type="text"], input[type="email"], input:not([type]), div[role="textbox"][contenteditable="true"], input[type="radio"], [role="radio"], input[type="checkbox"], [role="checkbox"]'
+      );
+
+      if (!field) {
+        continue;
+      }
+
+      const labelTexts = Array.from(
+        container.querySelectorAll('label, span, legend, div[dir="auto"]')
+      )
+        .map((node) => (node.innerText || '').trim())
+        .filter((text) => text && text.length > 2);
+
+      const questionText = labelTexts[0] || (container.innerText || '').trim().split('\n')[0];
+      if (!questionText) {
+        continue;
+      }
+
+      const fieldId = field.id
+        || field.getAttribute('name')
+        || field.getAttribute('aria-label')
+        || field.outerHTML.slice(0, 120);
+      const key = `${questionText}::${fieldId}`;
+      if (seen.has(key)) {
+        continue;
+      }
+
+      seen.add(key);
+      results.push({
+        questionText,
+        fieldType: field.getAttribute('type') || field.getAttribute('role') || field.tagName.toLowerCase(),
+      });
+    }
+
+    return results.slice(0, 20);
+  });
+
+  const joinQuestions = questionEntries.map((entry) => entry.questionText);
+  const structuredAnswers = await answerJoinQuestions(questionEntries);
+  const answersUsed = [];
+
+  for (let index = 0; index < questionEntries.length; index += 1) {
+    const entry = questionEntries[index];
+    const answerText = pickJoinAnswer(entry.questionText, structuredAnswers.answers, index);
+    const candidateContainers = joinDialog.locator(
+      'div:has(textarea), div:has(input[type="text"]), div:has(input[type="email"]), div:has(input[type="checkbox"]), div:has(input[type="radio"]), div:has([role="textbox"]), fieldset, [role="radiogroup"], [role="group"], form'
+    );
+    const containerCount = await candidateContainers.count();
+    let matchedContainer = null;
+
+    for (let containerIndex = 0; containerIndex < containerCount; containerIndex += 1) {
+      const container = candidateContainers.nth(containerIndex);
+      let text = '';
+      try {
+        text = ((await container.innerText()) || '').trim();
+      } catch (_error) {
+        text = '';
+      }
+
+      if (text && text.includes(entry.questionText)) {
+        matchedContainer = container;
         break;
       }
     }
 
-    if (!selected) {
-      await options.first().click({ delay: randomBetween(40, 120) });
+    if (!matchedContainer) {
+      continue;
+    }
+
+    const textField = matchedContainer
+      .locator('textarea, input[type="text"], input[type="email"], input:not([type]), div[role="textbox"][contenteditable="true"]')
+      .first();
+
+    if (await textField.count()) {
+      await textField.waitFor({ state: 'visible', timeout: 10_000 });
+      await textField.click({ delay: randomBetween(50, 120) });
+
+      const tagName = await textField.evaluate((element) => element.tagName.toLowerCase());
+      if (tagName === 'input' || tagName === 'textarea') {
+        await textField.fill('');
+        await textField.type(answerText, { delay: 100 });
+      } else {
+        await page.keyboard.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A');
+        await page.keyboard.type(answerText, { delay: 100 });
+      }
+
+      answersUsed.push(answerText);
+      await page.waitForTimeout(randomBetween(300, 900));
+      continue;
+    }
+
+    const radioOptions = matchedContainer.locator('[role="radio"], input[type="radio"]');
+    const radioCount = await radioOptions.count();
+    if (radioCount) {
+      const hint = (
+        structuredAnswers.optionHints[index]
+        || pickCheckboxChoice(entry.questionText)
+      ).toLowerCase();
+      let selected = false;
+
+      for (let optionIndex = 0; optionIndex < radioCount; optionIndex += 1) {
+        const option = radioOptions.nth(optionIndex);
+        const optionContainer = option.locator(
+          'xpath=ancestor::*[@role="radio" or self::label or self::div][1]'
+        );
+        let optionText = '';
+
+        try {
+          optionText = ((await optionContainer.innerText()) || '').trim().toLowerCase();
+        } catch (_error) {
+          optionText = '';
+        }
+
+        if (!hint || (optionText && optionText.includes(hint))) {
+          await optionContainer.click({ delay: randomBetween(40, 120) });
+          selected = true;
+          break;
+        }
+      }
+
+      if (!selected) {
+        await radioOptions.first().click({ delay: randomBetween(40, 120) });
+      }
+
+      answersUsed.push(hint || 'selected first radio option');
+      continue;
+    }
+
+    const checkboxOptions = matchedContainer.locator('input[type="checkbox"], [role="checkbox"]');
+    const checkboxCount = await checkboxOptions.count();
+    if (checkboxCount) {
+      const hint = pickCheckboxChoice(entry.questionText);
+
+      for (let optionIndex = 0; optionIndex < checkboxCount; optionIndex += 1) {
+        const option = checkboxOptions.nth(optionIndex);
+        const optionContainer = option.locator(
+          'xpath=ancestor::*[@role="checkbox" or self::label or self::div][1]'
+        );
+        let optionText = '';
+
+        try {
+          optionText = ((await optionContainer.innerText()) || '').trim().toLowerCase();
+        } catch (_error) {
+          optionText = '';
+        }
+
+        if (!hint || !optionText || optionText.includes(hint)) {
+          await optionContainer.click({ delay: randomBetween(40, 120) });
+        }
+      }
+
+      answersUsed.push(hint || 'checked required checkbox');
     }
   }
+
+  await completeRemainingJoinChoices(page, joinDialog);
 
   const submitButton = joinDialog
     .getByRole('button', { name: /submit|send|join group|apply/i })
@@ -442,7 +826,7 @@ async function answerJoinQuestionsInModal(page, joinDialog, answerJoinQuestions)
 
   return {
     answeredQuestions: joinQuestions,
-    answers: structuredAnswers.answers,
+    answers: answersUsed,
     submitted: true,
   };
 }
@@ -463,28 +847,70 @@ async function handleJoinGroup(page, options = {}) {
 
   const joinDialog = page.locator('div[role="dialog"]').last();
   if ((await joinDialog.count()) && (await joinDialog.isVisible())) {
-    if (typeof options.answerJoinQuestions === 'function') {
-      const modalResult = await answerJoinQuestionsInModal(
-        page,
-        joinDialog,
-        options.answerJoinQuestions
-      );
-      return {
-        joined: true,
-        pendingApproval: true,
-        modalHandled: true,
-        ...modalResult,
-      };
+    let modalHandled = false;
+    let answeredQuestions = [];
+    let answers = [];
+
+    for (let step = 0; step < 6; step += 1) {
+      if (!((await joinDialog.count()) && (await joinDialog.isVisible()))) {
+        break;
+      }
+
+      const hasInputs = await joinDialog
+        .locator(
+          'textarea, input[type="text"], input[type="email"], input:not([type]), div[role="textbox"][contenteditable="true"], [role="radiogroup"], fieldset, input[type="checkbox"], [role="checkbox"]'
+        )
+        .count();
+
+      if (hasInputs && typeof options.answerJoinQuestions === 'function') {
+        const modalResult = await answerJoinQuestionsInModal(
+          page,
+          joinDialog,
+          options.answerJoinQuestions
+        );
+        modalHandled = true;
+        answeredQuestions = modalResult.answeredQuestions || answeredQuestions;
+        answers = modalResult.answers || answers;
+      }
+
+      const nextButton = joinDialog
+        .getByRole('button', { name: /next|continue|i agree|agree|got it|review/i })
+        .first();
+      if (await nextButton.count()) {
+        await nextButton.waitFor({ state: 'visible', timeout: 10_000 });
+        await nextButton.click({ delay: randomBetween(60, 180) });
+        await page.waitForTimeout(randomBetween(1_500, 3_000));
+        continue;
+      }
+
+      const submitButton = joinDialog
+        .getByRole('button', { name: /submit|send|join group|apply|done/i })
+        .first();
+      if (await submitButton.count()) {
+        await submitButton.waitFor({ state: 'visible', timeout: 15_000 });
+        await submitButton.click({ delay: randomBetween(60, 180) });
+        await page.waitForTimeout(randomBetween(2_000, 5_000));
+        const dialogState = await waitForJoinDialogToSettle(page, joinDialog);
+        return {
+          joined: true,
+          pendingApproval: dialogState === 'pending' || dialogState === 'closed',
+          modalHandled: true,
+          answeredQuestions,
+          answers,
+          submitted: true,
+        };
+      }
+
+      break;
     }
 
-    const submitButton = joinDialog
-      .getByRole('button', { name: /submit|send|join group|apply/i })
-      .first();
-    if (await submitButton.count()) {
-      await submitButton.waitFor({ state: 'visible', timeout: 15_000 });
-      await submitButton.click({ delay: randomBetween(60, 180) });
-      await page.waitForTimeout(randomBetween(2_000, 5_000));
-    }
+    return {
+      joined: true,
+      pendingApproval: true,
+      modalHandled,
+      answeredQuestions,
+      answers,
+    };
   }
 
   return { joined: true, pendingApproval: true, modalHandled: false };
@@ -549,38 +975,54 @@ async function discoverGroups(page, keyword, options = {}) {
   return results;
 }
 
+async function loadGroupFeedPosts(page, { scrollRounds = 5 } = {}) {
+  for (let round = 0; round < scrollRounds; round += 1) {
+    await page.evaluate(() => {
+      window.scrollBy(0, 800);
+    });
+    await page.waitForTimeout(2000);
+  }
+}
+
 async function scrapeGroupFeed(page, { limit = 20 } = {}) {
   await page.waitForLoadState('domcontentloaded');
   await page.waitForTimeout(randomBetween(2_000, 4_000));
+  await loadGroupFeedPosts(page, { scrollRounds: 5 });
 
-  const postLocator = page.locator('div[role="feed"] > div, div[aria-posinset]');
-  const count = Math.min(await postLocator.count(), limit * 2);
+  const postLocator = page.locator('div[role="article"]');
+  const count = Math.min(await postLocator.count(), limit * 3);
   const posts = [];
 
   for (let index = 0; index < count; index += 1) {
     const item = postLocator.nth(index);
-    const textLocator = item.locator('div[data-ad-preview="message"], div[dir="auto"]');
-    const authorLocator = item.locator('h2 a, h3 a, strong span a');
-    const linkLocator = item.locator('a[href*="/posts/"], a[href*="story_fbid="]').first();
+    const authorLocator = item.locator('h2 a, h3 a, strong span a').first();
 
     let postText = '';
     let authorName = '';
     let postUrl = '';
 
     try {
-      postText = ((await textLocator.first().innerText()) || '').trim();
+      postText = ((await item.innerText()) || '').trim();
     } catch (_error) {
       postText = '';
     }
 
     try {
-      authorName = ((await authorLocator.first().innerText()) || '').trim();
+      authorName = ((await authorLocator.innerText()) || '').trim();
     } catch (_error) {
       authorName = '';
     }
 
     try {
-      postUrl = (await linkLocator.getAttribute('href')) || '';
+      postUrl = await item.evaluate((element) => {
+        const links = Array.from(element.querySelectorAll('a[href]'));
+        const match = links.find((link) => {
+          const href = link.getAttribute('href') || '';
+          return /\/posts\/|story_fbid=|\/permalink\//i.test(href);
+        });
+
+        return match ? match.getAttribute('href') || '' : '';
+      });
     } catch (_error) {
       postUrl = '';
     }
@@ -698,16 +1140,21 @@ module.exports = {
   discoverGroups,
   ensureLoggedIn,
   extractGroupIdFromUrl,
+  inspectGroupMembershipStatus,
+  isCreatePostComposerVisible,
   isCanonicalGroupUrl,
   isLikelyGroupName,
   extractPostIdFromUrl,
   handleJoinGroup,
   humanJitter,
   launchBrowser,
+  loadGroupFeedPosts,
   lightHumanPause,
   openTaskGroups,
   postComment,
   readTaskInput,
+  scrapeJoinApprovalNotifications,
+  scrapeJoinedGroups,
   scrapeInboxPreviews,
   scrapeNotifications,
   scrapeGroupFeed,

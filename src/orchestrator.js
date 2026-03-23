@@ -2,12 +2,18 @@
 
 require('dotenv').config();
 
+const fs = require('fs/promises');
 const path = require('path');
 const readline = require('readline');
 
 const {
+  AGENT_INSIGHTS_PATH,
+  appendAgentInsights,
   callOllama,
   draftReply,
+  MORNING_BRIEFING_MODEL,
+  ensureMemoryFile,
+  readAgentInsights,
   resolveSkillForTask,
   summarizeDiscussion,
   scorePostAgainstSkill,
@@ -22,6 +28,8 @@ const {
   extractGroupIdFromUrl,
   handleJoinGroup,
   humanJitter,
+  inspectGroupMembershipStatus,
+  isCreatePostComposerVisible,
   isCanonicalGroupUrl,
   isLikelyGroupName,
   launchBrowser,
@@ -29,6 +37,8 @@ const {
   readTaskInput,
   scrapeGroupFeed,
   scrapeInboxPreviews,
+  scrapeJoinApprovalNotifications,
+  scrapeJoinedGroups,
   scrapeNotifications,
   sendInboxReply,
   visitGroup,
@@ -36,19 +46,34 @@ const {
 const {
   appendThreadHistory,
   closeDatabase,
+  completeJob,
   connectDatabase,
+  enqueueUniqueJob,
+  failJob,
+  findGroupByName,
+  findLeadByPostId,
   findPostById,
   getCollections,
   getContextMemory,
   getDiscoveredGroups,
+  getLeadsByInteractionResult,
+  getGroupsByStatus,
   getInteractionCountsSince,
+  getJobsByStatus,
   hasInteraction,
+  leaseNextJob,
   logInteraction,
   markPostStatus,
+  releaseExpiredJobs,
   saveDiscoveredGroups,
   setupCollections,
+  updateDiscoveredGroupStatus,
+  updateLeadInteractionResult,
+  updateLeadStatus,
+  updateGroupLastScanned,
   updateContextPhase,
   updatePostScore,
+  upsertLead,
   upsertContextMemory,
   upsertPost,
 } = require('./database');
@@ -76,6 +101,71 @@ const DEFAULT_OUTBOUND_POSTS = [
   'Private label sellers doing solid revenue can still miss recoveries from lost inventory and incorrect fee charges.',
   'Most Amazon sellers watch sales closely but do not review settlements deeply enough to catch hidden losses and reimbursement gaps.',
 ];
+const HOUSEKEEPING_INTERVAL_MS = 3 * 60 * 60 * 1000;
+const JOB_TYPES = {
+  HOUSEKEEPING: 'housekeeping',
+  SYNC_GROUPS: 'sync_groups',
+  VERIFY_PENDING: 'verify_pending',
+  SCAN_GROUPS: 'scan_groups',
+  ENGAGE: 'engage',
+  REPLY: 'reply',
+  SEARCH_GROUPS: 'search_groups',
+  BRIEF: 'brief',
+};
+
+function createBrowserLock() {
+  let chain = Promise.resolve();
+  let activeLabel = null;
+
+  return {
+    async runExclusive(label, task) {
+      const run = chain.then(async () => {
+        activeLabel = label;
+        try {
+          return await task();
+        } finally {
+          activeLabel = null;
+        }
+      });
+
+      chain = run.catch(() => {});
+      return run;
+    },
+    isBusy() {
+      return Boolean(activeLabel);
+    },
+    getActiveLabel() {
+      return activeLabel;
+    },
+  };
+}
+
+function isLikelyEnglishGroupName(name = '') {
+  return /^[\x00-\x7F\s.,&()'"/|:+-]+$/.test(name);
+}
+
+function isRelevantAmazonGroupName(name = '') {
+  const text = name.toLowerCase();
+  return (
+    /(amazon|fba|private label|wholesale|seller|ecommerce|ppc)/i.test(text) &&
+    !/(crypto|forex|loan|dating|casino|review group|buyer and seller|virtual assistant|chinese seller|ksa|uae|walmart|ebay|suspension|legal issues)/i.test(text)
+  );
+}
+
+function matchesTargetGroupHints(name = '', taskInput = {}) {
+  const targets = Array.isArray(taskInput.target_groups) ? taskInput.target_groups : [];
+  if (!targets.length) {
+    return true;
+  }
+
+  const normalizedName = name.toLowerCase();
+
+  return targets.some((target) => {
+    const normalizedTarget = String(target).toLowerCase();
+    const tokens = normalizedTarget.split(/\s+/).filter((token) => token.length > 2);
+    return tokens.some((token) => normalizedName.includes(token));
+  });
+}
 
 function getStartOfToday() {
   const now = new Date();
@@ -160,6 +250,7 @@ function createSessionState(existingCounts = {}) {
       inboxPreviews: [],
       summary: '',
     },
+    lastInsightDate: null,
   };
 }
 
@@ -180,49 +271,85 @@ function canPerformAction(state, type) {
 }
 
 async function answerJoinQuestionsFactory(skill) {
-  return async function answerJoinQuestions(questions = []) {
-    if (!questions.length) {
+  return async function answerJoinQuestions(questionEntries = []) {
+    if (!questionEntries.length) {
       return { answers: [], optionHints: [] };
     }
 
-    const prompt = [
-      'You are applying to a Facebook Group.',
-      'Answer these questions briefly and professionally so an admin will approve you.',
-      `Use the context of our business: ${skill.content}`,
-      'Return strict JSON with this shape: {"answers":["..."],"optionHints":["..."]}',
-      'Keep answers short and credible.',
-      '',
-      'Questions:',
-      ...questions.map((question, index) => `${index + 1}. ${question}`),
-    ].join('\n');
-
-    const raw = await callOllama(prompt, {
-      generationOptions: {
-        temperature: 0.2,
-        num_predict: 240,
-      },
+    const fallbackAnswers = questionEntries.map((entry) => {
+      const question = entry.questionText || '';
+      const fallback = (skill.manualFallbacks || []).find((item) =>
+        question.toLowerCase().includes(item.question.toLowerCase())
+      );
+      return fallback
+        ? fallback.answer
+        : 'I work with Amazon sellers and would love to contribute and learn from the community.';
     });
+    const answers = [];
+    const usedAnswers = new Set();
 
-    const jsonMatch = raw.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) {
-      return {
-        answers: questions.map(() => 'I work with Amazon sellers and would love to join the community.'),
-        optionHints: [],
-      };
+    for (let index = 0; index < questionEntries.length; index += 1) {
+      const entry = questionEntries[index];
+      const question = entry.questionText || '';
+
+      if (/checkbox/i.test(entry.fieldType || '') && /agree|rules|spam|policy/i.test(question)) {
+        answers.push('AGREE_CHECKBOX');
+        continue;
+      }
+
+      const makePrompt = (avoidText = '') => [
+        'You are applying to join a professional Facebook group for Amazon Sellers.',
+        `QUESTION: "${question}"`,
+        `MY BUSINESS SKILL: ${skill.content}`,
+        '',
+        'TASK: Write a short (1-sentence), professional, and honest answer based on the skill file.',
+        "- If they ask about revenue, use the '$10k-$50k' range.",
+        '- If they ask why I want to join, mention networking and fee management.',
+        `- DO NOT use generic AI phrases like 'As an AI...' or 'I would like to...'.`,
+        '- Sound like a real busy entrepreneur.',
+        avoidText ? `- Do not reuse this sentence: "${avoidText}"` : '',
+      ].filter(Boolean).join('\n');
+
+      let answer = fallbackAnswers[index];
+
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        try {
+          const raw = await callOllama(makePrompt(attempt === 1 ? answer : ''), {
+            model: MORNING_BRIEFING_MODEL,
+            timeoutMs: 30_000,
+            generationOptions: {
+              temperature: 0.3,
+              num_ctx: 2048,
+              num_predict: 80,
+            },
+          });
+
+          const candidate = raw.replace(/^["']|["']$/g, '').trim();
+          if (candidate && !usedAnswers.has(candidate)) {
+            answer = candidate;
+            break;
+          }
+        } catch (_error) {
+          // Fall back below.
+        }
+      }
+
+      if (usedAnswers.has(answer)) {
+        answer = `${answer} Focused on Amazon fee control and seller networking.`;
+      }
+
+      usedAnswers.add(answer);
+      answers.push(answer);
     }
 
-    try {
-      const parsed = JSON.parse(jsonMatch[0]);
-      return {
-        answers: Array.isArray(parsed.answers) ? parsed.answers : [],
-        optionHints: Array.isArray(parsed.optionHints) ? parsed.optionHints : [],
-      };
-    } catch (_error) {
-      return {
-        answers: questions.map(() => 'I help Amazon sellers identify hidden losses and would be glad to contribute.'),
-        optionHints: [],
-      };
-    }
+    return {
+      answers,
+      optionHints: questionEntries.map((entry) =>
+        /checkbox/i.test(entry.fieldType || '') && /agree|rules|spam|policy/i.test(entry.questionText || '')
+          ? 'yes'
+          : ''
+      ),
+    };
   };
 }
 
@@ -276,6 +403,83 @@ async function resolveTargetGroups(page, taskInput) {
   return [...uniqueByUrl.values()];
 }
 
+async function resolveScannableGroups(page, taskInput) {
+  const joinedGroups = await getGroupsByStatus('joined', { limit: 200 });
+  return joinedGroups
+    .filter((group) => isLikelyEnglishGroupName(group.name))
+    .filter((group) => isRelevantAmazonGroupName(group.name))
+    .filter((group) => matchesTargetGroupHints(group.name, taskInput))
+    .map((group) => ({
+      id: group.group_id || extractGroupIdFromUrl(group.url),
+      url: group.url,
+      label: group.name,
+      keyword: group.keyword,
+      status: group.status,
+      lastScanned: group.lastScanned || null,
+    }));
+}
+
+async function syncGroups(page) {
+  const joinedGroups = await scrapeJoinedGroups(page, { limit: 120 });
+  if (joinedGroups.length) {
+    await saveDiscoveredGroups('__joined_sync__', joinedGroups.map((group) => ({
+      ...group,
+      status: 'joined',
+      source: group.source || 'groups_feed',
+    })));
+  }
+
+  const approvals = await scrapeJoinApprovalNotifications(page, { limit: 10 });
+  let updated = 0;
+
+  for (const approval of approvals) {
+    const group = await findGroupByName(approval.groupName);
+    if (!group) {
+      continue;
+    }
+
+    await updateDiscoveredGroupStatus(group.url, 'joined');
+    updated += 1;
+  }
+
+  console.log(`Group sync complete. Joined approvals updated: ${updated}. Joined groups synced from feed: ${joinedGroups.length}`);
+  return {
+    approvalsUpdated: updated,
+    joinedGroupsSynced: joinedGroups.length,
+  };
+}
+
+async function verifyPendingGroups(page) {
+  const pendingGroups = await getGroupsByStatus('pending', { limit: 200 });
+  let verified = 0;
+
+  console.log(`Verifying pending groups: ${pendingGroups.length}`);
+
+  for (const group of pendingGroups) {
+    await visitGroup(page, group.url);
+
+    if (await isCreatePostComposerVisible(page)) {
+      await updateDiscoveredGroupStatus(group.url, 'joined');
+      verified += 1;
+      console.log(`Verified joined: ${group.name}`);
+      continue;
+    }
+
+    const membershipStatus = await inspectGroupMembershipStatus(page);
+    if (membershipStatus === 'joined') {
+      await updateDiscoveredGroupStatus(group.url, 'joined');
+      verified += 1;
+      console.log(`Verified joined: ${group.name}`);
+    } else if (membershipStatus === 'discovered') {
+      await updateDiscoveredGroupStatus(group.url, 'discovered');
+      console.log(`No longer pending: ${group.name}`);
+    }
+  }
+
+  console.log(`Verify complete. Groups marked joined: ${verified}`);
+  return verified;
+}
+
 async function generateMorningBriefing(skill, notifications, inboxPreviews) {
   const prompt = [
     'Create a short morning briefing for the business owner.',
@@ -294,12 +498,21 @@ async function generateMorningBriefing(skill, notifications, inboxPreviews) {
     inboxPreviews.length ? inboxPreviews.map((item) => `- ${item.text}`).join('\n') : '- None',
   ].join('\n');
 
-  return callOllama(prompt, {
-    generationOptions: {
-      temperature: 0.2,
-      num_predict: 120,
-    },
-  });
+  try {
+    return await callOllama(prompt, {
+      model: MORNING_BRIEFING_MODEL,
+      timeoutMs: 30_000,
+      generationOptions: {
+        temperature: 0.2,
+        num_ctx: 2048,
+        num_predict: 120,
+      },
+    });
+  } catch (_error) {
+    const dmCount = inboxPreviews.length;
+    const notificationCount = notifications.length;
+    return `Boss, you have ${dmCount} DM leads and ${notificationCount} active notifications. What is our mission today?`;
+  }
 }
 
 async function runMorningBriefing(page, skill, state) {
@@ -320,33 +533,238 @@ async function runMorningBriefing(page, skill, state) {
   return state.briefing;
 }
 
-async function scanGroupFeed(page, group, skill, goalSummary, state, triggerPatterns, answerJoinQuestions) {
+async function summarizeInbox(page, skill, state) {
+  return runMorningBriefing(page, skill, state);
+}
+
+async function performSocialBreak(page) {
+  if (Math.random() > 0.35) {
+    return 0;
+  }
+
+  await page.goto(FACEBOOK_BASE_URL, {
+    waitUntil: 'domcontentloaded',
+    timeout: 90_000,
+  });
+  await page.waitForTimeout(3000);
+
+  const likeButtons = page.getByRole('button', { name: /like/i });
+  const likeCount = Math.min(await likeButtons.count(), 8);
+  let likesDone = 0;
+  const targetLikes = Math.min(2, Math.max(1, Math.floor(Math.random() * 2) + 1));
+
+  for (let index = 0; index < likeCount && likesDone < targetLikes; index += 1) {
+    const button = likeButtons.nth(index);
+    try {
+      await button.scrollIntoViewIfNeeded();
+      await button.click({ delay: 80 });
+      likesDone += 1;
+      await page.waitForTimeout(1200);
+    } catch (_error) {
+      continue;
+    }
+  }
+
+  if (likesDone) {
+    console.log(`Social break complete. Liked ${likesDone} home-feed posts.`);
+  }
+
+  return likesDone;
+}
+
+async function writeDailyInsights(skill, state) {
+  const today = new Date().toISOString().slice(0, 10);
+  if (state.lastInsightDate === today) {
+    return null;
+  }
+
+  const successfulLeads = await getLeadsByInteractionResult('Success', { limit: 20 });
+  if (!successfulLeads.length) {
+    state.lastInsightDate = today;
+    return null;
+  }
+
+  const insightsFile = await readAgentInsights();
+  const prompt = [
+    'Analyze these successful Facebook seller leads.',
+    'Why did these sellers reply to us? What keywords or tone worked best?',
+    'Keep the answer concise and actionable.',
+    '',
+    'Existing insights:',
+    insightsFile,
+    '',
+    'Successful leads:',
+    successfulLeads.map((lead) => `- ${lead.content}`).join('\n'),
+  ].join('\n');
+
+  const analysis = await callOllama(prompt, {
+    model: MORNING_BRIEFING_MODEL,
+    timeoutMs: 30_000,
+    generationOptions: {
+      temperature: 0.1,
+      num_ctx: 2048,
+      num_predict: 220,
+    },
+  }).catch(() => '');
+
+  if (!analysis) {
+    return null;
+  }
+
+  const entry = `\n## ${today}\n${analysis}\n`;
+  await appendAgentInsights(entry);
+  state.lastInsightDate = today;
+  console.log(`Agent insights updated: ${AGENT_INSIGHTS_PATH}`);
+  return analysis;
+}
+
+async function runHousekeeping(page, skill, state) {
+  console.log('Starting housekeeping cycle...');
+  await ensureLoggedIn(page);
+  await syncGroups(page);
+  await verifyPendingGroups(page);
+  try {
+    await summarizeInbox(page, skill, state);
+  } catch (error) {
+    state.errors.push(`Morning briefing failed: ${error.message}`);
+    state.briefing = state.briefing || {
+      notifications: [],
+      inboxPreviews: [],
+      summary: '',
+    };
+    console.log(`Morning briefing skipped: ${error.message}`);
+  }
+
+  try {
+    await handleReplyLoop(page, skill, state, state.briefing);
+  } catch (error) {
+    state.errors.push(`Reply loop failed: ${error.message}`);
+    console.log(`Reply loop skipped: ${error.message}`);
+  }
+
+  try {
+    await performSocialBreak(page);
+  } catch (error) {
+    state.errors.push(`Social break failed: ${error.message}`);
+    console.log(`Social break skipped: ${error.message}`);
+  }
+
+  try {
+    await writeDailyInsights(skill, state);
+  } catch (error) {
+    state.errors.push(`Daily insights failed: ${error.message}`);
+    console.log(`Daily insights skipped: ${error.message}`);
+  }
+  console.log('Housekeeping cycle complete.');
+}
+
+async function searchAndJoinGroups(page, keyword, skill, state) {
+  const cleanedKeyword = String(keyword || '').trim();
+  if (!cleanedKeyword) {
+    throw new Error('A group keyword is required.');
+  }
+
+  console.log(`Searching groups for keyword: ${cleanedKeyword}`);
+  const discovered = await discoverGroups(page, cleanedKeyword, { maxResults: 8 });
+  const filtered = discovered.filter((group) => isCanonicalGroupUrl(group.url) && isLikelyGroupName(group.name));
+  await saveDiscoveredGroups(cleanedKeyword, filtered);
+
+  const answerJoinQuestions = await answerJoinQuestionsFactory(skill);
+  let joinAttempts = 0;
+  let pendingCount = 0;
+  let joinedCount = 0;
+
+  for (const group of filtered) {
+    console.log(`Search found group: ${group.name} -> ${group.url}`);
+    await visitGroup(page, group.url);
+    const membershipStatus = await inspectGroupMembershipStatus(page);
+
+    if (membershipStatus === 'joined') {
+      await updateDiscoveredGroupStatus(group.url, 'joined', {
+        name: group.name,
+        group_id: group.id,
+      });
+      joinedCount += 1;
+      continue;
+    }
+
+    if (membershipStatus === 'pending') {
+      await updateDiscoveredGroupStatus(group.url, 'pending', {
+        name: group.name,
+        group_id: group.id,
+      });
+      pendingCount += 1;
+      console.log(`Already pending: ${group.name}`);
+      continue;
+    }
+
+    const result = await handleJoinGroup(page, {
+      answerJoinQuestions,
+    });
+
+    joinAttempts += 1;
+    const nextStatus = result.pendingApproval ? 'pending' : 'joined';
+    await updateDiscoveredGroupStatus(group.url, nextStatus, {
+      name: group.name,
+      group_id: group.id,
+    });
+
+    if (nextStatus === 'pending') {
+      pendingCount += 1;
+      state.joinRequests += 1;
+      console.log(`Join submitted: ${group.name}`);
+    } else {
+      joinedCount += 1;
+      console.log(`Joined immediately: ${group.name}`);
+    }
+  }
+
+  return {
+    discovered: filtered.length,
+    joinAttempts,
+    pendingCount,
+    joinedCount,
+  };
+}
+
+async function scanGroupFeed(page, group, skill, goalSummary, state) {
   console.log(`Opening group: ${group.label}`);
   await visitGroup(page, group.url);
   state.groupsVisited.push(group.label);
 
-  const joinState = await handleJoinGroup(page, { answerJoinQuestions });
-  if (joinState.joined) {
-    console.log(`Join requested for group: ${group.label}`);
-    state.joinRequests += 1;
+  const membershipStatus = await inspectGroupMembershipStatus(page);
+
+  if (membershipStatus === 'pending') {
+    await updateDiscoveredGroupStatus(group.url, 'pending', {
+      name: group.label,
+      group_id: group.id,
+    });
+    console.log(`Skipping pending group: ${group.label}`);
     return [];
   }
 
+  if (membershipStatus === 'discovered') {
+    await updateDiscoveredGroupStatus(group.url, 'discovered', {
+      name: group.label,
+      group_id: group.id,
+    });
+    console.log(`Skipping discovered group: ${group.label}`);
+    return [];
+  }
+
+  await updateDiscoveredGroupStatus(group.url, 'joined', {
+    name: group.label,
+    group_id: group.id,
+  });
+
   const scrapedPosts = await scrapeGroupFeed(page, { limit: 30 });
+  await updateGroupLastScanned(group.url, new Date());
   state.scrapedPosts += scrapedPosts.length;
   console.log(`Scraped ${scrapedPosts.length} posts from ${group.label}`);
 
   const found = [];
 
   for (const scrapedPost of scrapedPosts) {
-    const matchedTriggers = triggerPatterns.some((pattern) => pattern.test(scrapedPost.postText));
-    if (!matchedTriggers) {
-      continue;
-    }
-
-    state.triggerMatches += 1;
-    console.log(`Trigger matched in post ${scrapedPost.postId} from ${group.label}`);
-
     const storedPost = await upsertPost({
       post_id: scrapedPost.postId,
       group: group.label,
@@ -368,10 +786,23 @@ async function scanGroupFeed(page, group, skill, goalSummary, state, triggerPatt
     state.scoredPosts += 1;
     const status = scoreResult.shouldInteract ? 'qualified' : 'ignored';
     await updatePostScore(storedPost.post_id, scoreResult.score, status);
-    console.log(`Scored post ${storedPost.post_id}: ${scoreResult.score}/10 (${status})`);
+    console.log(
+      `Scored post ${storedPost.post_id}: ${scoreResult.score}/10 (${status}) ${scoreResult.category || ''}`
+    );
 
     if (scoreResult.shouldInteract) {
+      state.triggerMatches += 1;
       state.eligiblePosts += 1;
+      await upsertLead({
+        post_id: storedPost.post_id,
+        group: storedPost.group,
+        content: storedPost.content,
+        author: storedPost.author,
+        category: scoreResult.category,
+        confidence: scoreResult.confidence,
+        reason: scoreResult.reason,
+        status: 'New',
+      });
       found.push({
         ...storedPost,
         relevance_score: scoreResult.score,
@@ -383,13 +814,15 @@ async function scanGroupFeed(page, group, skill, goalSummary, state, triggerPatt
 }
 
 async function scanJoinedGroups(page, taskInput, skill, state) {
-  const groups = await resolveTargetGroups(page, taskInput);
-  const triggerPatterns = buildTriggerPatterns(taskInput);
-  const answerJoinQuestions = await answerJoinQuestionsFactory(skill);
+  const groups = await resolveScannableGroups(page, taskInput);
   const results = [];
 
   state.resolvedGroups = groups;
   console.log(`Groups to scan: ${groups.length}`);
+
+  if (!groups.length) {
+    console.log('No already-joined groups are available to scan. Use `search [keyword]` first or wait for pending approvals.');
+  }
 
   for (const group of groups) {
     try {
@@ -398,9 +831,7 @@ async function scanJoinedGroups(page, taskInput, skill, state) {
         group,
         skill,
         buildGoalSummary(taskInput),
-        state,
-        triggerPatterns,
-        answerJoinQuestions
+        state
       );
       results.push(...found);
     } catch (error) {
@@ -489,9 +920,11 @@ async function engageQualifiedPosts(page, skill, state) {
         });
         await updateContextPhase(candidate.post_id, draft.phase);
         await markPostStatus(candidate.post_id, 'engaged');
+        await updateLeadInteractionResult(candidate.post_id, 'Success');
         state.comments += 1;
         await humanJitter(page, { logLabel: 'Post-comment jitter' });
       } catch (error) {
+        await updateLeadInteractionResult(candidate.post_id, 'Blocked');
         state.errors.push(`Comment failed for ${candidate.post_id}: ${error.message}`);
       }
     }
@@ -597,6 +1030,7 @@ async function handleReplyLoop(page, skill, state, briefing = state.briefing) {
 
     const originalPost = await findPostById(notification.postId);
     const existingContext = await getContextMemory(notification.postId);
+    const existingLead = await findLeadByPostId(notification.postId);
 
     if (!originalPost && !existingContext) {
       continue;
@@ -616,6 +1050,7 @@ async function handleReplyLoop(page, skill, state, briefing = state.briefing) {
       summary_of_discussion: existingContext?.summary_of_discussion || 'User replied to our outreach.',
     });
 
+    const looksLikeQuestion = /\?/.test(notification.text);
     const draft = await draftReply({
       skill,
       post: {
@@ -625,6 +1060,7 @@ async function handleReplyLoop(page, skill, state, briefing = state.briefing) {
       threadId: notification.postId,
       contextSummary,
       tone: 'warm, concise, and specific',
+      phaseOverride: looksLikeQuestion ? 2 : null,
     });
 
     if (!notification.href) {
@@ -678,6 +1114,11 @@ async function handleReplyLoop(page, skill, state, briefing = state.briefing) {
       },
     });
 
+    if (existingLead || originalPost) {
+      await updateLeadStatus(notification.postId, 'Warm');
+      await updateLeadInteractionResult(notification.postId, 'Success');
+    }
+
     state.replies += 1;
     await humanJitter(page, { logLabel: 'Reply-loop jitter' });
   }
@@ -713,80 +1154,258 @@ function printSessionSummary(taskInput, skill, state, dbCounts) {
   }
 }
 
-async function handleManualCommand(command, context) {
-  const input = command.trim();
-  if (!input) {
-    return true;
-  }
-
-  if (input === 'exit' || input === 'quit') {
-    printSessionSummary(context.taskInput, context.skill, context.state, context.existingCounts);
-    return false;
-  }
-
-  if (input.startsWith('search ')) {
-    const keyword = input.slice(7).trim();
-    if (!keyword) {
-      console.log('Usage: search [keyword]');
-      return true;
-    }
-
-    const results = await discoverGroups(context.page, keyword, { maxResults: 5 });
-    await saveDiscoveredGroups(keyword, results);
-    const answerJoinQuestions = await answerJoinQuestionsFactory(context.skill);
-
-    for (const group of results) {
-      console.log(`Search found group: ${group.name} -> ${group.url}`);
-      await visitGroup(context.page, group.url);
-      await handleJoinGroup(context.page, { answerJoinQuestions });
-    }
-
-    return true;
-  }
-
-  if (input === 'scan') {
-    await scanJoinedGroups(context.page, context.taskInput, context.skill, context.state);
-    return true;
-  }
-
-  if (input === 'engage') {
-    await engageQualifiedPosts(context.page, context.skill, context.state);
-    return true;
-  }
-
-  if (input === 'reply') {
-    await handleReplyLoop(context.page, context.skill, context.state, context.state.briefing);
-    return true;
-  }
-
-  console.log('Commands: search [keyword], scan, engage, reply, exit');
-  return true;
+async function scheduleStandardJobs() {
+  await enqueueUniqueJob({ type: JOB_TYPES.HOUSEKEEPING });
+  await enqueueUniqueJob({ type: JOB_TYPES.SCAN_GROUPS, runAt: new Date(Date.now() + 20_000) });
+  await enqueueUniqueJob({ type: JOB_TYPES.ENGAGE, runAt: new Date(Date.now() + 45_000) });
 }
 
-async function startCommandLoop(context) {
-  console.log('Command mode ready. Commands: search [keyword], scan, engage, reply, exit');
+async function executeJob(job, page, skill, state, taskInput) {
+  switch (job.type) {
+    case JOB_TYPES.HOUSEKEEPING:
+      return runHousekeeping(page, skill, state);
+    case JOB_TYPES.SYNC_GROUPS:
+      return syncGroups(page);
+    case JOB_TYPES.VERIFY_PENDING:
+      return verifyPendingGroups(page);
+    case JOB_TYPES.SCAN_GROUPS:
+      return scanJoinedGroups(page, taskInput, skill, state);
+    case JOB_TYPES.ENGAGE:
+      return engageQualifiedPosts(page, skill, state);
+    case JOB_TYPES.REPLY:
+      return handleReplyLoop(page, skill, state, state.briefing);
+    case JOB_TYPES.BRIEF:
+      return summarizeInbox(page, skill, state);
+    case JOB_TYPES.SEARCH_GROUPS:
+      return searchAndJoinGroups(page, job.payload?.keyword || '', skill, state);
+    default:
+      throw new Error(`Unsupported job type: ${job.type}`);
+  }
+}
 
+async function runQueuedJobs(lock, page, skill, state, taskInput) {
+  await releaseExpiredJobs();
+
+  for (;;) {
+    const job = await leaseNextJob('browser-worker-1');
+    if (!job) {
+      break;
+    }
+
+    try {
+      const result = await lock.runExclusive(`job:${job.type}`, async () =>
+        executeJob(job, page, skill, state, taskInput)
+      );
+      await completeJob(job._id, result || null);
+    } catch (error) {
+      state.errors.push(`Job ${job.type} failed: ${error.message}`);
+      await failJob(job._id, error);
+    }
+  }
+}
+
+async function summarizeRecentPostsFromDb(limit = 12) {
+  const { posts } = getCollections();
+  const recentPosts = await posts.find({})
+    .sort({ updated_at: -1, created_at: -1 })
+    .limit(limit)
+    .lean();
+
+  if (!recentPosts.length) {
+    return 'No recent scanned posts are saved yet.';
+  }
+
+  const samples = recentPosts
+    .map((post) => `- [${post.group}] ${String(post.content || '').slice(0, 280)}`)
+    .join('\n');
+
+  try {
+    const summary = await callOllama([
+      'Summarize what people are talking about across these Facebook group posts.',
+      'Keep it short and practical in 4 bullet-style lines or fewer.',
+      '',
+      samples,
+    ].join('\n'), {
+      model: MORNING_BRIEFING_MODEL,
+      timeoutMs: 30_000,
+      generationOptions: {
+        temperature: 0.2,
+        num_ctx: 2048,
+        num_predict: 180,
+      },
+    });
+
+    return summary || 'Recent posts were found, but the summary came back empty.';
+  } catch (_error) {
+    return `Recent post samples:\n${samples}`;
+  }
+}
+
+async function answerOperatorQuestion(input, page) {
+  const normalized = input.toLowerCase();
+
+  if (/how many groups|total groups|groups joined/.test(normalized)) {
+    const joined = await getGroupsByStatus('joined', { limit: 500 });
+    const pending = await getGroupsByStatus('pending', { limit: 500 });
+    const discovered = await getGroupsByStatus('discovered', { limit: 500 });
+    return `Groups in DB: ${joined.length} joined, ${pending.length} pending, ${discovered.length} discovered.`;
+  }
+
+  if (/not only amazon|non[- ]amazon|not amazon related|any group.*not.*amazon/.test(normalized)) {
+    const joined = await getGroupsByStatus('joined', { limit: 500 });
+    const nonAmazon = joined.filter((group) => !isRelevantAmazonGroupName(group.name));
+    if (!nonAmazon.length) {
+      return 'All joined groups currently saved in DB look Amazon/FBA-related.';
+    }
+
+    return `Joined non-Amazon or weak-fit groups:\n${nonAmazon
+      .slice(0, 20)
+      .map((group) => `- ${group.name}`)
+      .join('\n')}`;
+  }
+
+  if (/what people are posting|people posting about|what are people talking about|summarize posts/.test(normalized)) {
+    return summarizeRecentPostsFromDb();
+  }
+
+  if (/what notification|notifications now|show notifications|any notifications/.test(normalized)) {
+    const notifications = await scrapeNotifications(page, { limit: 8 });
+    if (!notifications.length) {
+      return 'No visible notifications were scraped right now.';
+    }
+
+    return `Latest notifications:\n${notifications
+      .map((item, index) => `${index + 1}. ${item.text}`)
+      .join('\n')}`;
+  }
+
+  return [
+    'I can answer these live console questions right now:',
+    '- how many groups total we joined',
+    '- any group not only amazon related',
+    '- what people are posting about in any group',
+    '- what notification we have now',
+    '',
+    'You can also use commands: status, groups, notifications, posts, scan, engage, reply, sync, exit',
+  ].join('\n');
+}
+
+function startOperatorConsole({ page, taskInput, skill, state, lock }) {
   const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout,
     prompt: 'fb-agent> ',
   });
 
-  rl.prompt();
+  let busy = false;
 
-  for await (const line of rl) {
-    try {
-      const shouldContinue = await handleManualCommand(line, context);
-      if (!shouldContinue) {
-        rl.close();
-        break;
-      }
-    } catch (error) {
-      console.error(`Command failed: ${error.message}`);
+  const run = async (input) => {
+    const raw = input.trim();
+    if (!raw) {
+      return;
     }
 
-    rl.prompt();
-  }
+    const normalized = raw.toLowerCase();
+
+    if (normalized === 'help') {
+      console.log('Commands: status, groups, notifications, posts, brief, sync, verify, search [keyword], scan, engage, reply, exit');
+      return;
+    }
+
+    if (normalized === 'exit' || normalized === 'quit') {
+      rl.close();
+      process.exit(0);
+    }
+
+    if (busy) {
+      console.log('A task is already running. Please wait for it to finish.');
+      return;
+    }
+
+    busy = true;
+
+    try {
+      if (normalized === 'status' || normalized === 'stats') {
+        const joined = await getGroupsByStatus('joined', { limit: 500 });
+        const pending = await getGroupsByStatus('pending', { limit: 500 });
+        const discovered = await getGroupsByStatus('discovered', { limit: 500 });
+        const queuedJobs = await getJobsByStatus('queued', { limit: 200 });
+        const runningJobs = await getJobsByStatus('running', { limit: 50 });
+        console.log(`Status: ${joined.length} joined, ${pending.length} pending, ${discovered.length} discovered, ${queuedJobs.length} queued jobs, ${runningJobs.length} running jobs.`);
+      } else if (normalized === 'groups') {
+        const joined = await getGroupsByStatus('joined', { limit: 50 });
+        if (!joined.length) {
+          console.log('No joined groups are saved yet.');
+        } else {
+          console.log(`Joined groups (${joined.length}):`);
+          for (const group of joined.slice(0, 25)) {
+            console.log(`- ${group.name}`);
+          }
+        }
+      } else if (normalized === 'notifications') {
+        const answer = await lock.runExclusive('operator:notifications', async () =>
+          answerOperatorQuestion('what notification we have now', page)
+        );
+        console.log(answer);
+      } else if (normalized === 'posts') {
+        console.log(await summarizeRecentPostsFromDb());
+      } else if (normalized === 'brief') {
+        await enqueueUniqueJob({ type: JOB_TYPES.BRIEF });
+        console.log('Queued: brief');
+        await runQueuedJobs(lock, page, skill, state, taskInput);
+      } else if (normalized === 'sync') {
+        await enqueueUniqueJob({ type: JOB_TYPES.SYNC_GROUPS });
+        console.log('Queued: sync_groups');
+        await runQueuedJobs(lock, page, skill, state, taskInput);
+      } else if (normalized === 'verify') {
+        await enqueueUniqueJob({ type: JOB_TYPES.VERIFY_PENDING });
+        console.log('Queued: verify_pending');
+        await runQueuedJobs(lock, page, skill, state, taskInput);
+      } else if (normalized === 'scan') {
+        await enqueueUniqueJob({ type: JOB_TYPES.SCAN_GROUPS });
+        console.log('Queued: scan_groups');
+        await runQueuedJobs(lock, page, skill, state, taskInput);
+      } else if (normalized === 'engage') {
+        await enqueueUniqueJob({ type: JOB_TYPES.ENGAGE });
+        console.log('Queued: engage');
+        await runQueuedJobs(lock, page, skill, state, taskInput);
+      } else if (normalized === 'reply') {
+        await enqueueUniqueJob({ type: JOB_TYPES.REPLY });
+        console.log('Queued: reply');
+        await runQueuedJobs(lock, page, skill, state, taskInput);
+      } else if (normalized.startsWith('search ')) {
+        const keyword = raw.slice(7).trim();
+        await enqueueUniqueJob({
+          type: JOB_TYPES.SEARCH_GROUPS,
+          payload: { keyword },
+        });
+        console.log(`Queued: search_groups (${keyword})`);
+        await runQueuedJobs(lock, page, skill, state, taskInput);
+      } else {
+        const answer = await lock.runExclusive('operator:question', async () =>
+          answerOperatorQuestion(raw, page)
+        );
+        console.log(answer);
+      }
+    } catch (error) {
+      console.log(`Command failed: ${error.message}`);
+    } finally {
+      busy = false;
+      rl.prompt();
+    }
+  };
+
+  rl.on('line', (line) => {
+    run(line);
+  });
+
+  rl.on('close', () => {
+    console.log('Operator console closed.');
+  });
+
+  console.log('Operator console ready. Type `help` for commands or ask a plain-English status question.');
+  rl.prompt();
+  return rl;
 }
 
 async function runAssistantSession(options = {}) {
@@ -808,6 +1427,7 @@ async function runAssistantSession(options = {}) {
   state.taskInput = taskInput;
 
   let browserContext;
+  const lock = createBrowserLock();
 
   try {
     const browser = await launchBrowser({
@@ -817,19 +1437,39 @@ async function runAssistantSession(options = {}) {
 
     browserContext = browser.context;
 
-    await ensureLoggedIn(browser.page);
-    await runMorningBriefing(browser.page, skill, state);
-
     console.log(`Goal for today: ${buildGoalSummary(taskInput)}`);
     console.log(`Using skill: ${skill.id}`);
 
-    await startCommandLoop({
+    await ensureMemoryFile();
+    await scheduleStandardJobs();
+    await runQueuedJobs(lock, browser.page, skill, state, taskInput);
+    startOperatorConsole({
       page: browser.page,
+      taskInput,
       skill,
       state,
-      taskInput,
-      existingCounts,
+      lock,
     });
+
+    setInterval(async () => {
+      try {
+        await scheduleStandardJobs();
+        await runQueuedJobs(lock, browser.page, skill, state, taskInput);
+        printSessionSummary(taskInput, skill, state, existingCounts);
+      } catch (error) {
+        console.error(`Housekeeping interval failed: ${error.message}`);
+      }
+    }, HOUSEKEEPING_INTERVAL_MS);
+
+    setInterval(async () => {
+      try {
+        await runQueuedJobs(lock, browser.page, skill, state, taskInput);
+      } catch (error) {
+        console.error(`Job runner failed: ${error.message}`);
+      }
+    }, 15_000);
+
+    await new Promise(() => {});
   } finally {
     await closeBrowser(browserContext);
     await closeDatabase();
@@ -851,9 +1491,13 @@ module.exports = {
   createSessionState,
   engageQualifiedPosts,
   handleReplyLoop,
-  resolveTargetGroups,
+  resolveScannableGroups,
   runAssistantSession,
+  runHousekeeping,
   runMorningBriefing,
   scanJoinedGroups,
   scrapeNotificationReplies,
+  startOperatorConsole,
+  syncGroups,
+  verifyPendingGroups,
 };
