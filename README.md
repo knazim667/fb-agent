@@ -47,6 +47,11 @@ skills/
   amazon_hidden_money.md
   web_dev.md
 src/
+  agent/
+    operator_console.js
+    runtime.js
+  browser/
+    notifications.js
   brain.js
   browser.js
   database.js

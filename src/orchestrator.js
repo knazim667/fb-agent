@@ -2,9 +2,7 @@
 
 require('dotenv').config();
 
-const fs = require('fs/promises');
 const path = require('path');
-const readline = require('readline');
 
 const {
   AGENT_INSIGHTS_PATH,
@@ -18,6 +16,14 @@ const {
   summarizeDiscussion,
   scorePostAgainstSkill,
 } = require('./brain');
+const {
+  createBrowserLock,
+  runQueuedJobs,
+  scheduleStandardJobs,
+} = require('./agent/runtime');
+const {
+  startOperatorConsole,
+} = require('./agent/operator_console');
 const {
   DEFAULT_TASK_INPUT_PATH,
   clickLike,
@@ -112,33 +118,6 @@ const JOB_TYPES = {
   SEARCH_GROUPS: 'search_groups',
   BRIEF: 'brief',
 };
-
-function createBrowserLock() {
-  let chain = Promise.resolve();
-  let activeLabel = null;
-
-  return {
-    async runExclusive(label, task) {
-      const run = chain.then(async () => {
-        activeLabel = label;
-        try {
-          return await task();
-        } finally {
-          activeLabel = null;
-        }
-      });
-
-      chain = run.catch(() => {});
-      return run;
-    },
-    isBusy() {
-      return Boolean(activeLabel);
-    },
-    getActiveLabel() {
-      return activeLabel;
-    },
-  };
-}
 
 function isLikelyEnglishGroupName(name = '') {
   return /^[\x00-\x7F\s.,&()'"/|:+-]+$/.test(name);
@@ -1154,260 +1133,6 @@ function printSessionSummary(taskInput, skill, state, dbCounts) {
   }
 }
 
-async function scheduleStandardJobs() {
-  await enqueueUniqueJob({ type: JOB_TYPES.HOUSEKEEPING });
-  await enqueueUniqueJob({ type: JOB_TYPES.SCAN_GROUPS, runAt: new Date(Date.now() + 20_000) });
-  await enqueueUniqueJob({ type: JOB_TYPES.ENGAGE, runAt: new Date(Date.now() + 45_000) });
-}
-
-async function executeJob(job, page, skill, state, taskInput) {
-  switch (job.type) {
-    case JOB_TYPES.HOUSEKEEPING:
-      return runHousekeeping(page, skill, state);
-    case JOB_TYPES.SYNC_GROUPS:
-      return syncGroups(page);
-    case JOB_TYPES.VERIFY_PENDING:
-      return verifyPendingGroups(page);
-    case JOB_TYPES.SCAN_GROUPS:
-      return scanJoinedGroups(page, taskInput, skill, state);
-    case JOB_TYPES.ENGAGE:
-      return engageQualifiedPosts(page, skill, state);
-    case JOB_TYPES.REPLY:
-      return handleReplyLoop(page, skill, state, state.briefing);
-    case JOB_TYPES.BRIEF:
-      return summarizeInbox(page, skill, state);
-    case JOB_TYPES.SEARCH_GROUPS:
-      return searchAndJoinGroups(page, job.payload?.keyword || '', skill, state);
-    default:
-      throw new Error(`Unsupported job type: ${job.type}`);
-  }
-}
-
-async function runQueuedJobs(lock, page, skill, state, taskInput) {
-  await releaseExpiredJobs();
-
-  for (;;) {
-    const job = await leaseNextJob('browser-worker-1');
-    if (!job) {
-      break;
-    }
-
-    try {
-      const result = await lock.runExclusive(`job:${job.type}`, async () =>
-        executeJob(job, page, skill, state, taskInput)
-      );
-      await completeJob(job._id, result || null);
-    } catch (error) {
-      state.errors.push(`Job ${job.type} failed: ${error.message}`);
-      await failJob(job._id, error);
-    }
-  }
-}
-
-async function summarizeRecentPostsFromDb(limit = 12) {
-  const { posts } = getCollections();
-  const recentPosts = await posts.find({})
-    .sort({ updated_at: -1, created_at: -1 })
-    .limit(limit)
-    .lean();
-
-  if (!recentPosts.length) {
-    return 'No recent scanned posts are saved yet.';
-  }
-
-  const samples = recentPosts
-    .map((post) => `- [${post.group}] ${String(post.content || '').slice(0, 280)}`)
-    .join('\n');
-
-  try {
-    const summary = await callOllama([
-      'Summarize what people are talking about across these Facebook group posts.',
-      'Keep it short and practical in 4 bullet-style lines or fewer.',
-      '',
-      samples,
-    ].join('\n'), {
-      model: MORNING_BRIEFING_MODEL,
-      timeoutMs: 30_000,
-      generationOptions: {
-        temperature: 0.2,
-        num_ctx: 2048,
-        num_predict: 180,
-      },
-    });
-
-    return summary || 'Recent posts were found, but the summary came back empty.';
-  } catch (_error) {
-    return `Recent post samples:\n${samples}`;
-  }
-}
-
-async function answerOperatorQuestion(input, page) {
-  const normalized = input.toLowerCase();
-
-  if (/how many groups|total groups|groups joined/.test(normalized)) {
-    const joined = await getGroupsByStatus('joined', { limit: 500 });
-    const pending = await getGroupsByStatus('pending', { limit: 500 });
-    const discovered = await getGroupsByStatus('discovered', { limit: 500 });
-    return `Groups in DB: ${joined.length} joined, ${pending.length} pending, ${discovered.length} discovered.`;
-  }
-
-  if (/not only amazon|non[- ]amazon|not amazon related|any group.*not.*amazon/.test(normalized)) {
-    const joined = await getGroupsByStatus('joined', { limit: 500 });
-    const nonAmazon = joined.filter((group) => !isRelevantAmazonGroupName(group.name));
-    if (!nonAmazon.length) {
-      return 'All joined groups currently saved in DB look Amazon/FBA-related.';
-    }
-
-    return `Joined non-Amazon or weak-fit groups:\n${nonAmazon
-      .slice(0, 20)
-      .map((group) => `- ${group.name}`)
-      .join('\n')}`;
-  }
-
-  if (/what people are posting|people posting about|what are people talking about|summarize posts/.test(normalized)) {
-    return summarizeRecentPostsFromDb();
-  }
-
-  if (/what notification|notifications now|show notifications|any notifications/.test(normalized)) {
-    const notifications = await scrapeNotifications(page, { limit: 8 });
-    if (!notifications.length) {
-      return 'No visible notifications were scraped right now.';
-    }
-
-    return `Latest notifications:\n${notifications
-      .map((item, index) => `${index + 1}. ${item.text}`)
-      .join('\n')}`;
-  }
-
-  return [
-    'I can answer these live console questions right now:',
-    '- how many groups total we joined',
-    '- any group not only amazon related',
-    '- what people are posting about in any group',
-    '- what notification we have now',
-    '',
-    'You can also use commands: status, groups, notifications, posts, scan, engage, reply, sync, exit',
-  ].join('\n');
-}
-
-function startOperatorConsole({ page, taskInput, skill, state, lock }) {
-  const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout,
-    prompt: 'fb-agent> ',
-  });
-
-  let busy = false;
-
-  const run = async (input) => {
-    const raw = input.trim();
-    if (!raw) {
-      return;
-    }
-
-    const normalized = raw.toLowerCase();
-
-    if (normalized === 'help') {
-      console.log('Commands: status, groups, notifications, posts, brief, sync, verify, search [keyword], scan, engage, reply, exit');
-      return;
-    }
-
-    if (normalized === 'exit' || normalized === 'quit') {
-      rl.close();
-      process.exit(0);
-    }
-
-    if (busy) {
-      console.log('A task is already running. Please wait for it to finish.');
-      return;
-    }
-
-    busy = true;
-
-    try {
-      if (normalized === 'status' || normalized === 'stats') {
-        const joined = await getGroupsByStatus('joined', { limit: 500 });
-        const pending = await getGroupsByStatus('pending', { limit: 500 });
-        const discovered = await getGroupsByStatus('discovered', { limit: 500 });
-        const queuedJobs = await getJobsByStatus('queued', { limit: 200 });
-        const runningJobs = await getJobsByStatus('running', { limit: 50 });
-        console.log(`Status: ${joined.length} joined, ${pending.length} pending, ${discovered.length} discovered, ${queuedJobs.length} queued jobs, ${runningJobs.length} running jobs.`);
-      } else if (normalized === 'groups') {
-        const joined = await getGroupsByStatus('joined', { limit: 50 });
-        if (!joined.length) {
-          console.log('No joined groups are saved yet.');
-        } else {
-          console.log(`Joined groups (${joined.length}):`);
-          for (const group of joined.slice(0, 25)) {
-            console.log(`- ${group.name}`);
-          }
-        }
-      } else if (normalized === 'notifications') {
-        const answer = await lock.runExclusive('operator:notifications', async () =>
-          answerOperatorQuestion('what notification we have now', page)
-        );
-        console.log(answer);
-      } else if (normalized === 'posts') {
-        console.log(await summarizeRecentPostsFromDb());
-      } else if (normalized === 'brief') {
-        await enqueueUniqueJob({ type: JOB_TYPES.BRIEF });
-        console.log('Queued: brief');
-        await runQueuedJobs(lock, page, skill, state, taskInput);
-      } else if (normalized === 'sync') {
-        await enqueueUniqueJob({ type: JOB_TYPES.SYNC_GROUPS });
-        console.log('Queued: sync_groups');
-        await runQueuedJobs(lock, page, skill, state, taskInput);
-      } else if (normalized === 'verify') {
-        await enqueueUniqueJob({ type: JOB_TYPES.VERIFY_PENDING });
-        console.log('Queued: verify_pending');
-        await runQueuedJobs(lock, page, skill, state, taskInput);
-      } else if (normalized === 'scan') {
-        await enqueueUniqueJob({ type: JOB_TYPES.SCAN_GROUPS });
-        console.log('Queued: scan_groups');
-        await runQueuedJobs(lock, page, skill, state, taskInput);
-      } else if (normalized === 'engage') {
-        await enqueueUniqueJob({ type: JOB_TYPES.ENGAGE });
-        console.log('Queued: engage');
-        await runQueuedJobs(lock, page, skill, state, taskInput);
-      } else if (normalized === 'reply') {
-        await enqueueUniqueJob({ type: JOB_TYPES.REPLY });
-        console.log('Queued: reply');
-        await runQueuedJobs(lock, page, skill, state, taskInput);
-      } else if (normalized.startsWith('search ')) {
-        const keyword = raw.slice(7).trim();
-        await enqueueUniqueJob({
-          type: JOB_TYPES.SEARCH_GROUPS,
-          payload: { keyword },
-        });
-        console.log(`Queued: search_groups (${keyword})`);
-        await runQueuedJobs(lock, page, skill, state, taskInput);
-      } else {
-        const answer = await lock.runExclusive('operator:question', async () =>
-          answerOperatorQuestion(raw, page)
-        );
-        console.log(answer);
-      }
-    } catch (error) {
-      console.log(`Command failed: ${error.message}`);
-    } finally {
-      busy = false;
-      rl.prompt();
-    }
-  };
-
-  rl.on('line', (line) => {
-    run(line);
-  });
-
-  rl.on('close', () => {
-    console.log('Operator console closed.');
-  });
-
-  console.log('Operator console ready. Type `help` for commands or ask a plain-English status question.');
-  rl.prompt();
-  return rl;
-}
-
 async function runAssistantSession(options = {}) {
   const taskInputPath = options.taskInputPath || DEFAULT_TASK_INPUT_PATH;
   const taskInput = await readTaskInput(taskInputPath);
@@ -1441,20 +1166,58 @@ async function runAssistantSession(options = {}) {
     console.log(`Using skill: ${skill.id}`);
 
     await ensureMemoryFile();
-    await scheduleStandardJobs();
-    await runQueuedJobs(lock, browser.page, skill, state, taskInput);
+    const runtimeContext = {
+      lock,
+      page: browser.page,
+      skill,
+      state,
+      taskInput,
+      jobTypes: JOB_TYPES,
+      enqueueUniqueJob,
+      releaseExpiredJobs,
+      leaseNextJob,
+      completeJob,
+      failJob,
+      runHousekeeping,
+      syncGroups,
+      verifyPendingGroups,
+      scanJoinedGroups,
+      engageQualifiedPosts,
+      handleReplyLoop,
+      summarizeInbox,
+      searchAndJoinGroups,
+    };
+
+    await scheduleStandardJobs({
+      enqueueUniqueJob,
+      jobTypes: JOB_TYPES,
+    });
+    await runQueuedJobs(runtimeContext);
     startOperatorConsole({
       page: browser.page,
       taskInput,
       skill,
       state,
       lock,
+      getGroupsByStatus,
+      getJobsByStatus,
+      enqueueUniqueJob,
+      runQueuedJobs: () => runQueuedJobs(runtimeContext),
+      scrapeNotifications,
+      isRelevantAmazonGroupName,
+      getCollections,
+      callOllama,
+      model: MORNING_BRIEFING_MODEL,
+      jobTypes: JOB_TYPES,
     });
 
     setInterval(async () => {
       try {
-        await scheduleStandardJobs();
-        await runQueuedJobs(lock, browser.page, skill, state, taskInput);
+        await scheduleStandardJobs({
+          enqueueUniqueJob,
+          jobTypes: JOB_TYPES,
+        });
+        await runQueuedJobs(runtimeContext);
         printSessionSummary(taskInput, skill, state, existingCounts);
       } catch (error) {
         console.error(`Housekeeping interval failed: ${error.message}`);
@@ -1463,7 +1226,7 @@ async function runAssistantSession(options = {}) {
 
     setInterval(async () => {
       try {
-        await runQueuedJobs(lock, browser.page, skill, state, taskInput);
+        await runQueuedJobs(runtimeContext);
       } catch (error) {
         console.error(`Job runner failed: ${error.message}`);
       }
