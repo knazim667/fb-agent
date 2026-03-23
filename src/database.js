@@ -131,6 +131,15 @@ const jobSchema = new mongoose.Schema(
 jobSchema.index({ status: 1, runAt: 1 });
 jobSchema.index({ lockedBy: 1, lockedAt: 1 });
 
+const agentStateSchema = new mongoose.Schema(
+  {
+    key: { type: String, required: true, unique: true, index: true },
+    value: { type: mongoose.Schema.Types.Mixed, default: null },
+    updated_at: { type: Date, default: Date.now, index: true },
+  },
+  { collection: 'Agent_State', versionKey: false }
+);
+
 const Post = mongoose.models.Post || mongoose.model('Post', postSchema);
 const Lead = mongoose.models.Lead || mongoose.model('Lead', leadSchema);
 const Interaction =
@@ -142,6 +151,7 @@ const DiscoveredGroup =
   mongoose.models.DiscoveredGroup ||
   mongoose.model('DiscoveredGroup', discoveredGroupSchema);
 const Job = mongoose.models.Job || mongoose.model('Job', jobSchema);
+const AgentState = mongoose.models.AgentState || mongoose.model('AgentState', agentStateSchema);
 
 async function connectDatabase({
   uri = DEFAULT_URI,
@@ -214,6 +224,7 @@ async function setupCollections() {
       ContextMemory.init(),
       DiscoveredGroup.init(),
       Job.init(),
+      AgentState.init(),
     ]);
     isInitialized = true;
   }
@@ -227,6 +238,7 @@ function getCollections() {
     contextMemory: ContextMemory,
     discoveredGroups: DiscoveredGroup,
     jobs: Job,
+    agentState: AgentState,
   };
 }
 
@@ -449,7 +461,6 @@ async function saveDiscoveredGroups(keyword, groups = []) {
           last_seen_at: now,
         },
         $setOnInsert: {
-          keyword,
           url: group.url,
           discovered_at: now,
         },
@@ -719,6 +730,28 @@ async function getJobsByStatus(status, { limit = 100 } = {}) {
     .lean();
 }
 
+async function upsertAgentState(key, value) {
+  await AgentState.updateOne(
+    { key },
+    {
+      $set: {
+        value,
+        updated_at: new Date(),
+      },
+      $setOnInsert: {
+        key,
+      },
+    },
+    { upsert: true }
+  );
+
+  return AgentState.findOne({ key }).lean();
+}
+
+async function getAgentState(key) {
+  return AgentState.findOne({ key }).lean();
+}
+
 module.exports = {
   DEFAULT_DB_NAME,
   DEFAULT_URI,
@@ -729,6 +762,7 @@ module.exports = {
   enqueueJob,
   enqueueUniqueJob,
   failJob,
+  getAgentState,
   findPostById,
   findExistingQueuedJob,
   getCollections,
@@ -749,6 +783,7 @@ module.exports = {
   saveDiscoveredGroups,
   setupCollections,
   getLeadsByInteractionResult,
+  upsertAgentState,
   updateDiscoveredGroupStatus,
   updateLeadInteractionResult,
   updateLeadStatus,

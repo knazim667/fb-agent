@@ -39,6 +39,48 @@ async function summarizeRecentPostsFromDb(getCollections, callOllama, model, lim
   }
 }
 
+async function buildDashboard(deps) {
+  const {
+    getGroupsByStatus,
+    getJobsByStatus,
+    getCollections,
+    getAgentState,
+  } = deps;
+  const { leads, interactions } = getCollections();
+  const [joined, pending, discovered, queuedJobs, runningJobs, accountSummary] = await Promise.all([
+    getGroupsByStatus('joined', { limit: 1000 }),
+    getGroupsByStatus('pending', { limit: 1000 }),
+    getGroupsByStatus('discovered', { limit: 1000 }),
+    getJobsByStatus('queued', { limit: 500 }),
+    getJobsByStatus('running', { limit: 100 }),
+    getAgentState('account_group_summary'),
+  ]);
+
+  const [newLeads, warmLeads, successfulLeads, todaysInteractions] = await Promise.all([
+    leads.countDocuments({ status: 'New' }),
+    leads.countDocuments({ status: 'Warm' }),
+    leads.countDocuments({ interaction_result: 'Success' }),
+    interactions.countDocuments({
+      timestamp: { $gte: new Date(new Date().setHours(0, 0, 0, 0)) },
+    }),
+  ]);
+
+  const totalJoined = accountSummary?.value?.totalJoinedGroups || joined.length;
+  const lastSync = accountSummary?.value?.lastFullSyncAt
+    ? new Date(accountSummary.value.lastFullSyncAt).toLocaleString()
+    : 'never';
+
+  return [
+    '=== Agent Dashboard ===',
+    `Account-level joined groups: ${totalJoined}`,
+    `Tracked groups in DB: ${joined.length} joined, ${pending.length} pending, ${discovered.length} discovered`,
+    `Jobs: ${queuedJobs.length} queued, ${runningJobs.length} running`,
+    `Leads: ${newLeads} new, ${warmLeads} warm, ${successfulLeads} successful`,
+    `Today's interactions: ${todaysInteractions}`,
+    `Last full group sync: ${lastSync}`,
+  ].join('\n');
+}
+
 async function answerOperatorQuestion(input, deps) {
   const {
     page,
@@ -48,6 +90,7 @@ async function answerOperatorQuestion(input, deps) {
     getCollections,
     callOllama,
     model,
+    getAgentState,
   } = deps;
   const normalized = input.toLowerCase();
 
@@ -55,7 +98,9 @@ async function answerOperatorQuestion(input, deps) {
     const joined = await getGroupsByStatus('joined', { limit: 500 });
     const pending = await getGroupsByStatus('pending', { limit: 500 });
     const discovered = await getGroupsByStatus('discovered', { limit: 500 });
-    return `Groups in DB: ${joined.length} joined, ${pending.length} pending, ${discovered.length} discovered.`;
+    const accountSummary = await getAgentState('account_group_summary');
+    const totalJoined = accountSummary?.value?.totalJoinedGroups || joined.length;
+    return `Account-level groups joined: ${totalJoined}. Tracked in DB: ${joined.length} joined, ${pending.length} pending, ${discovered.length} discovered.`;
   }
 
   if (/not only amazon|non[- ]amazon|not amazon related|any group.*not.*amazon/.test(normalized)) {
@@ -93,8 +138,141 @@ async function answerOperatorQuestion(input, deps) {
     '- what people are posting about in any group',
     '- what notification we have now',
     '',
-    'You can also use commands: status, groups, notifications, posts, brief, sync, verify, search [keyword], scan, engage, reply, exit',
+    'You can also use commands: dashboard, status, groups, notifications, posts, brief, sync, verify, search [keyword], scan, engage, reply, exit',
   ].join('\n');
+}
+
+function inferIntentHeuristically(input) {
+  const normalized = input.trim().toLowerCase();
+
+  if (!normalized) {
+    return { type: 'noop' };
+  }
+
+  if (normalized === 'help') {
+    return { type: 'help' };
+  }
+
+  if (normalized === 'exit' || normalized === 'quit') {
+    return { type: 'exit' };
+  }
+
+  if (normalized === 'dashboard' || /what happened today|overall health|show dashboard|health status/.test(normalized)) {
+    return { type: 'dashboard' };
+  }
+
+  if (normalized === 'status' || normalized === 'stats' || /show status|current status/.test(normalized)) {
+    return { type: 'status' };
+  }
+
+  if (normalized === 'groups' || /show groups|list groups/.test(normalized)) {
+    return { type: 'groups' };
+  }
+
+  if (normalized === 'notifications' || /show notifications|check notifications|what notifications/.test(normalized)) {
+    return { type: 'notifications' };
+  }
+
+  if (normalized === 'posts' || /what people are posting|summarize posts|what are people talking about/.test(normalized)) {
+    return { type: 'posts' };
+  }
+
+  if (normalized === 'brief' || /morning briefing|give me a briefing/.test(normalized)) {
+    return { type: 'brief' };
+  }
+
+  if (normalized === 'sync' || /sync groups|refresh groups|update joined groups/.test(normalized)) {
+    return { type: 'sync' };
+  }
+
+  if (normalized === 'verify' || /verify pending|check pending groups/.test(normalized)) {
+    return { type: 'verify' };
+  }
+
+  if (normalized === 'scan' || /scan(?: the)? groups|look for leads|find posts|check groups for leads/.test(normalized)) {
+    return { type: 'scan' };
+  }
+
+  if (normalized === 'engage' || /engage leads|start engaging|do engagement|comment and like/.test(normalized)) {
+    return { type: 'engage' };
+  }
+
+  if (normalized === 'reply' || /reply to notifications|reply to leads|answer replies/.test(normalized)) {
+    return { type: 'reply' };
+  }
+
+  if (normalized.startsWith('search ')) {
+    return { type: 'search', keyword: input.trim().slice(7).trim() };
+  }
+
+  const searchMatch = input.match(/(?:find|search|look for|join)\s+groups?\s+(?:about|for)?\s*(.+)$/i);
+  if (searchMatch && searchMatch[1]) {
+    return { type: 'search', keyword: searchMatch[1].trim() };
+  }
+
+  return { type: 'question', text: input.trim() };
+}
+
+async function inferIntentWithModel(input, deps) {
+  const { callOllama, model } = deps;
+
+  try {
+    const raw = await callOllama([
+      'Map this operator request to one console intent.',
+      'Return JSON only.',
+      'Valid intents:',
+      'dashboard, status, groups, notifications, posts, brief, sync, verify, scan, engage, reply, search, question, exit',
+      'If intent is search, include {"keyword":"..."}',
+      'If intent is question, include {"question":"..."}',
+      '',
+      `REQUEST: "${input}"`,
+      '',
+      'JSON:',
+    ].join('\n'), {
+      model,
+      timeoutMs: 15_000,
+      generationOptions: {
+        temperature: 0.1,
+        num_ctx: 1024,
+        num_predict: 120,
+      },
+    });
+
+    const jsonMatch = raw.match(/\{[\s\S]*\}/);
+    const parsed = jsonMatch ? JSON.parse(jsonMatch[0].replace(/'/g, '"')) : null;
+    if (!parsed?.intent) {
+      return null;
+    }
+
+    if (parsed.intent === 'search') {
+      return {
+        type: 'search',
+        keyword: String(parsed.keyword || '').trim(),
+      };
+    }
+
+    if (parsed.intent === 'question') {
+      return {
+        type: 'question',
+        text: String(parsed.question || input).trim(),
+      };
+    }
+
+    return { type: String(parsed.intent).trim().toLowerCase() };
+  } catch (_error) {
+    return null;
+  }
+}
+
+async function routeOperatorIntent(input, deps) {
+  const heuristic = inferIntentHeuristically(input);
+
+  if (heuristic.type !== 'question') {
+    return heuristic;
+  }
+
+  const aiIntent = await inferIntentWithModel(input, deps);
+  return aiIntent || heuristic;
 }
 
 function startOperatorConsole(deps) {
@@ -114,6 +292,7 @@ function startOperatorConsole(deps) {
     callOllama,
     model,
     jobTypes,
+    getAgentState,
   } = deps;
 
   const rl = readline.createInterface({
@@ -132,12 +311,17 @@ function startOperatorConsole(deps) {
 
     const normalized = raw.toLowerCase();
 
-    if (normalized === 'help') {
-      console.log('Commands: status, groups, notifications, posts, brief, sync, verify, search [keyword], scan, engage, reply, exit');
+    const intent = await routeOperatorIntent(raw, {
+      callOllama,
+      model,
+    });
+
+    if (intent.type === 'help') {
+      console.log('Commands: dashboard, status, groups, notifications, posts, brief, sync, verify, search [keyword], scan, engage, reply, exit');
       return;
     }
 
-    if (normalized === 'exit' || normalized === 'quit') {
+    if (intent.type === 'exit') {
       rl.close();
       process.exit(0);
     }
@@ -150,14 +334,21 @@ function startOperatorConsole(deps) {
     busy = true;
 
     try {
-      if (normalized === 'status' || normalized === 'stats') {
+      if (intent.type === 'dashboard') {
+        console.log(await buildDashboard({
+          getGroupsByStatus,
+          getJobsByStatus,
+          getCollections,
+          getAgentState,
+        }));
+      } else if (intent.type === 'status') {
         const joined = await getGroupsByStatus('joined', { limit: 500 });
         const pending = await getGroupsByStatus('pending', { limit: 500 });
         const discovered = await getGroupsByStatus('discovered', { limit: 500 });
         const queuedJobs = await getJobsByStatus('queued', { limit: 200 });
         const runningJobs = await getJobsByStatus('running', { limit: 50 });
         console.log(`Status: ${joined.length} joined, ${pending.length} pending, ${discovered.length} discovered, ${queuedJobs.length} queued jobs, ${runningJobs.length} running jobs.`);
-      } else if (normalized === 'groups') {
+      } else if (intent.type === 'groups') {
         const joined = await getGroupsByStatus('joined', { limit: 50 });
         if (!joined.length) {
           console.log('No joined groups are saved yet.');
@@ -167,7 +358,7 @@ function startOperatorConsole(deps) {
             console.log(`- ${group.name}`);
           }
         }
-      } else if (normalized === 'notifications') {
+      } else if (intent.type === 'notifications') {
         const answer = await lock.runExclusive('operator:notifications', async () =>
           answerOperatorQuestion('what notification we have now', {
             page,
@@ -177,46 +368,51 @@ function startOperatorConsole(deps) {
             getCollections,
             callOllama,
             model,
+            getAgentState,
           })
         );
         console.log(answer);
-      } else if (normalized === 'posts') {
+      } else if (intent.type === 'posts') {
         console.log(await summarizeRecentPostsFromDb(getCollections, callOllama, model));
-      } else if (normalized === 'brief') {
+      } else if (intent.type === 'brief') {
         await enqueueUniqueJob({ type: jobTypes.BRIEF });
         console.log('Queued: brief');
         await runQueuedJobs();
-      } else if (normalized === 'sync') {
+      } else if (intent.type === 'sync') {
         await enqueueUniqueJob({ type: jobTypes.SYNC_GROUPS });
         console.log('Queued: sync_groups');
         await runQueuedJobs();
-      } else if (normalized === 'verify') {
+      } else if (intent.type === 'verify') {
         await enqueueUniqueJob({ type: jobTypes.VERIFY_PENDING });
         console.log('Queued: verify_pending');
         await runQueuedJobs();
-      } else if (normalized === 'scan') {
+      } else if (intent.type === 'scan') {
         await enqueueUniqueJob({ type: jobTypes.SCAN_GROUPS });
         console.log('Queued: scan_groups');
         await runQueuedJobs();
-      } else if (normalized === 'engage') {
+      } else if (intent.type === 'engage') {
         await enqueueUniqueJob({ type: jobTypes.ENGAGE });
         console.log('Queued: engage');
         await runQueuedJobs();
-      } else if (normalized === 'reply') {
+      } else if (intent.type === 'reply') {
         await enqueueUniqueJob({ type: jobTypes.REPLY });
         console.log('Queued: reply');
         await runQueuedJobs();
-      } else if (normalized.startsWith('search ')) {
-        const keyword = raw.slice(7).trim();
-        await enqueueUniqueJob({
-          type: jobTypes.SEARCH_GROUPS,
-          payload: { keyword },
-        });
-        console.log(`Queued: search_groups (${keyword})`);
-        await runQueuedJobs();
+      } else if (intent.type === 'search') {
+        const keyword = String(intent.keyword || '').trim();
+        if (!keyword) {
+          console.log('Please include a group keyword after search.');
+        } else {
+          await enqueueUniqueJob({
+            type: jobTypes.SEARCH_GROUPS,
+            payload: { keyword },
+          });
+          console.log(`Queued: search_groups (${keyword})`);
+          await runQueuedJobs();
+        }
       } else {
         const answer = await lock.runExclusive('operator:question', async () =>
-          answerOperatorQuestion(raw, {
+          answerOperatorQuestion(intent.text || raw, {
             page,
             getGroupsByStatus,
             scrapeNotifications,
@@ -224,6 +420,7 @@ function startOperatorConsole(deps) {
             getCollections,
             callOllama,
             model,
+            getAgentState,
           })
         );
         console.log(answer);
@@ -251,6 +448,9 @@ function startOperatorConsole(deps) {
 
 module.exports = {
   answerOperatorQuestion,
+  buildDashboard,
+  inferIntentHeuristically,
+  routeOperatorIntent,
   startOperatorConsole,
   summarizeRecentPostsFromDb,
 };

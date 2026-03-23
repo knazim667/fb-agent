@@ -59,6 +59,7 @@ const {
   findGroupByName,
   findLeadByPostId,
   findPostById,
+  getAgentState,
   getCollections,
   getContextMemory,
   getDiscoveredGroups,
@@ -73,6 +74,7 @@ const {
   releaseExpiredJobs,
   saveDiscoveredGroups,
   setupCollections,
+  upsertAgentState,
   updateDiscoveredGroupStatus,
   updateLeadInteractionResult,
   updateLeadStatus,
@@ -399,13 +401,18 @@ async function resolveScannableGroups(page, taskInput) {
 }
 
 async function syncGroups(page) {
-  const joinedGroups = await scrapeJoinedGroups(page, { limit: 120 });
+  const joinedGroups = await scrapeJoinedGroups(page, { limit: 500, scrollRounds: 14 });
   if (joinedGroups.length) {
     await saveDiscoveredGroups('__joined_sync__', joinedGroups.map((group) => ({
       ...group,
       status: 'joined',
       source: group.source || 'groups_feed',
     })));
+    await upsertAgentState('account_group_summary', {
+      totalJoinedGroups: joinedGroups.length,
+      lastFullSyncAt: new Date(),
+      sampleGroupNames: joinedGroups.slice(0, 20).map((group) => group.name),
+    });
   }
 
   const approvals = await scrapeJoinApprovalNotifications(page, { limit: 10 });
@@ -421,7 +428,7 @@ async function syncGroups(page) {
     updated += 1;
   }
 
-  console.log(`Group sync complete. Joined approvals updated: ${updated}. Joined groups synced from feed: ${joinedGroups.length}`);
+  console.log(`Group sync complete. Joined approvals updated: ${updated}. Account-level joined groups synced: ${joinedGroups.length}`);
   return {
     approvalsUpdated: updated,
     joinedGroupsSynced: joinedGroups.length,
@@ -1201,6 +1208,7 @@ async function runAssistantSession(options = {}) {
       lock,
       getGroupsByStatus,
       getJobsByStatus,
+      getAgentState,
       enqueueUniqueJob,
       runQueuedJobs: () => runQueuedJobs(runtimeContext),
       scrapeNotifications,

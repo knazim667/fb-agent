@@ -29,7 +29,7 @@ Available commands:
 - `reply` to answer notification threads and inbox leads
 - `sync` to refresh joined-group state from notifications and the groups feed
 - `verify` to revisit pending groups and mark newly joined ones
-- `status`, `groups`, `notifications`, `posts`, `brief`
+- `dashboard`, `status`, `groups`, `notifications`, `posts`, `brief`
 - `exit` to close the session
 
 You can also ask plain-English questions like:
@@ -51,6 +51,9 @@ src/
     operator_console.js
     runtime.js
   browser/
+    feed.js
+    groups.js
+    interactions.js
     notifications.js
   brain.js
   browser.js
@@ -72,6 +75,12 @@ task_input.json
 ```bash
 npm install
 node setup.js
+```
+
+Run tests:
+
+```bash
+npm test
 ```
 
 Optional `.env` example:
@@ -99,5 +108,6 @@ The browser opens in visible mode so you can complete Facebook login and any che
 
 - Facebook selectors change frequently, so some UI flows may need light tuning over time.
 - Group discovery and joined-group sync are cached in MongoDB.
+- The agent performs an account-level joined-group sync so it can track how many groups the logged-in Facebook account already belongs to overall, not just Amazon groups.
 - The current `task_input.json` is configured for the Amazon Hidden Money workflow.
 - The browser session is persisted in `user_data/`, so Facebook login and 2FA should usually be one-time.
