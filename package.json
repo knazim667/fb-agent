@@ -1,0 +1,16 @@
+{
+  "name": "fb-agent",
+  "version": "1.0.0",
+  "description": "Multi-skill task-oriented AI agent for Facebook automation.",
+  "main": "src/orchestrator.js",
+  "scripts": {
+    "start": "node src/orchestrator.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "mongoose": "^8.13.2",
+    "playwright": "^1.52.0",
+    "playwright-extra": "^4.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
+  }
+}

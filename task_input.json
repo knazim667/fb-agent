@@ -1,0 +1,20 @@
+{
+  "active_skill": "amazon_hidden_money",
+  "target_groups": [
+    "Amazon FBA Sellers",
+    "Amazon Private Label",
+    "FBA Growth"
+  ],
+  "triggers": [
+    "fees are too high",
+    "profit is low",
+    "don't understand settlement",
+    "lost my inventory",
+    "reimbursement"
+  ],
+  "daily_limits": {
+    "comments": 10,
+    "likes": 20,
+    "posts": 5
+  }
+}
