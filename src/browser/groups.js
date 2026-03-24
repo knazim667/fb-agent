@@ -8,12 +8,80 @@ function createGroupsApi({
   isCanonicalGroupUrl,
   isLikelyGroupName,
 }) {
+  function parseActivityToHours(activityText = '') {
+    const normalized = String(activityText).toLowerCase().trim();
+    if (!normalized) {
+      return null;
+    }
+
+    if (/a few seconds|few seconds|just now/.test(normalized)) {
+      return 0;
+    }
+
+    const minuteMatch = normalized.match(/(\d+|an?|few)\s+minutes?/);
+    if (minuteMatch) {
+      const raw = minuteMatch[1];
+      const minutes = raw === 'a' || raw === 'an' ? 1 : raw === 'few' ? 3 : Number(raw);
+      return minutes / 60;
+    }
+
+    if (/about an hour|an hour|a hour/.test(normalized)) {
+      return 1;
+    }
+
+    const hourMatch = normalized.match(/(\d+)\s+hours?/);
+    if (hourMatch) {
+      return Number(hourMatch[1]);
+    }
+
+    const dayMatch = normalized.match(/(\d+|an?|few)\s+days?/);
+    if (dayMatch) {
+      const raw = dayMatch[1];
+      const days = raw === 'a' || raw === 'an' ? 1 : raw === 'few' ? 3 : Number(raw);
+      return days * 24;
+    }
+
+    const weekMatch = normalized.match(/(\d+|an?)\s+weeks?/);
+    if (weekMatch) {
+      const raw = weekMatch[1];
+      const weeks = raw === 'a' || raw === 'an' ? 1 : Number(raw);
+      return weeks * 24 * 7;
+    }
+
+    const monthMatch = normalized.match(/(\d+|an?)\s+months?/);
+    if (monthMatch) {
+      const raw = monthMatch[1];
+      const months = raw === 'a' || raw === 'an' ? 1 : Number(raw);
+      return months * 24 * 30;
+    }
+
+    const yearMatch = normalized.match(/(\d+|an?|a)\s+years?/);
+    if (yearMatch) {
+      const raw = yearMatch[1];
+      const years = raw === 'a' || raw === 'an' ? 1 : Number(raw);
+      return years * 24 * 365;
+    }
+
+    return null;
+  }
+
+  async function inspectGroupActivity(page) {
+    const bodyText = await page.locator('body').innerText().catch(() => '');
+    const match = bodyText.match(/Last active\s+([^\n]+)/i);
+    const activityLabel = match ? match[1].trim() : null;
+    const activityAgeHours = activityLabel ? parseActivityToHours(activityLabel) : null;
+    return {
+      activityLabel,
+      activityAgeHours,
+    };
+  }
+
   async function visitGroup(page, groupUrl) {
     await page.goto(groupUrl, {
       waitUntil: 'domcontentloaded',
       timeout: 90_000,
     });
-    await lightHumanPause(page, 2_000, 5_000);
+    await lightHumanPause(page, 1_000, 2_000);
     return page.url();
   }
 
@@ -361,6 +429,13 @@ function createGroupsApi({
 
     const joinDialog = page.locator('div[role="dialog"]').last();
     if ((await joinDialog.count()) && (await joinDialog.isVisible())) {
+      if (typeof options.dynamicJoinLoop === 'function') {
+        const dynamicResult = await options.dynamicJoinLoop(page, joinDialog);
+        if (dynamicResult) {
+          return dynamicResult;
+        }
+      }
+
       let modalHandled = false;
       let answeredQuestions = [];
       let answers = [];
@@ -543,7 +618,9 @@ function createGroupsApi({
     discoverGroups,
     handleJoinGroup,
     inspectGroupMembershipStatus,
+    inspectGroupActivity,
     isCreatePostComposerVisible,
+    parseActivityToHours,
     scrapeJoinedGroups,
     visitGroup,
   };

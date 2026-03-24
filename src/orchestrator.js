@@ -3,24 +3,34 @@
 require('dotenv').config();
 
 const path = require('path');
+const readline = require('node:readline/promises');
 
 const {
   AGENT_INSIGHTS_PATH,
   appendAgentInsights,
   callOllama,
+  decideNextDomAction,
+  DEFAULT_MODEL_PROVIDER,
+  DEFAULT_OLLAMA_MODEL,
+  DEFAULT_OPENAI_MODEL,
   draftReply,
+  getModelRuntimeConfig,
   MORNING_BRIEFING_MODEL,
   ensureMemoryFile,
   readAgentInsights,
   resolveSkillForTask,
+  setModelRuntimeConfig,
   summarizeDiscussion,
   scorePostAgainstSkill,
 } = require('./brain');
 const {
   createBrowserLock,
   runQueuedJobs,
-  scheduleStandardJobs,
 } = require('./agent/runtime');
+const {
+  ensureWorkspaceDocs,
+  loadWorkspaceContext,
+} = require('./workspace');
 const {
   startOperatorConsole,
 } = require('./agent/operator_console');
@@ -28,19 +38,26 @@ const {
   DEFAULT_TASK_INPUT_PATH,
   clickLike,
   closeBrowser,
+  createFeedPost,
   createNewPost,
   discoverGroups,
   ensureLoggedIn,
+  executeAgentAction,
+  extractPostIdFromUrl,
   extractGroupIdFromUrl,
+  getSimplifiedDOM,
   handleJoinGroup,
   humanJitter,
+  inspectGroupActivity,
   inspectGroupMembershipStatus,
   isCreatePostComposerVisible,
   isCanonicalGroupUrl,
   isLikelyGroupName,
   launchBrowser,
+  markNotificationsRead,
   postComment,
   readTaskInput,
+  classifyPageState,
   scrapeGroupFeed,
   scrapeInboxPreviews,
   scrapeJoinApprovalNotifications,
@@ -51,6 +68,7 @@ const {
 } = require('./browser');
 const {
   appendThreadHistory,
+  clearJobs,
   closeDatabase,
   completeJob,
   connectDatabase,
@@ -110,6 +128,8 @@ const DEFAULT_OUTBOUND_POSTS = [
   'Most Amazon sellers watch sales closely but do not review settlements deeply enough to catch hidden losses and reimbursement gaps.',
 ];
 const HOUSEKEEPING_INTERVAL_MS = 3 * 60 * 60 * 1000;
+const MAX_GROUPS_PER_SCAN = Number(process.env.MAX_GROUPS_PER_SCAN || 8);
+const MAX_ACTIVITY_AGE_HOURS = Number(process.env.MAX_ACTIVITY_AGE_HOURS || 24 * 14);
 const JOB_TYPES = {
   HOUSEKEEPING: 'housekeeping',
   SYNC_GROUPS: 'sync_groups',
@@ -120,6 +140,7 @@ const JOB_TYPES = {
   SEARCH_GROUPS: 'search_groups',
   BRIEF: 'brief',
 };
+const STALL_TIMEOUT_MS = 120_000;
 
 function isLikelyEnglishGroupName(name = '') {
   return /^[\x00-\x7F\s.,&()'"/|:+-]+$/.test(name);
@@ -127,10 +148,25 @@ function isLikelyEnglishGroupName(name = '') {
 
 function isRelevantAmazonGroupName(name = '') {
   const text = name.toLowerCase();
-  return (
-    /(amazon|fba|private label|wholesale|seller|ecommerce|ppc)/i.test(text) &&
-    !/(crypto|forex|loan|dating|casino|review group|buyer and seller|virtual assistant|chinese seller|ksa|uae|walmart|ebay|suspension|legal issues)/i.test(text)
-  );
+  const strongSignals = /(amazon|fba|amz|private label|wholesale|ppc|seller|brand builders?|reimbursement|inventory|settlement)/i;
+  const weakOrOffTarget = /(crypto|forex|loan|dating|casino|review(?:ers?| group)?|buyer\b|buyers\b|buyer group|seller & buyer|buyer & seller|virtual assistant|\bva\b|chinese|🇨🇳|ksa|uae|walmart|ebay|suspension|legal issues?|certification|passion\b|reviewers community|support\s*&\s*virtual|amazon chinese)/i;
+  const requiresExtraSignal = /(support|community|group|help|seller)/i;
+
+  if (!strongSignals.test(text)) {
+    return false;
+  }
+
+  if (weakOrOffTarget.test(text)) {
+    if (!/(fba|private label|ppc|wholesale|reimbursement|inventory|settlement)/i.test(text)) {
+      return false;
+    }
+  }
+
+  if (requiresExtraSignal.test(text) && !/(amazon|fba|amz|private label|ppc|wholesale)/i.test(text)) {
+    return false;
+  }
+
+  return true;
 }
 
 function matchesTargetGroupHints(name = '', taskInput = {}) {
@@ -232,6 +268,15 @@ function createSessionState(existingCounts = {}) {
       summary: '',
     },
     lastInsightDate: null,
+    operatorContext: {
+      executionMode: 'confirm',
+      currentGroup: null,
+      lastListedGroups: [],
+      lastPosts: [],
+      lastNotifications: [],
+      lastDraft: null,
+    },
+    workspaceContext: null,
   };
 }
 
@@ -249,6 +294,70 @@ function canPerformAction(state, type) {
   }
 
   return true;
+}
+
+function looksLikePotentialLeadPost(text = '') {
+  const normalized = String(text).toLowerCase();
+  return /amazon|fba|seller|inventory|shipment|warehouse|fee|fees|profit|margin|settlement|reimbursement|refund|negative balance|payout|damaged|lost/i.test(
+    normalized
+  );
+}
+
+async function selectModelProviderOnStart() {
+  if (!process.stdin.isTTY || process.env.MODEL_SELECTION_ON_START === 'false') {
+    return getModelRuntimeConfig();
+  }
+
+  const current = getModelRuntimeConfig();
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+
+  try {
+    const providerAnswer = await rl.question(
+      `Select model provider: [1] Ollama (default) [2] OpenAI [enter=${current.provider || DEFAULT_MODEL_PROVIDER}]: `
+    );
+    const providerChoice = providerAnswer.trim();
+    let provider = current.provider || DEFAULT_MODEL_PROVIDER;
+
+    if (providerChoice === '1') {
+      provider = 'ollama';
+    } else if (providerChoice === '2') {
+      provider = 'openai';
+    } else if (/^openai$/i.test(providerChoice)) {
+      provider = 'openai';
+    } else if (/^ollama$/i.test(providerChoice)) {
+      provider = 'ollama';
+    }
+
+    let model = null;
+
+    if (provider === 'openai') {
+      const openAiAnswer = await rl.question(
+        `Select OpenAI model: [1] gpt-5-mini (recommended) [2] gpt-5 [enter=${DEFAULT_OPENAI_MODEL}]: `
+      );
+      const choice = openAiAnswer.trim();
+      model = choice === '2' ? 'gpt-5' : choice === '1' ? 'gpt-5-mini' : (choice || DEFAULT_OPENAI_MODEL);
+
+      if (!process.env.OPENAI_API_KEY) {
+        console.log('OPENAI_API_KEY is not set. Falling back to Ollama for this session.');
+        provider = 'ollama';
+        model = DEFAULT_OLLAMA_MODEL;
+      }
+    } else {
+      const ollamaAnswer = await rl.question(
+        `Select Ollama model [enter=${DEFAULT_OLLAMA_MODEL}]: `
+      );
+      model = ollamaAnswer.trim() || DEFAULT_OLLAMA_MODEL;
+    }
+
+    const resolved = setModelRuntimeConfig({ provider, model });
+    console.log(`Model runtime: ${resolved.provider}/${resolved.model}`);
+    return resolved;
+  } finally {
+    rl.close();
+  }
 }
 
 async function answerJoinQuestionsFactory(skill) {
@@ -334,6 +443,318 @@ async function answerJoinQuestionsFactory(skill) {
   };
 }
 
+async function runPerceiveReasonActLoop(page, {
+  goal,
+  skill,
+  workspaceContext = null,
+  maxSteps = 8,
+  onStall = null,
+}) {
+  const insights = await readAgentInsights().catch(() => '');
+  const memorySections = [
+    skill?.content || '',
+    insights || '',
+    workspaceContext?.memory || '',
+    workspaceContext?.user || '',
+    workspaceContext?.agents || '',
+  ].filter(Boolean);
+  let lastError = '';
+  let lastUrl = page.url();
+  let lastProgressAt = Date.now();
+  let hintNote = '';
+
+  for (let step = 1; step <= maxSteps; step += 1) {
+    const snapshot = await getSimplifiedDOM(page, { maxElements: 80 });
+    const pageState = classifyPageState(snapshot);
+    const now = Date.now();
+
+    if (/find and extract text from all posts in this group/i.test(goal) && Array.isArray(snapshot.posts) && snapshot.posts.length > 0) {
+      return {
+        success: true,
+        completed: true,
+        steps: step,
+        lastThought: 'Visible posts already present in the current group snapshot.',
+      };
+    }
+
+    if (page.url() !== lastUrl) {
+      lastUrl = page.url();
+      lastProgressAt = now;
+    }
+
+    if (now - lastProgressAt > STALL_TIMEOUT_MS && typeof onStall === 'function') {
+      const stallResult = await onStall({
+        page,
+        snapshot,
+        goal,
+        step,
+        lastError,
+      });
+      if (stallResult?.handled) {
+        lastProgressAt = Date.now();
+        hintNote = stallResult.hint ? `Operator hint: ${stallResult.hint}` : '';
+        lastError = hintNote || '';
+        continue;
+      }
+    }
+
+    const nextStep = await decideNextDomAction({
+      url: page.url(),
+      goal,
+      memory: memorySections.join('\n\n'),
+      snapshot,
+      pageState,
+      lastError: [lastError, hintNote].filter(Boolean).join('\n'),
+    });
+
+    if (nextStep.action === 'complete') {
+      return {
+        success: true,
+        completed: true,
+        steps: step,
+        lastThought: nextStep.thought,
+      };
+    }
+
+    try {
+      await executeAgentAction(page, nextStep);
+      await page.waitForTimeout(1000);
+      lastError = '';
+      lastProgressAt = Date.now();
+    } catch (error) {
+      lastError = error.message;
+      continue;
+    }
+  }
+
+  return {
+    success: false,
+    completed: false,
+    error: lastError || 'Reasoning loop reached the maximum number of steps.',
+  };
+}
+
+async function appendRecoveryLesson(hint, metadata = {}) {
+  const entry = [
+    '',
+    '# RECOVERY LESSONS',
+    `- ${new Date().toISOString()}: Hint="${hint}" | Goal="${metadata.goal || ''}" | Step=${metadata.step || ''} | Error="${metadata.lastError || ''}" | Screenshot="${metadata.screenshotPath || ''}"`,
+  ].join('\n');
+  await appendAgentInsights(entry);
+}
+
+function normalizePostUrl(url = '') {
+  if (!url) {
+    return '';
+  }
+
+  return url.startsWith('http') ? url : `${FACEBOOK_BASE_URL}${url}`;
+}
+
+async function extractLeadPostsFromCurrentPage(page, groupLabel, skill, state, topic = '') {
+  const snapshot = await getSimplifiedDOM(page, { maxElements: 120 });
+  const posts = Array.isArray(snapshot.posts) ? snapshot.posts : [];
+  const filteredByTopic = await filterPostsByRequestedTopic(posts, topic, skill);
+  const aiCandidates = filteredByTopic.slice(0, 12);
+  const found = [];
+
+  for (const post of aiCandidates) {
+    const normalizedText = String(post.text || '').replace(/\s+/g, ' ').trim();
+    if (!normalizedText || (/\b(i'?m interested|interested|dm me|inbox me)\b/i.test(normalizedText) && normalizedText.length < 120)) {
+      continue;
+    }
+
+    const stablePostId = extractPostIdFromUrl(normalizePostUrl(post.post_url)) || post.agent_id;
+    const storedPost = await upsertPost({
+      post_id: stablePostId,
+      group: groupLabel,
+      post_url: normalizePostUrl(post.post_url),
+      content: normalizedText,
+      author: post.author || 'Unknown',
+      status: 'pending',
+    });
+
+    const scoreResult = await scorePostAgainstSkill(
+      {
+        post_id: storedPost.post_id,
+        group: storedPost.group,
+        author: storedPost.author,
+        content: storedPost.content,
+      },
+      skill
+    );
+
+    state.scoredPosts += 1;
+    const status = scoreResult.shouldInteract ? 'qualified' : 'ignored';
+    await updatePostScore(storedPost.post_id, scoreResult.score, status);
+
+    if (scoreResult.shouldInteract) {
+      await upsertLead({
+        post_id: storedPost.post_id,
+        group: storedPost.group,
+        content: storedPost.content,
+        author: storedPost.author,
+        category: scoreResult.category,
+        confidence: scoreResult.confidence,
+        reason: scoreResult.reason,
+        status: 'New',
+      });
+      found.push({
+        ...storedPost,
+        post_url: normalizePostUrl(post.post_url),
+        relevance_score: scoreResult.score,
+        comment_button_id: post.comment_button_id || '',
+        like_button_id: post.like_button_id || '',
+      });
+    }
+  }
+
+  return found;
+}
+
+async function filterPostsByRequestedTopic(posts = [], topic = '', skill) {
+  if (!topic || !posts.length) {
+    return posts;
+  }
+
+  const prompt = [
+    'Select which visible Facebook posts match this business goal.',
+    `GOAL: ${topic}`,
+    'Use the skill context when judging relevance.',
+    skill.content,
+    '',
+    'Return JSON only like {"keep_indexes":[1,3]}',
+    JSON.stringify(
+      posts.slice(0, 20).map((post, index) => ({
+        index: index + 1,
+        author: post.author,
+        text: post.text.slice(0, 300),
+      })),
+      null,
+      2
+    ),
+  ].join('\n');
+
+  try {
+    const raw = await callOllama(prompt, {
+      model: MORNING_BRIEFING_MODEL,
+      timeoutMs: 20_000,
+      generationOptions: {
+        temperature: 0.1,
+        num_ctx: 2048,
+        num_predict: 120,
+      },
+    });
+    const match = raw.match(/\{[\s\S]*\}/);
+    const parsed = match ? JSON.parse(match[0].replace(/'/g, '"')) : null;
+    const keep = new Set(Array.isArray(parsed?.keep_indexes) ? parsed.keep_indexes.map(Number) : []);
+    return keep.size ? posts.filter((_post, index) => keep.has(index + 1)) : posts;
+  } catch (_error) {
+    return posts;
+  }
+}
+
+async function scanGroupWithReasoningLoop(page, group, skill, state, options = {}) {
+  console.log(`Opening group: ${group.label}`);
+  await visitGroup(page, group.url);
+  state.groupsVisited.push(group.label);
+
+  await updateDiscoveredGroupStatus(group.url, 'joined', {
+    name: group.label,
+    group_id: group.id,
+  });
+
+  const activity = await inspectGroupActivity(page);
+  if (activity.activityLabel) {
+    console.log(`Last active ${activity.activityLabel}`);
+  }
+
+  await updateDiscoveredGroupStatus(group.url, 'joined', {
+    name: group.label,
+    group_id: group.id,
+    activity_label: activity.activityLabel,
+    activity_age_hours: activity.activityAgeHours,
+    lastActivityCheckedAt: new Date(),
+  });
+
+  if (
+    Number.isFinite(activity.activityAgeHours) &&
+    activity.activityAgeHours > MAX_ACTIVITY_AGE_HOURS
+  ) {
+    console.log(`Skipping stale group: ${group.label}`);
+    return [];
+  }
+
+  const loopResult = await runPerceiveReasonActLoop(page, {
+    goal: `Find and extract text from all posts in this group that match our business interests${options.topic ? ` about ${options.topic}` : ''}. Scroll if needed. Complete when visible relevant posts can be extracted or when there are clearly no relevant posts visible.`,
+    skill,
+    workspaceContext: state.workspaceContext || null,
+    maxSteps: 8,
+    onStall: options.onStall || null,
+  });
+
+  if (!loopResult.success && loopResult.error) {
+    state.errors.push(`Scan loop issue for ${group.label}: ${loopResult.error}`);
+  }
+
+  const found = await extractLeadPostsFromCurrentPage(page, group.label, skill, state, options.topic || '');
+  state.scrapedPosts += found.length;
+  await updateGroupLastScanned(group.url, new Date());
+  console.log(`Matched ${found.length} lead posts from ${group.label}`);
+  return found;
+}
+
+async function engageLeadWithReasoningLoop(page, skill, candidate, state, options = {}) {
+  if (!candidate.post_url) {
+    throw new Error(`No direct post URL stored for ${candidate.post_id}.`);
+  }
+
+  const draft = options.draft || await draftCommentForCandidate(skill, candidate, {
+    phaseOverride: 1,
+  });
+
+  await page.goto(candidate.post_url, {
+    waitUntil: 'domcontentloaded',
+    timeout: 90_000,
+  });
+
+  const result = await runPerceiveReasonActLoop(page, {
+    goal: `Read the identified lead and post this exact helpful, non-spammy comment based on our skill file: "${draft.reply}" Complete only after the comment has been entered and submitted.`,
+    skill,
+    workspaceContext: state.workspaceContext || null,
+    maxSteps: 8,
+    onStall: options.onStall || null,
+  });
+
+  if (!result.success) {
+    throw new Error(result.error || 'Engagement loop did not complete successfully.');
+  }
+
+  await logInteraction({
+    target_id: candidate.post_id,
+    type: 'comment',
+    content_sent: draft.reply,
+    metadata: {
+      group: candidate.group,
+      score: candidate.relevance_score,
+    },
+  });
+  await appendThreadHistory(candidate.post_id, {
+    role: 'assistant',
+    text: draft.reply,
+    phase: draft.phase,
+  }, {
+    related_post_id: candidate.post_id,
+    current_phase: draft.phase,
+    summary_of_discussion: `Initial outbound comment sent for ${candidate.group}.`,
+  });
+  await updateContextPhase(candidate.post_id, draft.phase);
+  await markPostStatus(candidate.post_id, 'engaged');
+  await updateLeadInteractionResult(candidate.post_id, 'Success');
+  state.comments += 1;
+  return draft;
+}
+
 async function resolveTargetGroups(page, taskInput) {
   const configuredGroups = (
     taskInput.facebook_groups ||
@@ -390,6 +811,17 @@ async function resolveScannableGroups(page, taskInput) {
     .filter((group) => isLikelyEnglishGroupName(group.name))
     .filter((group) => isRelevantAmazonGroupName(group.name))
     .filter((group) => matchesTargetGroupHints(group.name, taskInput))
+    .sort((left, right) => {
+      const leftActivity = Number.isFinite(left.activity_age_hours) ? left.activity_age_hours : Number.MAX_SAFE_INTEGER;
+      const rightActivity = Number.isFinite(right.activity_age_hours) ? right.activity_age_hours : Number.MAX_SAFE_INTEGER;
+      if (leftActivity !== rightActivity) {
+        return leftActivity - rightActivity;
+      }
+      const leftTime = left.lastScanned ? new Date(left.lastScanned).getTime() : 0;
+      const rightTime = right.lastScanned ? new Date(right.lastScanned).getTime() : 0;
+      return leftTime - rightTime;
+    })
+    .slice(0, MAX_GROUPS_PER_SCAN)
     .map((group) => ({
       id: group.group_id || extractGroupIdFromUrl(group.url),
       url: group.url,
@@ -686,6 +1118,30 @@ async function searchAndJoinGroups(page, keyword, skill, state) {
 
     const result = await handleJoinGroup(page, {
       answerJoinQuestions,
+      dynamicJoinLoop: async (loopPage, _joinDialog) => {
+        const dynamicResult = await runPerceiveReasonActLoop(loopPage, {
+          goal: 'Join Group and answer questions truthfully using the Amazon Hidden Money business context. Submit the modal when complete.',
+          skill,
+          workspaceContext: state.workspaceContext || null,
+          maxSteps: 10,
+        });
+
+        if (dynamicResult?.success) {
+          await appendAgentInsights(
+            `\n[${new Date().toISOString()}] Success Note: Completed a Facebook group join flow using the perceive-reason-act loop.\n`
+          ).catch(() => {});
+          return {
+            joined: true,
+            pendingApproval: true,
+            modalHandled: true,
+            answeredQuestions: [],
+            answers: [],
+            submitted: true,
+          };
+        }
+
+        return null;
+      },
     });
 
     joinAttempts += 1;
@@ -743,17 +1199,41 @@ async function scanGroupFeed(page, group, skill, goalSummary, state) {
     group_id: group.id,
   });
 
-  const scrapedPosts = await scrapeGroupFeed(page, { limit: 30 });
+  const activity = await inspectGroupActivity(page);
+  if (activity.activityLabel) {
+    console.log(`Last active ${activity.activityLabel}`);
+  }
+
+  await updateDiscoveredGroupStatus(group.url, 'joined', {
+    name: group.label,
+    group_id: group.id,
+    activity_label: activity.activityLabel,
+    activity_age_hours: activity.activityAgeHours,
+    lastActivityCheckedAt: new Date(),
+  });
+
+  if (
+    Number.isFinite(activity.activityAgeHours) &&
+    activity.activityAgeHours > MAX_ACTIVITY_AGE_HOURS
+  ) {
+    console.log(`Skipping stale group: ${group.label}`);
+    return [];
+  }
+
+  const scrapedPosts = await scrapeGroupFeed(page, { limit: 18, scrollRounds: 2 });
   await updateGroupLastScanned(group.url, new Date());
   state.scrapedPosts += scrapedPosts.length;
   console.log(`Scraped ${scrapedPosts.length} posts from ${group.label}`);
 
   const found = [];
+  const aiCandidates = scrapedPosts.filter((post) => looksLikePotentialLeadPost(post.postText)).slice(0, 8);
+  console.log(`Prefiltered ${aiCandidates.length} posts for AI scoring in ${group.label}`);
 
-  for (const scrapedPost of scrapedPosts) {
+  for (const scrapedPost of aiCandidates) {
     const storedPost = await upsertPost({
       post_id: scrapedPost.postId,
       group: group.label,
+      post_url: scrapedPost.postUrl || null,
       content: scrapedPost.postText,
       author: scrapedPost.authorName || 'Unknown',
       status: 'pending',
@@ -791,6 +1271,7 @@ async function scanGroupFeed(page, group, skill, goalSummary, state) {
       });
       found.push({
         ...storedPost,
+        post_url: scrapedPost.postUrl || storedPost.post_url || null,
         relevance_score: scoreResult.score,
       });
     }
@@ -800,11 +1281,11 @@ async function scanGroupFeed(page, group, skill, goalSummary, state) {
 }
 
 async function scanJoinedGroups(page, taskInput, skill, state) {
-  const groups = await resolveScannableGroups(page, taskInput);
+  const groups = (await resolveScannableGroups(page, taskInput)).slice(0, MAX_GROUPS_PER_SCAN);
   const results = [];
 
   state.resolvedGroups = groups;
-  console.log(`Groups to scan: ${groups.length}`);
+  console.log(`Groups to scan this cycle: ${groups.length} (cap ${MAX_GROUPS_PER_SCAN})`);
 
   if (!groups.length) {
     console.log('No already-joined groups are available to scan. Use `search [keyword]` first or wait for pending approvals.');
@@ -812,13 +1293,9 @@ async function scanJoinedGroups(page, taskInput, skill, state) {
 
   for (const group of groups) {
     try {
-      const found = await scanGroupFeed(
-        page,
-        group,
-        skill,
-        buildGoalSummary(taskInput),
-        state
-      );
+      const found = await scanGroupWithReasoningLoop(page, group, skill, state, {
+        topic: buildGoalSummary(taskInput),
+      });
       results.push(...found);
     } catch (error) {
       state.errors.push(`Group scan failed for ${group.label}: ${error.message}`);
@@ -828,6 +1305,102 @@ async function scanJoinedGroups(page, taskInput, skill, state) {
   state.scanResults = results;
   console.log(`Scan complete. Qualified posts found: ${results.length}`);
   return results;
+}
+
+async function openCandidatePost(page, candidate, state) {
+  if (!candidate?.post_url) {
+    state.errors.push(`Skipping ${candidate?.post_id || 'unknown'}: no direct post URL was stored.`);
+    await updateLeadInteractionResult(candidate?.post_id, 'Blocked').catch(() => {});
+    return false;
+  }
+
+  try {
+    await page.goto(candidate.post_url, {
+      waitUntil: 'domcontentloaded',
+      timeout: 90_000,
+    });
+    return true;
+  } catch (error) {
+    state.errors.push(`Open failed for ${candidate.post_id}: ${error.message}`);
+    await updateLeadInteractionResult(candidate.post_id, 'Blocked').catch(() => {});
+    return false;
+  }
+}
+
+async function likeQualifiedPost(page, candidate, state) {
+  if (!(await openCandidatePost(page, candidate, state))) {
+    return false;
+  }
+
+  if (await hasInteraction(candidate.post_id, 'like')) {
+    state.skippedDuplicates += 1;
+    return false;
+  }
+
+  console.log(`Liking post ${candidate.post_id}`);
+  await clickLike(page, candidate.post_id, { postUrl: candidate.post_url || null });
+  await logInteraction({
+    target_id: candidate.post_id,
+    type: 'like',
+    metadata: {
+      group: candidate.group,
+      score: candidate.relevance_score,
+    },
+  });
+  state.likes += 1;
+  return true;
+}
+
+async function draftCommentForCandidate(skill, candidate, options = {}) {
+  return draftReply({
+    skill,
+    post: {
+      post_id: candidate.post_id,
+      content: candidate.content,
+    },
+    threadId: candidate.post_id,
+    contextSummary: candidate.content,
+    tone: options.tone || 'helpful, consultative, confident, concise',
+    phaseOverride: options.phaseOverride ?? 1,
+  });
+}
+
+async function commentOnQualifiedPost(page, skill, candidate, state, options = {}) {
+  if (!(await openCandidatePost(page, candidate, state))) {
+    return { posted: false, draft: null };
+  }
+
+  if (await hasInteraction(candidate.post_id, 'comment')) {
+    state.skippedDuplicates += 1;
+    return { posted: false, draft: null };
+  }
+
+  const draft = options.draft || await draftCommentForCandidate(skill, candidate, options);
+  console.log(`Posting comment on ${candidate.post_id}`);
+  await postComment(page, candidate.post_id, draft.reply, { postUrl: candidate.post_url || null });
+  await logInteraction({
+    target_id: candidate.post_id,
+    type: 'comment',
+    content_sent: draft.reply,
+    metadata: {
+      group: candidate.group,
+      score: candidate.relevance_score,
+    },
+  });
+  await appendThreadHistory(candidate.post_id, {
+    role: 'assistant',
+    text: draft.reply,
+    phase: draft.phase,
+  }, {
+    related_post_id: candidate.post_id,
+    current_phase: draft.phase,
+    summary_of_discussion: `Initial outbound comment sent for ${candidate.group}.`,
+  });
+  await updateContextPhase(candidate.post_id, draft.phase);
+  await markPostStatus(candidate.post_id, 'engaged');
+  await updateLeadInteractionResult(candidate.post_id, 'Success');
+  state.comments += 1;
+  return { posted: true, draft };
 }
 
 async function engageQualifiedPosts(page, skill, state) {
@@ -841,29 +1414,12 @@ async function engageQualifiedPosts(page, skill, state) {
       break;
     }
 
-    try {
-      await page.goto(`${FACEBOOK_BASE_URL}/groups/search/?view=permalink&id=${candidate.post_id}`, {
-        waitUntil: 'domcontentloaded',
-        timeout: 90_000,
-      });
-    } catch (_error) {
-      // Fallback: many posts are still visible in the current group view, so we continue.
-    }
-
     if (canPerformAction(state, 'like') && !(await hasInteraction(candidate.post_id, 'like'))) {
       try {
-        console.log(`Liking post ${candidate.post_id}`);
-        await clickLike(page, candidate.post_id);
-        await logInteraction({
-          target_id: candidate.post_id,
-          type: 'like',
-          metadata: {
-            group: candidate.group,
-            score: candidate.relevance_score,
-          },
-        });
-        state.likes += 1;
-        await humanJitter(page, { logLabel: 'Post-like jitter' });
+        const liked = await likeQualifiedPost(page, candidate, state);
+        if (liked) {
+          await humanJitter(page, { logLabel: 'Post-like jitter' });
+        }
       } catch (error) {
         state.errors.push(`Like failed for ${candidate.post_id}: ${error.message}`);
       }
@@ -872,42 +1428,10 @@ async function engageQualifiedPosts(page, skill, state) {
     if (canPerformAction(state, 'comment') && !(await hasInteraction(candidate.post_id, 'comment'))) {
       try {
         console.log(`Drafting Phase 1 comment for post ${candidate.post_id}`);
-        const draft = await draftReply({
-          skill,
-          post: {
-            post_id: candidate.post_id,
-            content: candidate.content,
-          },
-          threadId: candidate.post_id,
-          contextSummary: candidate.content,
-          tone: 'helpful, consultative, confident, concise',
-          phaseOverride: 1,
+        const draft = await draftCommentForCandidate(skill, candidate, { phaseOverride: 1 });
+        await engageLeadWithReasoningLoop(page, skill, candidate, state, {
+          draft,
         });
-
-        console.log(`Posting comment on ${candidate.post_id}`);
-        await postComment(page, candidate.post_id, draft.reply);
-        await logInteraction({
-          target_id: candidate.post_id,
-          type: 'comment',
-          content_sent: draft.reply,
-          metadata: {
-            group: candidate.group,
-            score: candidate.relevance_score,
-          },
-        });
-        await appendThreadHistory(candidate.post_id, {
-          role: 'assistant',
-          text: draft.reply,
-          phase: draft.phase,
-        }, {
-          related_post_id: candidate.post_id,
-          current_phase: draft.phase,
-          summary_of_discussion: `Initial outbound comment sent for ${candidate.group}.`,
-        });
-        await updateContextPhase(candidate.post_id, draft.phase);
-        await markPostStatus(candidate.post_id, 'engaged');
-        await updateLeadInteractionResult(candidate.post_id, 'Success');
-        state.comments += 1;
         await humanJitter(page, { logLabel: 'Post-comment jitter' });
       } catch (error) {
         await updateLeadInteractionResult(candidate.post_id, 'Blocked');
@@ -1002,6 +1526,106 @@ async function replyToInboxPreviews(page, skill, state, inboxPreviews) {
   }
 }
 
+async function replyToNotificationItem(page, skill, state, notification) {
+  if (await hasInteraction(notification.postId, 'reply')) {
+    return { replied: false, reason: 'duplicate' };
+  }
+
+  const originalPost = await findPostById(notification.postId);
+  const existingContext = await getContextMemory(notification.postId);
+  const existingLead = await findLeadByPostId(notification.postId);
+
+  if (!originalPost && !existingContext) {
+    return { replied: false, reason: 'missing_context' };
+  }
+
+  const contextSummary = existingContext?.summary_of_discussion
+    || originalPost?.content
+    || 'Follow-up on an earlier Facebook discussion.';
+
+  await appendThreadHistory(notification.postId, {
+    role: 'user',
+    text: notification.text,
+    phase: existingContext?.current_phase ?? null,
+  }, {
+    related_post_id: notification.postId,
+    current_phase: existingContext?.current_phase ?? null,
+    summary_of_discussion: existingContext?.summary_of_discussion || 'User replied to our outreach.',
+  });
+
+  const looksLikeQuestion = /\?/.test(notification.text);
+  const draft = await draftReply({
+    skill,
+    post: {
+      post_id: notification.postId,
+      content: notification.text,
+    },
+    threadId: notification.postId,
+    contextSummary,
+    tone: 'warm, concise, and specific',
+    phaseOverride: looksLikeQuestion ? 2 : null,
+  });
+
+  if (!notification.href) {
+    return { replied: false, reason: 'missing_href', draft };
+  }
+
+  console.log(`Posting reply for notification thread ${notification.postId}`);
+  await page.goto(notification.href, {
+    waitUntil: 'domcontentloaded',
+    timeout: 90_000,
+  });
+  await page.waitForTimeout(2_000);
+  await postComment(page, notification.postId, draft.reply);
+
+  const summary = await summarizeDiscussion({
+    skill,
+    postContent: originalPost?.content || contextSummary,
+    replies: [notification.text, draft.reply],
+  });
+
+  await upsertContextMemory({
+    thread_id: notification.postId,
+    summary_of_discussion: summary,
+    related_post_id: notification.postId,
+    current_phase: draft.phase,
+    thread_history: [
+      ...(existingContext?.thread_history || []),
+      {
+        role: 'user',
+        text: notification.text,
+        phase: existingContext?.current_phase ?? null,
+        timestamp: new Date(),
+      },
+      {
+        role: 'assistant',
+        text: draft.reply,
+        phase: draft.phase,
+        timestamp: new Date(),
+      },
+    ],
+  });
+  await updateContextPhase(notification.postId, draft.phase);
+
+  await logInteraction({
+    target_id: notification.postId,
+    type: 'reply',
+    content_sent: draft.reply,
+    metadata: {
+      notification_text: notification.text,
+      phase: draft.phase,
+    },
+  });
+
+  if (existingLead || originalPost) {
+    await updateLeadStatus(notification.postId, 'Warm');
+    await updateLeadInteractionResult(notification.postId, 'Success');
+  }
+
+  state.replies += 1;
+  return { replied: true, draft };
+}
+
 async function handleReplyLoop(page, skill, state, briefing = state.briefing) {
   const notifications = briefing.notifications?.length
     ? briefing.notifications.filter((item) => item.postId)
@@ -1010,103 +1634,10 @@ async function handleReplyLoop(page, skill, state, briefing = state.briefing) {
   console.log(`Notifications found for reply loop: ${notifications.length}`);
 
   for (const notification of notifications) {
-    if (await hasInteraction(notification.postId, 'reply')) {
-      continue;
+    const result = await replyToNotificationItem(page, skill, state, notification);
+    if (result.replied) {
+      await humanJitter(page, { logLabel: 'Reply-loop jitter' });
     }
-
-    const originalPost = await findPostById(notification.postId);
-    const existingContext = await getContextMemory(notification.postId);
-    const existingLead = await findLeadByPostId(notification.postId);
-
-    if (!originalPost && !existingContext) {
-      continue;
-    }
-
-    const contextSummary = existingContext?.summary_of_discussion
-      || originalPost?.content
-      || 'Follow-up on an earlier Facebook discussion.';
-
-    await appendThreadHistory(notification.postId, {
-      role: 'user',
-      text: notification.text,
-      phase: existingContext?.current_phase ?? null,
-    }, {
-      related_post_id: notification.postId,
-      current_phase: existingContext?.current_phase ?? null,
-      summary_of_discussion: existingContext?.summary_of_discussion || 'User replied to our outreach.',
-    });
-
-    const looksLikeQuestion = /\?/.test(notification.text);
-    const draft = await draftReply({
-      skill,
-      post: {
-        post_id: notification.postId,
-        content: notification.text,
-      },
-      threadId: notification.postId,
-      contextSummary,
-      tone: 'warm, concise, and specific',
-      phaseOverride: looksLikeQuestion ? 2 : null,
-    });
-
-    if (!notification.href) {
-      continue;
-    }
-
-    console.log(`Posting reply for notification thread ${notification.postId}`);
-    await page.goto(notification.href, {
-      waitUntil: 'domcontentloaded',
-      timeout: 90_000,
-    });
-    await page.waitForTimeout(2_000);
-    await postComment(page, notification.postId, draft.reply);
-
-    const summary = await summarizeDiscussion({
-      skill,
-      postContent: originalPost?.content || contextSummary,
-      replies: [notification.text, draft.reply],
-    });
-
-    await upsertContextMemory({
-      thread_id: notification.postId,
-      summary_of_discussion: summary,
-      related_post_id: notification.postId,
-      current_phase: draft.phase,
-      thread_history: [
-        ...(existingContext?.thread_history || []),
-        {
-          role: 'user',
-          text: notification.text,
-          phase: existingContext?.current_phase ?? null,
-          timestamp: new Date(),
-        },
-        {
-          role: 'assistant',
-          text: draft.reply,
-          phase: draft.phase,
-          timestamp: new Date(),
-        },
-      ],
-    });
-    await updateContextPhase(notification.postId, draft.phase);
-
-    await logInteraction({
-      target_id: notification.postId,
-      type: 'reply',
-      content_sent: draft.reply,
-      metadata: {
-        notification_text: notification.text,
-        phase: draft.phase,
-      },
-    });
-
-    if (existingLead || originalPost) {
-      await updateLeadStatus(notification.postId, 'Warm');
-      await updateLeadInteractionResult(notification.postId, 'Success');
-    }
-
-    state.replies += 1;
-    await humanJitter(page, { logLabel: 'Reply-loop jitter' });
   }
 
   if (briefing.inboxPreviews?.length) {
@@ -1142,15 +1673,36 @@ function printSessionSummary(taskInput, skill, state, dbCounts) {
 
 async function runAssistantSession(options = {}) {
   const taskInputPath = options.taskInputPath || DEFAULT_TASK_INPUT_PATH;
+  const selectedModel = await selectModelProviderOnStart();
   const taskInput = await readTaskInput(taskInputPath);
   const skill = await resolveSkillForTask(taskInput);
   const todayStart = getStartOfToday();
 
   await connectDatabase();
   await setupCollections();
+  await ensureWorkspaceDocs();
+  await clearJobs({
+    types: [
+      JOB_TYPES.HOUSEKEEPING,
+      JOB_TYPES.SYNC_GROUPS,
+      JOB_TYPES.VERIFY_PENDING,
+      JOB_TYPES.SCAN_GROUPS,
+      JOB_TYPES.ENGAGE,
+      JOB_TYPES.REPLY,
+      JOB_TYPES.BRIEF,
+    ],
+  });
 
   const existingCounts = await getInteractionCountsSince(todayStart);
   const state = createSessionState(existingCounts);
+  state.workspaceContext = await loadWorkspaceContext();
+  const savedOperatorContext = await getAgentState('operator_context');
+  if (savedOperatorContext?.value && typeof savedOperatorContext.value === 'object') {
+    state.operatorContext = {
+      ...state.operatorContext,
+      ...savedOperatorContext.value,
+    };
+  }
   state.limits = {
     comments: taskInput.daily_limits?.comments || DEFAULT_SESSION_LIMITS.comments,
     likes: taskInput.daily_limits?.likes || DEFAULT_SESSION_LIMITS.likes,
@@ -1171,8 +1723,10 @@ async function runAssistantSession(options = {}) {
 
     console.log(`Goal for today: ${buildGoalSummary(taskInput)}`);
     console.log(`Using skill: ${skill.id}`);
+    console.log(`Using model runtime: ${selectedModel.provider}/${selectedModel.model}`);
 
     await ensureMemoryFile();
+    await ensureLoggedIn(browser.page);
     const runtimeContext = {
       lock,
       page: browser.page,
@@ -1195,11 +1749,6 @@ async function runAssistantSession(options = {}) {
       searchAndJoinGroups,
     };
 
-    await scheduleStandardJobs({
-      enqueueUniqueJob,
-      jobTypes: JOB_TYPES,
-    });
-    await runQueuedJobs(runtimeContext);
     startOperatorConsole({
       page: browser.page,
       taskInput,
@@ -1217,28 +1766,35 @@ async function runAssistantSession(options = {}) {
       callOllama,
       model: MORNING_BRIEFING_MODEL,
       jobTypes: JOB_TYPES,
+      visitGroup,
+      scrapeInboxPreviews,
+      syncGroups: () => syncGroups(browser.page),
+      verifyPendingGroups: () => verifyPendingGroups(browser.page),
+      searchAndJoinGroups: (keyword) => searchAndJoinGroups(browser.page, keyword, skill, state),
+      scanJoinedGroups: () => scanJoinedGroups(browser.page, taskInput, skill, state),
+      scanSingleGroup: async (group, options = {}) => {
+        const results = await scanGroupWithReasoningLoop(browser.page, group, skill, state, options);
+        state.scanResults = results;
+        return results;
+      },
+      engageQualifiedPosts: () => engageQualifiedPosts(browser.page, skill, state),
+      summarizeInbox: () => summarizeInbox(browser.page, skill, state),
+      handleReplyLoop: (briefing) => handleReplyLoop(browser.page, skill, state, briefing),
+      likeQualifiedPost: (candidate) => likeQualifiedPost(browser.page, candidate, state),
+      draftCommentForCandidate: (candidate, options) => draftCommentForCandidate(skill, candidate, options),
+      commentOnQualifiedPost: (candidate, options) => engageLeadWithReasoningLoop(browser.page, skill, candidate, state, options),
+      createNewPost,
+      createFeedPost,
+      scrapeGroupFeed: (pageArg, optionsArg) => scrapeGroupFeed(pageArg || browser.page, optionsArg),
+      markNotificationsRead: (notifications, options) => markNotificationsRead(browser.page, notifications, options),
+      scrapeNotifications: (pageArg, optionsArg) => scrapeNotifications(pageArg || browser.page, optionsArg),
+      scrapeNotificationReplies: () => scrapeNotificationReplies(browser.page),
+      replyToNotificationItem: (notification) => replyToNotificationItem(browser.page, skill, state, notification),
+      upsertAgentState,
+      humanJitter,
+      appendRecoveryLesson,
+      runQueuedJobs: () => runQueuedJobs(runtimeContext),
     });
-
-    setInterval(async () => {
-      try {
-        await scheduleStandardJobs({
-          enqueueUniqueJob,
-          jobTypes: JOB_TYPES,
-        });
-        await runQueuedJobs(runtimeContext);
-        printSessionSummary(taskInput, skill, state, existingCounts);
-      } catch (error) {
-        console.error(`Housekeeping interval failed: ${error.message}`);
-      }
-    }, HOUSEKEEPING_INTERVAL_MS);
-
-    setInterval(async () => {
-      try {
-        await runQueuedJobs(runtimeContext);
-      } catch (error) {
-        console.error(`Job runner failed: ${error.message}`);
-      }
-    }, 15_000);
 
     await new Promise(() => {});
   } finally {

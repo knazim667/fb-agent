@@ -9,6 +9,7 @@ const { createFeedApi } = require('./browser/feed');
 const { createGroupsApi } = require('./browser/groups');
 const { createInteractionsApi } = require('./browser/interactions');
 const { createNotificationsApi } = require('./browser/notifications');
+const { createPerceptionApi } = require('./browser/perception');
 
 chromium.use(StealthPlugin());
 
@@ -137,6 +138,7 @@ async function lightHumanPause(page, minMs = 500, maxMs = 2_500) {
 }
 
 const {
+  markNotificationsRead,
   scrapeInboxPreviews,
   scrapeJoinApprovalNotifications,
   scrapeNotifications,
@@ -149,8 +151,10 @@ const {
 const {
   discoverGroups,
   handleJoinGroup,
+  inspectGroupActivity,
   inspectGroupMembershipStatus,
   isCreatePostComposerVisible,
+  parseActivityToHours,
   scrapeJoinedGroups,
   visitGroup,
 } = createGroupsApi({
@@ -170,6 +174,7 @@ const {
 });
 const {
   clickLike,
+  createFeedPost,
   createNewPost,
   postComment,
 } = createInteractionsApi({
@@ -178,6 +183,11 @@ const {
   lightHumanPause,
   visitGroup,
 });
+const {
+  classifyPageState,
+  executeAgentAction,
+  getSimplifiedDOM,
+} = createPerceptionApi();
 
 async function launchBrowser({
   headless = false,
@@ -303,23 +313,30 @@ module.exports = {
   DEFAULT_USER_DATA_DIR,
   closeBrowser,
   clickLike,
+  createFeedPost,
   createNewPost,
   discoverGroups,
   ensureLoggedIn,
   extractGroupIdFromUrl,
+  inspectGroupActivity,
   inspectGroupMembershipStatus,
   isCreatePostComposerVisible,
   isCanonicalGroupUrl,
   isLikelyGroupName,
   extractPostIdFromUrl,
+  executeAgentAction,
+  getSimplifiedDOM,
   handleJoinGroup,
   humanJitter,
   launchBrowser,
   loadGroupFeedPosts,
+  markNotificationsRead,
   lightHumanPause,
   openTaskGroups,
+  parseActivityToHours,
   postComment,
   readTaskInput,
+  classifyPageState,
   scrapeJoinApprovalNotifications,
   scrapeJoinedGroups,
   scrapeInboxPreviews,

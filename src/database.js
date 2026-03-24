@@ -11,6 +11,7 @@ const postSchema = new mongoose.Schema(
   {
     post_id: { type: String, required: true, unique: true, index: true },
     group: { type: String, required: true, index: true },
+    post_url: { type: String, default: null },
     content: { type: String, required: true },
     author: { type: String, required: true },
     status: { type: String, required: true, index: true },
@@ -95,6 +96,9 @@ const discoveredGroupSchema = new mongoose.Schema(
       enum: ['discovered', 'pending', 'joined'],
       index: true,
     },
+    activity_label: { type: String, default: null },
+    activity_age_hours: { type: Number, default: null, index: true },
+    lastActivityCheckedAt: { type: Date, default: null, index: true },
     lastScanned: { type: Date, default: null, index: true },
     discovered_at: { type: Date, required: true, default: Date.now },
     last_seen_at: { type: Date, default: Date.now, index: true },
@@ -250,6 +254,7 @@ async function upsertPost(post) {
     {
       $set: {
         group: post.group,
+        post_url: post.post_url || null,
         content: post.content,
         author: post.author,
         status: post.status || 'pending',
@@ -730,6 +735,21 @@ async function getJobsByStatus(status, { limit = 100 } = {}) {
     .lean();
 }
 
+async function clearJobs({
+  types = null,
+  statuses = ['queued', 'running'],
+} = {}) {
+  const query = {
+    status: { $in: statuses },
+  };
+
+  if (Array.isArray(types) && types.length) {
+    query.type = { $in: types };
+  }
+
+  return Job.deleteMany(query);
+}
+
 async function upsertAgentState(key, value) {
   await AgentState.updateOne(
     { key },
@@ -756,6 +776,7 @@ module.exports = {
   DEFAULT_DB_NAME,
   DEFAULT_URI,
   appendThreadHistory,
+  clearJobs,
   closeDatabase,
   connectDatabase,
   completeJob,
