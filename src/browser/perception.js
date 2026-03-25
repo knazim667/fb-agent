@@ -23,6 +23,8 @@ function createPerceptionApi() {
 
   async function getSimplifiedDOM(page, options = {}) {
     const maxElements = options.maxElements || 120;
+    await page.mouse.wheel(0, 300).catch(() => null);
+    await page.waitForTimeout(1_500);
     const snapshot = await page.evaluate(({ maxElements }) => {
       const RELATIVE_TIMESTAMP_PATTERN = /^(just now|now|today|yesterday|\d+\s*(?:m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days|w|week|weeks|y|yr|yrs|year|years))$/i;
       const ABSOLUTE_TIMESTAMP_PATTERN = /^(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)(?:\s+\d{1,2})(?:\s+at\s+\d{1,2}:\d{2}(?:\s?[ap]m)?)?$/i;
@@ -214,6 +216,46 @@ function createPerceptionApi() {
         return chunks.join('\n').trim();
       }
 
+      function extractDeepArticleText(article, actionTop) {
+        const nodes = Array.from(article.querySelectorAll('div, span, p, a, strong'));
+        const chunks = [];
+        const seen = new Set();
+
+        for (const node of nodes) {
+          if (!isVisible(node)) {
+            continue;
+          }
+          if (node.closest('form, [role="textbox"], [aria-label*="Comment"], [aria-label*="Reply"]')) {
+            continue;
+          }
+
+          const rect = node.getBoundingClientRect();
+          if (rect.top >= actionTop - 6) {
+            continue;
+          }
+
+          const text = normalize(node.innerText);
+          if (!text || text.length < 6) {
+            continue;
+          }
+
+          if (/^(like|comment|share|reply|follow|see more|top contributor|write a comment|leave a comment)$/i.test(text)) {
+            continue;
+          }
+
+          if (looksLikeTimestamp(text)) {
+            continue;
+          }
+
+          if (!seen.has(text)) {
+            seen.add(text);
+            chunks.push(text);
+          }
+        }
+
+        return chunks.join('\n').trim();
+      }
+
       function fallbackTimestampText(article) {
         const articleText = normalize(article.innerText);
         const match = articleText.match(/\b(just now|now|today|yesterday|\d+\s*(?:m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days|w|week|weeks|y|yr|yrs|year|years)|(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)(?:\s+\d{1,2})(?:\s+at\s+\d{1,2}:\d{2}(?:\s?[ap]m)?)?)\b/i);
@@ -256,7 +298,23 @@ function createPerceptionApi() {
         }
 
         const authorNode = article.querySelector('h2 a, h3 a, strong span a, [role="link"], strong span, h2, h3');
-        const author = normalize(authorNode?.innerText || '');
+        let author = normalize(authorNode?.innerText || '');
+        if (!author) {
+          const boldFallback = Array.from(article.querySelectorAll('span, strong, div, a'))
+            .find((node) => {
+              if (!isVisible(node)) {
+                return false;
+              }
+              const text = normalize(node.innerText);
+              if (!text || text.length < 2 || looksLikeTimestamp(text) || /like|comment|share|reply|follow/i.test(text)) {
+                return false;
+              }
+              const style = window.getComputedStyle(node);
+              const weight = Number(style.fontWeight || 400);
+              return weight >= 600 && node.getBoundingClientRect().top < article.getBoundingClientRect().top + 180;
+            });
+          author = normalize(boldFallback?.innerText || '');
+        }
         const timestampNode = Array.from(article.querySelectorAll('a[href], span, div'))
           .find((node) => isVisible(node) && looksLikeTimestamp(normalize(node.innerText)));
         const timestampText = normalize(timestampNode?.innerText || '') || fallbackTimestampText(article);
@@ -269,7 +327,7 @@ function createPerceptionApi() {
         const replyButton = Array.from(article.querySelectorAll('button,[role="button"], a[href], span, div'))
           .find((node) => isVisible(node) && matchesControl(node, /^reply$/i));
 
-        if (!author || !timestampText || [likeButton, commentButton, shareButton].filter(Boolean).length < 2) {
+        if (!timestampText || [likeButton, commentButton, shareButton].filter(Boolean).length < 2) {
           continue;
         }
 
@@ -281,7 +339,9 @@ function createPerceptionApi() {
         const actionTop = Math.min(
           ...[likeButton, commentButton, shareButton].filter(Boolean).map((node) => node.getBoundingClientRect().top)
         );
-        const text = extractPrimaryPostText(article, headerBottom, actionTop) || normalize(article.innerText);
+        const text = extractPrimaryPostText(article, headerBottom, actionTop)
+          || extractDeepArticleText(article, actionTop)
+          || normalize(article.innerText);
         if (!text || text.length < 15) {
           continue;
         }

@@ -35,6 +35,7 @@ function ensureOperatorContext(state) {
     state.operatorContext = {
       executionMode: 'confirm',
       debugMode: false,
+      currentSurface: 'group',
       currentGroup: null,
       lastListedGroups: [],
       lastPosts: [],
@@ -46,6 +47,10 @@ function ensureOperatorContext(state) {
 
   if (!Array.isArray(state.operatorContext.conversationHistory)) {
     state.operatorContext.conversationHistory = [];
+  }
+
+  if (!state.operatorContext.currentSurface) {
+    state.operatorContext.currentSurface = 'group';
   }
 
   return state.operatorContext;
@@ -62,6 +67,7 @@ async function persistOperatorContext(state, upsertAgentState) {
   await upsertAgentState('operator_context', {
     executionMode: context.executionMode,
     debugMode: Boolean(context.debugMode),
+    currentSurface: context.currentSurface || 'group',
     currentGroup: context.currentGroup,
     lastListedGroups: context.lastListedGroups,
     lastPosts: context.lastPosts,
@@ -217,6 +223,63 @@ function activityAgeForGroup(group = {}) {
   }
 
   return Number.MAX_SAFE_INTEGER;
+}
+
+function normalizeGroupReference(value = '') {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function scoreGroupReferenceMatch(query = '', candidateName = '') {
+  const normalizedQuery = normalizeGroupReference(query);
+  const normalizedCandidate = normalizeGroupReference(candidateName);
+  if (!normalizedQuery || !normalizedCandidate) {
+    return 0;
+  }
+
+  if (normalizedQuery === normalizedCandidate) {
+    return 1000;
+  }
+
+  if (normalizedCandidate.startsWith(normalizedQuery)) {
+    return 800 + normalizedQuery.length;
+  }
+
+  if (normalizedQuery.startsWith(normalizedCandidate)) {
+    return 700 + normalizedCandidate.length;
+  }
+
+  if (normalizedCandidate.includes(normalizedQuery)) {
+    return 600 + normalizedQuery.length;
+  }
+
+  const queryTokens = normalizedQuery.split(' ').filter(Boolean);
+  const candidateTokens = new Set(normalizedCandidate.split(' ').filter(Boolean));
+  const overlap = queryTokens.filter((token) => candidateTokens.has(token)).length;
+  if (!overlap) {
+    return 0;
+  }
+
+  return 300 + (overlap * 40);
+}
+
+function resolveNamedGroup(groups = [], query = '') {
+  const candidates = Array.isArray(groups) ? groups : [];
+  let best = null;
+  let bestScore = 0;
+
+  for (const group of candidates) {
+    const score = scoreGroupReferenceMatch(query, group?.name || group?.label || '');
+    if (score > bestScore) {
+      bestScore = score;
+      best = group;
+    }
+  }
+
+  return bestScore > 0 ? best : null;
 }
 
 function addConversationTurn(state, role, text) {
@@ -395,6 +458,19 @@ function inferIntentHeuristically(input) {
     };
   }
 
+  const draftThenPostToGroupMatch =
+    String(input || '').match(
+      /draft (?:a )?post about (.+?) and post (?:it )?(?:to|in|on|for) group\s+(\d+)/i
+    );
+  if (draftThenPostToGroupMatch) {
+    return {
+      type: 'draft_post',
+      target: 'group',
+      group_index: Number(draftThenPostToGroupMatch[2]),
+      topic: String(draftThenPostToGroupMatch[1] || '').trim() || undefined,
+    };
+  }
+
   const draftGroupMatch = String(input || '').match(/draft (?:a )?post .*?(?:on|for) group\s+(\d+)(?:\s+about\s+(.+))?/i)
     || String(input || '').match(/draft (?:a )?post .*?(?:on|for)\s+group\s+(.+?)(?:\s+about\s+(.+))?$/i);
   if (draftGroupMatch) {
@@ -418,8 +494,8 @@ function inferIntentHeuristically(input) {
     };
   }
 
-  const randomLikeMatch = String(input || '').match(/like(?:\s+at\s+least)?(?:\s+first)?\s+(\d+)\s+random\s+posts?(?:\s+(?:in|on|for)\s+group\s+(.+))?/i)
-    || String(input || '').match(/like(?:\s+at\s+least)?(?:\s+first)?\s+(\d+)\s+posts?(?:\s+(?:in|on|for)\s+group\s+(.+))?/i);
+  const randomLikeMatch = String(input || '').match(/like(?:\s+at\s+least)?(?:\s+the)?(?:\s+first)?\s+(\d+)\s+random\s+posts?(?:\s+(?:in|on|for)\s+group\s+(.+))?/i)
+    || String(input || '').match(/like(?:\s+at\s+least)?(?:\s+the)?(?:\s+first)?\s+(\d+)\s+posts?(?:\s+(?:in|on|for)\s+group\s+(.+))?/i);
   if (randomLikeMatch) {
     const maybeIndex = Number(randomLikeMatch[2]);
     const fallbackGroupIndex = Number((normalized.match(/\bgroup\s+(\d+)\b/i) || [])[1]);
@@ -433,12 +509,13 @@ function inferIntentHeuristically(input) {
       group_name: randomLikeMatch[2] && !(Number.isFinite(maybeIndex) && maybeIndex > 0)
         ? randomLikeMatch[2].trim()
         : '',
+      surface: /\bhome feed\b|\bmy feed\b|\bthe feed\b|\bfeed\b/i.test(normalized) ? 'feed' : 'group',
     };
   }
 
-  const randomCommentMatch = String(input || '').match(/comment(?:\s+on)?(?:\s+at\s+least)?(?:\s+first)?\s+(\d+)\s+random\s+posts?(?:\s+(?:in|on|for)\s+group\s+(.+))?/i)
-    || String(input || '').match(/comm+ment on(?:\s+first)?\s+(\d+)\s+random\s+posts?(?:\s+(?:in|on|for)\s+group\s+(.+))?/i)
-    || String(input || '').match(/comment(?:\s+on)?(?:\s+first)?\s+(\d+)\s+posts?(?:\s+(?:in|on|for)\s+group\s+(.+))?/i);
+  const randomCommentMatch = String(input || '').match(/comment(?:\s+on)?(?:\s+at\s+least)?(?:\s+the)?(?:\s+first)?\s+(\d+)\s+random\s+posts?(?:\s+(?:in|on|for)\s+group\s+(.+))?/i)
+    || String(input || '').match(/comm+ment on(?:\s+the)?(?:\s+first)?\s+(\d+)\s+random\s+posts?(?:\s+(?:in|on|for)\s+group\s+(.+))?/i)
+    || String(input || '').match(/comment(?:\s+on)?(?:\s+the)?(?:\s+first)?\s+(\d+)\s+posts?(?:\s+(?:in|on|for)\s+group\s+(.+))?/i);
   if (randomCommentMatch) {
     const maybeIndex = Number(randomCommentMatch[2]);
     const fallbackGroupIndex = Number((normalized.match(/\bgroup\s+(\d+)\b/i) || [])[1]);
@@ -452,6 +529,7 @@ function inferIntentHeuristically(input) {
       group_name: randomCommentMatch[2] && !(Number.isFinite(maybeIndex) && maybeIndex > 0)
         ? randomCommentMatch[2].trim()
         : '',
+      surface: /\bhome feed\b|\bmy feed\b|\bthe feed\b|\bfeed\b/i.test(normalized) ? 'feed' : 'group',
     };
   }
 
@@ -472,6 +550,7 @@ function inferIntentHeuristically(input) {
         ? showPostsMatch[2].trim()
         : '',
       random: /\brandom\b/i.test(normalized),
+      surface: /\bhome feed\b|\bmy feed\b|\bthe feed\b|\bfeed\b/i.test(normalized) ? 'feed' : 'group',
     };
   }
 
@@ -480,6 +559,15 @@ function inferIntentHeuristically(input) {
     return {
       type: 'show_posts',
       group_index: Number(match?.[1] || 0) || undefined,
+      random: /\brandom\b/i.test(normalized),
+      limit: Number((normalized.match(/\b(\d+)\s+posts?\b/i) || [])[1] || 0) || undefined,
+    };
+  }
+
+  if (/\b(show|give|find|list)\b/i.test(normalized) && /\bposts?\b/i.test(normalized) && /\b(home feed|my feed|the feed|feed)\b/i.test(normalized)) {
+    return {
+      type: 'show_posts',
+      surface: 'feed',
       random: /\brandom\b/i.test(normalized),
       limit: Number((normalized.match(/\b(\d+)\s+posts?\b/i) || [])[1] || 0) || undefined,
     };
@@ -915,6 +1003,7 @@ function startOperatorConsole(deps) {
     humanJitter,
     appendRecoveryLesson,
   } = deps;
+  const FACEBOOK_HOME_URL = 'https://www.facebook.com/';
 
   const rl = readline.createInterface({
     input: process.stdin,
@@ -996,6 +1085,36 @@ function startOperatorConsole(deps) {
 
   function currentNotifications() {
     return Array.isArray(context.lastNotifications) ? context.lastNotifications : [];
+  }
+
+  async function openHomeFeed() {
+    await page.goto(FACEBOOK_HOME_URL, {
+      waitUntil: 'domcontentloaded',
+      timeout: 90_000,
+    });
+    await page.waitForLoadState('networkidle').catch(() => null);
+    await page.waitForTimeout(3_000);
+    context.currentSurface = 'feed';
+    context.currentGroup = null;
+    context.lastPosts = [];
+  }
+
+  async function resolveTargetGroup(args = {}) {
+    if (Number.isFinite(Number(args.group_index))) {
+      return context.lastListedGroups[Number(args.group_index) - 1] || null;
+    }
+
+    if (!args.group_name) {
+      return null;
+    }
+
+    const preferred = resolveNamedGroup(context.lastListedGroups, args.group_name);
+    if (preferred) {
+      return preferred;
+    }
+
+    const allJoined = await getGroupsByStatus('joined', { limit: 500 });
+    return resolveNamedGroup(allJoined, args.group_name);
   }
 
   async function executeTool(action) {
@@ -1121,17 +1240,7 @@ function startOperatorConsole(deps) {
     }
 
     if (tool === 'open_group') {
-      let group = null;
-      if (Number.isFinite(Number(args.group_index))) {
-        group = context.lastListedGroups[Number(args.group_index) - 1] || null;
-      }
-
-      if (!group && args.group_name) {
-        const allJoined = await getGroupsByStatus('joined', { limit: 500 });
-        group = allJoined.find((item) =>
-          String(item.name || '').toLowerCase().includes(String(args.group_name).toLowerCase())
-        ) || null;
-      }
+      const group = await resolveTargetGroup(args);
 
       if (!group) {
         return 'I could not find that group in the current list. Ask me to list groups first, or mention the group name more clearly.';
@@ -1140,6 +1249,7 @@ function startOperatorConsole(deps) {
       await lock.runExclusive('operator:open-group', async () => {
         await visitGroup(page, group.url);
       });
+      context.currentSurface = 'group';
       context.currentGroup = group;
       context.lastPosts = [];
       logDebug(context, `Opened group URL: ${group.url || 'unknown-url'}`);
@@ -1188,24 +1298,17 @@ function startOperatorConsole(deps) {
     }
 
     if (tool === 'show_posts') {
-      if (Number.isFinite(Number(args.group_index))) {
-        const selected = context.lastListedGroups[Number(args.group_index) - 1] || null;
+      if (String(args.surface || '').toLowerCase() === 'feed') {
+        await lock.runExclusive('operator:open-feed-for-show-posts', async () => {
+          await openHomeFeed();
+        });
+      } else if (Number.isFinite(Number(args.group_index)) || args.group_name) {
+        const selected = await resolveTargetGroup(args);
         if (selected?.url) {
           await lock.runExclusive('operator:open-group-for-show-posts', async () => {
             await visitGroup(page, selected.url);
           });
-          context.currentGroup = selected;
-          context.lastPosts = [];
-        }
-      } else if (args.group_name) {
-        const allJoined = await getGroupsByStatus('joined', { limit: 500 });
-        const selected = allJoined.find((item) =>
-          String(item.name || '').toLowerCase().includes(String(args.group_name).toLowerCase())
-        ) || null;
-        if (selected?.url) {
-          await lock.runExclusive('operator:open-named-group-for-show-posts', async () => {
-            await visitGroup(page, selected.url);
-          });
+          context.currentSurface = 'group';
           context.currentGroup = selected;
           context.lastPosts = [];
         }
@@ -1232,11 +1335,18 @@ function startOperatorConsole(deps) {
             context,
             `visible post scan: mode=${debugInfo.pageMode || 'unknown'}, articles=${debugInfo.articleCount || 0}, kept=${debugInfo.keptCount || 0}`
           );
+          logDebug(
+            context,
+            `visible post debug: url=${debugInfo.url || page.url()} feed_container=${debugInfo.feedContainerStatus?.found ? 'yes' : 'no'} top_level_articles=${debugInfo.feedContainerStatus?.topLevelArticleCount || 0}`
+          );
           for (const rejection of (debugInfo.rejections || []).slice(0, 20)) {
             logDebug(
               context,
               `rejected article ${rejection.articleIndex}: ${rejection.reason}${rejection.detail ? ` (${rejection.detail})` : ''}`
             );
+          }
+          if (!visiblePosts.length && debugInfo.rejections?.[0]?.sampleText) {
+            logDebug(context, `first rejected article text: ${debugInfo.rejections[0].sampleText}`);
           }
         }
         if (visiblePosts.length) {
@@ -1252,6 +1362,7 @@ function startOperatorConsole(deps) {
             content: post.postText,
             author: post.authorName || 'Unknown',
             visible_index: post.visibleIndex,
+            selector_id: post.selectorId || '',
             group: context.currentGroup?.name || context.currentGroup?.label || '',
           }));
           await persistOperatorContext(state, upsertAgentState);
@@ -1263,6 +1374,9 @@ function startOperatorConsole(deps) {
       }
       if (context.currentGroup?.name) {
         return `I opened ${context.currentGroup.name}, but I could not read visible original posts right now.`;
+      }
+      if (context.currentSurface === 'feed') {
+        return 'I opened your home feed, but I could not read visible original posts right now.';
       }
       return summarizeRecentPostsFromDb(getCollections, callOllama, model);
     }
@@ -1283,7 +1397,7 @@ function startOperatorConsole(deps) {
       await lock.runExclusive('operator:like-post', async () => {
         if (Number.isFinite(Number(post.visible_index)) && typeof likeAnchoredPost === 'function') {
           await runAnchoredActionWithRecovery('Like anchored post', Number(post.visible_index), () =>
-            likeAnchoredPost(Number(post.visible_index))
+            likeAnchoredPost(Number(post.visible_index), { selectorId: post.selector_id || '' })
           );
         } else if (Number.isFinite(Number(post.visible_index)) && typeof clickLikeOnVisiblePost === 'function') {
           await clickLikeOnVisiblePost(Number(post.visible_index));
@@ -1298,28 +1412,23 @@ function startOperatorConsole(deps) {
     if (tool === 'like_random_posts') {
       const requestedCount = Math.max(1, Math.min(Number(args.count || 1), 20));
       const selection = String(args.selection || 'random').toLowerCase() === 'first' ? 'first' : 'random';
-      let targetGroup = context.currentGroup || null;
+      const surface = String(args.surface || '').toLowerCase() === 'feed' ? 'feed' : 'group';
+      let targetGroup = surface === 'group' ? (await resolveTargetGroup(args)) || context.currentGroup || null : null;
 
-      if (Number.isFinite(Number(args.group_index))) {
-        targetGroup = context.lastListedGroups[Number(args.group_index) - 1] || null;
-      }
-
-      if (args.group_name) {
-        const allJoined = await getGroupsByStatus('joined', { limit: 500 });
-        targetGroup = allJoined.find((item) =>
-          String(item.name || '').toLowerCase().includes(String(args.group_name).toLowerCase())
-        ) || null;
-      }
-
-      if (!targetGroup?.url) {
+      if (surface === 'feed') {
+        await lock.runExclusive('operator:open-feed-for-random-likes', async () => {
+          await openHomeFeed();
+        });
+      } else if (!targetGroup?.url) {
         return 'I need a valid joined group first. Open one first, or include the group name more clearly.';
+      } else {
+        await lock.runExclusive('operator:open-group-for-random-likes', async () => {
+          await visitGroup(page, targetGroup.url);
+        });
+        context.currentSurface = 'group';
+        context.currentGroup = targetGroup;
+        context.lastPosts = [];
       }
-
-      await lock.runExclusive('operator:open-group-for-random-likes', async () => {
-        await visitGroup(page, targetGroup.url);
-      });
-      context.currentGroup = targetGroup;
-      context.lastPosts = [];
 
       let recentPosts = await lock.runExclusive('operator:scrape-random-like-posts', async () =>
         (typeof listVisiblePosts === 'function'
@@ -1362,7 +1471,7 @@ function startOperatorConsole(deps) {
           await lock.runExclusive(`operator:random-like:${post.postId || post.visibleIndex}`, async () => {
             if (Number.isFinite(Number(post.visibleIndex)) && typeof likeAnchoredPost === 'function') {
               await runAnchoredActionWithRecovery('Like random anchored post', Number(post.visibleIndex), () =>
-                likeAnchoredPost(Number(post.visibleIndex))
+                likeAnchoredPost(Number(post.visibleIndex), { selectorId: post.selectorId || '' })
               );
             } else if (Number.isFinite(Number(post.visibleIndex)) && typeof clickLikeOnVisiblePost === 'function') {
               await clickLikeOnVisiblePost(Number(post.visibleIndex));
@@ -1386,40 +1495,37 @@ function startOperatorConsole(deps) {
 
       await persistOperatorContext(state, upsertAgentState);
       return errors.length
-        ? `Liked ${likedCount}/${requestedCount} ${selection === 'first' ? 'visible' : 'random'} posts in ${targetGroup.name}.\nErrors:\n- ${errors.slice(0, 3).join('\n- ')}`
-        : `Liked ${likedCount} ${selection === 'first' ? 'visible' : 'random'} posts in ${targetGroup.name}.`;
+        ? `Liked ${likedCount}/${requestedCount} ${selection === 'first' ? 'visible' : 'random'} posts in ${surface === 'feed' ? 'your home feed' : targetGroup.name}.\nErrors:\n- ${errors.slice(0, 3).join('\n- ')}`
+        : `Liked ${likedCount} ${selection === 'first' ? 'visible' : 'random'} posts in ${surface === 'feed' ? 'your home feed' : targetGroup.name}.`;
     }
 
     if (tool === 'comment_random_posts') {
       const requestedCount = Math.max(1, Math.min(Number(args.count || 1), 10));
       const selection = String(args.selection || 'random').toLowerCase() === 'first' ? 'first' : 'random';
-      let targetGroup = context.currentGroup || null;
+      const surface = String(args.surface || '').toLowerCase() === 'feed' ? 'feed' : 'group';
+      let targetGroup = surface === 'group' ? (await resolveTargetGroup(args)) || context.currentGroup || null : null;
 
-      if (Number.isFinite(Number(args.group_index))) {
-        targetGroup = context.lastListedGroups[Number(args.group_index) - 1] || null;
-      }
-
-      if (args.group_name) {
-        const allJoined = await getGroupsByStatus('joined', { limit: 500 });
-        targetGroup = allJoined.find((item) =>
-          String(item.name || '').toLowerCase().includes(String(args.group_name).toLowerCase())
-        ) || null;
-      }
-
-      if (!targetGroup?.url) {
-        return 'I need a valid joined group first. Open one first, or include the group name more clearly.';
-      }
-
-      const allowed = await maybeConfirm(`Post comments on up to ${requestedCount} random posts in ${targetGroup.name}`);
+      const allowed = await maybeConfirm(
+        `Post comments on up to ${requestedCount} random posts in ${surface === 'feed' ? 'your home feed' : targetGroup?.name}`
+      );
       if (!allowed) {
-        return `Cancelled random comments for ${targetGroup.name}.`;
+        return `Cancelled random comments for ${surface === 'feed' ? 'your home feed' : targetGroup?.name}.`;
       }
 
-      await lock.runExclusive('operator:open-group-for-random-comments', async () => {
-        await visitGroup(page, targetGroup.url);
-      });
-      context.currentGroup = targetGroup;
-      context.lastPosts = [];
+      if (surface === 'feed') {
+        await lock.runExclusive('operator:open-feed-for-random-comments', async () => {
+          await openHomeFeed();
+        });
+      } else if (!targetGroup?.url) {
+        return 'I need a valid joined group first. Open one first, or include the group name more clearly.';
+      } else {
+        await lock.runExclusive('operator:open-group-for-random-comments', async () => {
+          await visitGroup(page, targetGroup.url);
+        });
+        context.currentSurface = 'group';
+        context.currentGroup = targetGroup;
+        context.lastPosts = [];
+      }
 
       let visiblePosts = await lock.runExclusive('operator:list-visible-posts-for-random-comments', async () =>
         (typeof listVisiblePosts === 'function'
@@ -1437,7 +1543,7 @@ function startOperatorConsole(deps) {
 
       if (!visiblePosts.length) {
         await persistOperatorContext(state, upsertAgentState);
-        return `I opened ${targetGroup.name}, but I couldn't find visible original posts to comment on right now.`;
+        return `I opened ${surface === 'feed' ? 'your home feed' : targetGroup.name}, but I couldn't find visible original posts to comment on right now.`;
       }
 
       const candidatePosts = selection === 'first'
@@ -1475,7 +1581,7 @@ function startOperatorConsole(deps) {
           await lock.runExclusive(`operator:random-comment:${candidate.post_id}`, async () => {
             if (Number.isFinite(Number(candidate.visible_index)) && typeof commentAnchoredPost === 'function') {
               await runAnchoredActionWithRecovery('Comment on random anchored post', Number(candidate.visible_index), () =>
-                commentAnchoredPost(Number(candidate.visible_index), draft.reply)
+                commentAnchoredPost(Number(candidate.visible_index), draft.reply, { selectorId: post.selectorId || '' })
               );
             } else {
               await commentOnQualifiedPost(candidate, {
@@ -1496,8 +1602,8 @@ function startOperatorConsole(deps) {
 
       await persistOperatorContext(state, upsertAgentState);
       return errors.length
-        ? `Commented on ${commentedCount}/${requestedCount} ${selection === 'first' ? 'visible' : 'random'} posts in ${targetGroup.name}.\nErrors:\n- ${errors.slice(0, 3).join('\n- ')}`
-        : `Commented on ${commentedCount} ${selection === 'first' ? 'visible' : 'random'} posts in ${targetGroup.name}.`;
+        ? `Commented on ${commentedCount}/${requestedCount} ${selection === 'first' ? 'visible' : 'random'} posts in ${surface === 'feed' ? 'your home feed' : targetGroup.name}.\nErrors:\n- ${errors.slice(0, 3).join('\n- ')}`
+        : `Commented on ${commentedCount} ${selection === 'first' ? 'visible' : 'random'} posts in ${surface === 'feed' ? 'your home feed' : targetGroup.name}.`;
     }
 
     if (tool === 'draft_comment') {
@@ -1553,7 +1659,7 @@ function startOperatorConsole(deps) {
       await lock.runExclusive('operator:comment-post', async () => {
         if (Number.isFinite(Number(post.visible_index)) && typeof commentAnchoredPost === 'function') {
           await runAnchoredActionWithRecovery('Comment on anchored post', Number(post.visible_index), () =>
-            commentAnchoredPost(Number(post.visible_index), draft.reply)
+            commentAnchoredPost(Number(post.visible_index), draft.reply, { selectorId: post.selector_id || '' })
           );
         } else {
           await commentOnQualifiedPost(post, {
@@ -1629,14 +1735,11 @@ function startOperatorConsole(deps) {
 
     if (tool === 'draft_post') {
       const target = String(args.target || 'feed').toLowerCase() === 'group' ? 'group' : 'feed';
-      if (target === 'group') {
+        if (target === 'group') {
         if (Number.isFinite(Number(args.group_index))) {
           context.currentGroup = context.lastListedGroups[Number(args.group_index) - 1] || context.currentGroup;
         } else if (args.group_name) {
-          const allJoined = await getGroupsByStatus('joined', { limit: 500 });
-          context.currentGroup = allJoined.find((item) =>
-            String(item.name || '').toLowerCase().includes(String(args.group_name).toLowerCase())
-          ) || context.currentGroup;
+          context.currentGroup = (await resolveTargetGroup(args)) || context.currentGroup;
         }
       }
       const prompt = [
@@ -1720,7 +1823,7 @@ function startOperatorConsole(deps) {
         await lock.runExclusive('operator:post-last-comment-draft', async () => {
           if (Number.isFinite(Number(post.visible_index)) && typeof commentAnchoredPost === 'function') {
             await runAnchoredActionWithRecovery('Post saved comment on anchored post', Number(post.visible_index), () =>
-              commentAnchoredPost(Number(post.visible_index), draft.text)
+              commentAnchoredPost(Number(post.visible_index), draft.text, { selectorId: post.selector_id || '' })
             );
           } else {
             await commentOnQualifiedPost(post, {
@@ -1823,6 +1926,7 @@ function startOperatorConsole(deps) {
             selection: routed.selection || 'random',
             group_index: routed.group_index,
             group_name: routed.group_name || '',
+            surface: routed.surface || 'group',
           },
         }],
       };
@@ -1838,6 +1942,7 @@ function startOperatorConsole(deps) {
             selection: routed.selection || 'random',
             group_index: routed.group_index,
             group_name: routed.group_name || '',
+            surface: routed.surface || 'group',
           },
         }],
       };
@@ -1888,6 +1993,7 @@ function startOperatorConsole(deps) {
             group_name: routed.group_name || '',
             limit: routed.limit,
             random: routed.random || false,
+            surface: routed.surface || 'group',
           },
         }],
       };
@@ -2175,6 +2281,7 @@ module.exports = {
   buildDashboard,
   inferIntentHeuristically,
   planOperatorMessage,
+  resolveNamedGroup,
   routeOperatorIntent,
   startOperatorConsole,
   summarizeRecentPostsFromDb,

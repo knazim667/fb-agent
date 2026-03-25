@@ -5,6 +5,7 @@ const assert = require('node:assert/strict');
 
 const {
   inferIntentHeuristically,
+  resolveNamedGroup,
   routeOperatorIntent,
 } = require('../src/agent/operator_console');
 
@@ -134,11 +135,46 @@ test('heuristic router maps random posts request for numbered group', () => {
   assert.equal(intent.random, true);
 });
 
+test('heuristic router maps feed post listing requests', () => {
+  const intent = inferIntentHeuristically('show me recent 5 posts from my feed');
+  assert.equal(intent.type, 'show_posts');
+  assert.equal(intent.surface, 'feed');
+  assert.equal(intent.limit, 5);
+});
+
+test('heuristic router maps feed like requests', () => {
+  const intent = inferIntentHeuristically('go to the feed and like the first 5 random posts');
+  assert.equal(intent.type, 'like_random_posts');
+  assert.equal(intent.surface, 'feed');
+  assert.equal(intent.count, 5);
+});
+
+test('resolveNamedGroup prefers exact normalized matches before loose contains', () => {
+  const groups = [
+    { name: 'Amazon FBA Sellers and Community', url: 'https://facebook.com/groups/1' },
+    { name: 'Amazon FBA Sellers Community', url: 'https://facebook.com/groups/2' },
+    { name: 'Get and sell Amazon Products', url: 'https://facebook.com/groups/3' },
+  ];
+
+  const match = resolveNamedGroup(groups, 'Amazon FBA Sellers Community');
+  assert.equal(match?.url, 'https://facebook.com/groups/2');
+});
+
 test('heuristic router maps draft post on numbered group', () => {
   const intent = inferIntentHeuristically('draft a post on group 1 about our amazon hidden money business');
   assert.equal(intent.type, 'draft_post');
   assert.equal(intent.target, 'group');
   assert.equal(intent.group_index, 1);
+  assert.match(intent.topic, /amazon hidden money/i);
+});
+
+test('heuristic router maps natural draft-then-post phrasing for groups', () => {
+  const intent = inferIntentHeuristically(
+    'draft a post about our amazon hidden money business and post it to group 14'
+  );
+  assert.equal(intent.type, 'draft_post');
+  assert.equal(intent.target, 'group');
+  assert.equal(intent.group_index, 14);
   assert.match(intent.topic, /amazon hidden money/i);
 });
 

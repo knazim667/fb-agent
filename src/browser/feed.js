@@ -1,7 +1,7 @@
 'use strict';
 
-const ABSOLUTE_TIMESTAMP_PATTERN = /^(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)(?:\s+\d{1,2})(?:\s+at\s+\d{1,2}:\d{2}(?:\s?[ap]m)?)?$/i;
-const RELATIVE_TIMESTAMP_PATTERN = /^(just now|now|today|yesterday|\d+\s*(?:m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days|w|week|weeks|y|yr|yrs|year|years))$/i;
+const ABSOLUTE_TIMESTAMP_PATTERN = /^(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)(?:\s+\d{1,2})(?:,\s*\d{4})?(?:\s+at\s+\d{1,2}:\d{2}(?:\s?[ap]m)?)?$/i;
+const RELATIVE_TIMESTAMP_PATTERN = /^(?:just now|now|today|yesterday|\d+\s*(?:m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days|w|week|weeks|y|yr|yrs|year|years))(?:\s+ago)?$/i;
 
 function looksLikeFacebookTimestamp(text = '') {
   const normalized = String(text || '').trim().replace(/\s+/g, ' ');
@@ -12,13 +12,9 @@ function looksLikeFacebookTimestamp(text = '') {
 }
 
 function classifyFacebookPageMode({ articleCount = 0, bodyText = '', url = '' } = {}) {
-  const normalizedBody = String(bodyText || '').toLowerCase();
   const normalizedUrl = String(url || '').toLowerCase();
 
-  if (
-    /\/posts\/|story_fbid=|\/permalink\//i.test(normalizedUrl)
-    || (articleCount <= 2 && /view more answers|write an answer|write a public comment|public comment|comments?\b/i.test(normalizedBody))
-  ) {
+  if (/\/posts\/|story_fbid=|\/permalink\//i.test(normalizedUrl)) {
     return 'post_detail';
   }
 
@@ -27,6 +23,27 @@ function classifyFacebookPageMode({ articleCount = 0, bodyText = '', url = '' } 
   }
 
   return 'feed';
+}
+
+function isVisiblePostCandidate({
+  authorName = '',
+  bodyText = '',
+  actionControlCount = 0,
+  timestampText = '',
+} = {}) {
+  const normalizedAuthor = String(authorName || '').trim();
+  const normalizedBody = String(bodyText || '').trim();
+  const normalizedTimestamp = String(timestampText || '').trim();
+
+  if (actionControlCount < 2) {
+    return false;
+  }
+
+  if (normalizedBody.length < 15) {
+    return false;
+  }
+
+  return Boolean(normalizedAuthor || normalizedTimestamp);
 }
 
 function createFeedApi({
@@ -85,9 +102,9 @@ function createFeedApi({
     await page.waitForTimeout(randomBetween(1_000, 2_000));
     await loadGroupFeedPosts(page, { scrollRounds });
 
-    const extracted = await page.evaluate(({ limit }) => {
-      const RELATIVE_TIMESTAMP_PATTERN = /^(just now|now|today|yesterday|\d+\s*(?:m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days|w|week|weeks|y|yr|yrs|year|years))$/i;
-      const ABSOLUTE_TIMESTAMP_PATTERN = /^(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)(?:\s+\d{1,2})(?:\s+at\s+\d{1,2}:\d{2}(?:\s?[ap]m)?)?$/i;
+    const extractInPage = async () => page.evaluate(({ limit }) => {
+      const RELATIVE_TIMESTAMP_PATTERN = /^(?:just now|now|today|yesterday|\d+\s*(?:m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days|w|week|weeks|y|yr|yrs|year|years))(?:\s+ago)?$/i;
+      const ABSOLUTE_TIMESTAMP_PATTERN = /^(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)(?:\s+\d{1,2})(?:,\s*\d{4})?(?:\s+at\s+\d{1,2}:\d{2}(?:\s?[ap]m)?)?$/i;
 
       function normalize(text) {
         return (text || '').trim().replace(/\s+/g, ' ');
@@ -127,7 +144,7 @@ function createFeedApi({
 
       function findAuthorNode(article) {
         const candidates = Array.from(article.querySelectorAll('h2 a, h3 a, strong span a, [role="link"], strong span, h2, h3'));
-        return candidates.find((node) => {
+        const directMatch = candidates.find((node) => {
           if (!isVisible(node)) {
             return false;
           }
@@ -140,6 +157,27 @@ function createFeedApi({
             && !/follow|join|invite|share/i.test(text)
             && rect.top < article.getBoundingClientRect().top + 180;
         }) || null;
+
+        if (directMatch) {
+          return directMatch;
+        }
+
+        const boldCandidates = Array.from(article.querySelectorAll('span, strong, div, a'))
+          .filter((node) => {
+            if (!isVisible(node)) {
+              return false;
+            }
+            const text = normalize(node.innerText);
+            if (!text || text.length < 2 || looksLikeTimestamp(text) || /like|comment|share|reply|follow/i.test(text)) {
+              return false;
+            }
+            const style = window.getComputedStyle(node);
+            const weight = Number(style.fontWeight || 400);
+            const rect = node.getBoundingClientRect();
+            return weight >= 600 && rect.top < article.getBoundingClientRect().top + 180;
+          });
+
+        return boldCandidates[0] || null;
       }
 
       function findTimestampNode(article) {
@@ -168,7 +206,7 @@ function createFeedApi({
 
       function fallbackTimestampText(article) {
         const articleText = normalize(article.innerText);
-        const match = articleText.match(/\b(just now|now|today|yesterday|\d+\s*(?:m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days|w|week|weeks|y|yr|yrs|year|years)|(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)(?:\s+\d{1,2})(?:\s+at\s+\d{1,2}:\d{2}(?:\s?[ap]m)?)?)\b/i);
+        const match = articleText.match(/\b(just now|now|today|yesterday|\d+\s*(?:m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days|w|week|weeks|y|yr|yrs|year|years)(?:\s+ago)?|(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)(?:\s+\d{1,2})(?:,\s*\d{4})?(?:\s+at\s+\d{1,2}:\d{2}(?:\s?[ap]m)?)?)\b/i);
         return match ? normalize(match[1]) : '';
       }
 
@@ -238,16 +276,107 @@ function createFeedApi({
         return chunks.join('\n').trim();
       }
 
-      const articles = Array.from(document.querySelectorAll('div[role="article"]'));
+      function extractDeepArticleText(article, actionTop) {
+        const texts = [];
+        const seen = new Set();
+        const nodes = Array.from(article.querySelectorAll('div, span, p, a, strong'));
+
+        for (const node of nodes) {
+          if (!isVisible(node)) {
+            continue;
+          }
+
+          if (node.closest('form, [role="textbox"], [aria-label*="Comment"], [aria-label*="Reply"]')) {
+            continue;
+          }
+
+          const rect = node.getBoundingClientRect();
+          if (rect.top >= actionTop - 6) {
+            continue;
+          }
+
+          const text = normalize(node.innerText);
+          if (!text || text.length < 6) {
+            continue;
+          }
+
+          if (/^(like|comment|share|reply|follow|see more|top contributor|write a comment|leave a comment)$/i.test(text)) {
+            continue;
+          }
+
+          if (looksLikeTimestamp(text)) {
+            continue;
+          }
+
+          if (!seen.has(text)) {
+            seen.add(text);
+            texts.push(text);
+          }
+        }
+
+        return texts.join('\n').trim();
+      }
+
+      function getTopLevelArticles(root) {
+        const container = root || document.body;
+        const articles = Array.from(container.querySelectorAll('div[role="article"]'));
+        return articles.filter((article) => {
+          const parentArticle = article.parentElement?.closest?.('div[role="article"]');
+          return !parentArticle || !container.contains(parentArticle);
+        });
+      }
+
+      function findBestFeedContainer() {
+        const candidates = [
+          ...Array.from(document.querySelectorAll('[role="feed"]')),
+          ...Array.from(document.querySelectorAll('div[role="main"], main')),
+        ]
+          .filter((node, index, all) => node && isVisible(node) && all.indexOf(node) === index);
+
+        let best = null;
+        for (const candidate of candidates) {
+          const articles = getTopLevelArticles(candidate).filter((article) => isVisible(article));
+          const rect = candidate.getBoundingClientRect();
+          const score = (articles.length * 10_000) + Math.max(0, Math.round(rect.width * rect.height));
+          if (!best || score > best.score) {
+            best = {
+              container: candidate,
+              articles,
+              score,
+            };
+          }
+        }
+
+        return best;
+      }
+
+      function describeFeedContainer(choice) {
+        if (!choice?.container) {
+          return {
+            found: false,
+            tag: '',
+            role: '',
+            topLevelArticleCount: 0,
+          };
+        }
+
+        return {
+          found: true,
+          tag: choice.container.tagName.toLowerCase(),
+          role: choice.container.getAttribute('role') || '',
+          topLevelArticleCount: choice.articles.length,
+        };
+      }
+
+      const feedChoice = findBestFeedContainer();
+      const feedContainerStatus = describeFeedContainer(feedChoice);
+      const articles = (feedChoice?.articles?.length ? feedChoice.articles : getTopLevelArticles(document.body))
+        .filter((article) => isVisible(article));
       const anchors = [];
       const rejections = [];
       const pageMode = (() => {
-        const bodyText = normalize(document.body?.innerText || '');
         const url = window.location.href || '';
-        if (
-          /\/posts\/|story_fbid=|\/permalink\//i.test(url)
-          || (articles.length <= 2 && /view more answers|write an answer|write a public comment|public comment|comments?\b/i.test(bodyText))
-        ) {
+        if (/\/posts\/|story_fbid=|\/permalink\//i.test(url)) {
           return 'post_detail';
         }
         if (/\/groups\//i.test(url)) {
@@ -256,8 +385,13 @@ function createFeedApi({
         return 'feed';
       })();
 
-      function reject(articleIndex, reason, detail = '') {
-        rejections.push({ articleIndex, reason, detail });
+      function reject(articleIndex, reason, detail = '', article = null) {
+        rejections.push({
+          articleIndex,
+          reason,
+          detail,
+          sampleText: article ? normalize((article.innerText || '').slice(0, 400)) : '',
+        });
       }
 
       for (let articleIndex = 0; articleIndex < articles.length; articleIndex += 1) {
@@ -280,40 +414,46 @@ function createFeedApi({
         const shareButton = findActionButton(article, /^share$/i);
         const actionControls = [likeButton, commentButton, shareButton].filter(Boolean);
         const timestampText = normalize(timestampNode?.innerText || '') || fallbackTimestampText(article);
-
-        if (!authorNode) {
-          reject(articleIndex, 'missing_header_author');
-          continue;
-        }
-
-        if (!timestampText) {
-          reject(articleIndex, 'missing_header_timestamp');
-          continue;
-        }
+        const timestampConfidence = timestampText
+          ? (timestampNode ? 'strict' : 'fallback')
+          : 'missing';
 
         if (actionControls.length < 2) {
-          reject(articleIndex, 'weak_action_bar', `controls=${actionControls.length}`);
+          reject(articleIndex, 'weak_action_bar', `controls=${actionControls.length}`, article);
           continue;
         }
 
         const headerBottom = findHeaderBoundary(article, authorNode, timestampNode);
         const actionTop = findActionBarTop(article, actionControls);
-        const mainBodyText = extractMainBodyText(article, headerBottom, actionTop);
+        const mainBodyText = extractMainBodyText(article, headerBottom, actionTop)
+          || extractDeepArticleText(article, actionTop);
         if (!mainBodyText || mainBodyText.length < 15) {
-          reject(articleIndex, 'no_body_between_header_and_action_bar');
+          reject(articleIndex, 'no_body_between_header_and_action_bar', '', article);
           continue;
         }
 
-        const authorName = normalize(authorNode.innerText);
+        const authorName = normalize(authorNode?.innerText || '') || 'Unknown';
+        if (!isVisiblePostCandidate({
+          authorName: authorName === 'Unknown' ? '' : authorName,
+          bodyText: mainBodyText,
+          actionControlCount: actionControls.length,
+          timestampText,
+        })) {
+          reject(articleIndex, 'invalid_visible_post_candidate', '', article);
+          continue;
+        }
         const urlNode = (timestampNode?.closest('a[href]')) || Array.from(article.querySelectorAll('a[href]'))
           .find((node) => /\/posts\/|story_fbid=|\/permalink\//i.test(node.getAttribute('href') || '')) || null;
         const postUrl = urlNode ? urlNode.getAttribute('href') || '' : '';
         const ignoreAsComment = Boolean(replyButton)
           && !shareButton
           && /\b(reply|replies)\b/i.test(normalize(article.innerText));
+        const selectorId = article.getAttribute('data-agent-visible-post-id')
+          || `agent-visible-post-${articleIndex + 1}`;
+        article.setAttribute('data-agent-visible-post-id', selectorId);
 
         if (ignoreAsComment) {
-          reject(articleIndex, 'comment_thread_below_action_bar');
+          reject(articleIndex, 'comment_thread_below_action_bar', '', article);
           continue;
         }
 
@@ -323,7 +463,8 @@ function createFeedApi({
           timestampText,
           postText: mainBodyText,
           postUrl,
-          anchorConfidence: timestampNode ? 'strict' : 'fallback',
+          anchorConfidence: timestampConfidence,
+          selectorId,
         });
 
         if (anchors.length >= limit) {
@@ -336,20 +477,61 @@ function createFeedApi({
         rejections,
         articleCount: articles.length,
         pageMode,
+        url: window.location.href || '',
+        feedContainerStatus,
       };
     }, { limit: Math.max(limit * 2, 20) });
+
+    const desiredCount = Math.min(Math.max(1, Number(limit || 1)), 5);
+    const maxAttempts = Math.max(2, Math.min(Number(scrollRounds || 2) + 2, 6));
+    const aggregateAnchors = [];
+    const seenKeys = new Set();
+    let extracted = null;
+
+    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+      extracted = await extractInPage();
+      const rawAnchors = Array.isArray(extracted?.anchors) ? extracted.anchors : [];
+
+      for (const rawAnchor of rawAnchors) {
+        const href = String(rawAnchor.postUrl || '').trim();
+        const normalizedUrl = href
+          ? (href.startsWith('http') ? href : `${FACEBOOK_BASE_URL}${href}`)
+          : '';
+        const postId = extractPostIdFromHref(normalizedUrl) || '';
+        const dedupeKey = postId
+          || normalizedUrl
+          || `${String(rawAnchor.selectorId || '').trim()}|${String(rawAnchor.timestampText || '').trim()}|${String(rawAnchor.postText || '').trim().slice(0, 120)}`;
+
+        if (!dedupeKey || seenKeys.has(dedupeKey)) {
+          continue;
+        }
+
+        seenKeys.add(dedupeKey);
+        aggregateAnchors.push({
+          ...rawAnchor,
+          normalizedUrl,
+          postId,
+        });
+      }
+
+      if (aggregateAnchors.length >= desiredCount) {
+        break;
+      }
+
+      if (attempt < maxAttempts - 1) {
+        await page.mouse.wheel(0, 900).catch(() => null);
+        await page.waitForTimeout(randomBetween(1_500, 2_200));
+      }
+    }
 
     const anchors = [];
     const seenPostIds = new Set();
     const normalizedRejections = Array.isArray(extracted?.rejections) ? extracted.rejections : [];
-    const rawAnchors = Array.isArray(extracted?.anchors) ? extracted.anchors : [];
+    const rawAnchors = aggregateAnchors;
 
     for (const rawAnchor of rawAnchors) {
-      const href = String(rawAnchor.postUrl || '').trim();
-      const normalizedUrl = href
-        ? (href.startsWith('http') ? href : `${FACEBOOK_BASE_URL}${href}`)
-        : '';
-      const postId = extractPostIdFromHref(normalizedUrl) || `visible-${rawAnchor.articleIndex + 1}`;
+      const normalizedUrl = String(rawAnchor.normalizedUrl || rawAnchor.postUrl || '').trim();
+      const postId = String(rawAnchor.postId || '').trim() || `visible-${rawAnchor.articleIndex + 1}`;
       if (seenPostIds.has(postId)) {
         continue;
       }
@@ -364,6 +546,7 @@ function createFeedApi({
         timestampText: rawAnchor.timestampText,
         postUrl: normalizedUrl,
         anchorConfidence: rawAnchor.anchorConfidence || 'fallback',
+        selectorId: rawAnchor.selectorId || '',
         summary: rawAnchor.postText.split('\n')[0].slice(0, 180),
       });
 
@@ -377,8 +560,16 @@ function createFeedApi({
         posts: anchors,
         debug: {
           articleCount: Number(extracted?.articleCount || 0),
+          url: String(extracted?.url || page.url() || ''),
           keptCount: anchors.length,
           pageMode: String(extracted?.pageMode || 'unknown'),
+          feedContainerStatus: extracted?.feedContainerStatus || {
+            found: false,
+            tag: '',
+            role: '',
+            topLevelArticleCount: 0,
+          },
+          scanAttempts: maxAttempts,
           rejections: normalizedRejections,
         },
       };
@@ -406,5 +597,6 @@ function createFeedApi({
 module.exports = {
   createFeedApi,
   classifyFacebookPageMode,
+  isVisiblePostCandidate,
   looksLikeFacebookTimestamp,
 };

@@ -11,16 +11,38 @@ function createActionsApi({
   }
 
   async function anchorVisiblePost(page, visibleIndex, options = {}) {
+    const explicitSelectorId = String(options.selectorId || '').trim();
+    if (explicitSelectorId) {
+      const explicitArticle = page.locator(`[data-agent-visible-post-id="${explicitSelectorId}"]`).first();
+      if (await explicitArticle.count()) {
+        await explicitArticle.waitFor({ state: 'visible', timeout: 10_000 });
+        await explicitArticle.scrollIntoViewIfNeeded();
+        return {
+          anchor: {
+            visibleIndex: Number(visibleIndex),
+            selectorId: explicitSelectorId,
+          },
+          article: explicitArticle,
+        };
+      }
+    }
+
     const anchors = await listVisiblePosts(page, {
       limit: options.limit || Math.max(Number(visibleIndex) + 8, 12),
       scrollRounds: options.scrollRounds ?? 2,
     });
-    const anchor = anchors.find((item) => Number(item.visibleIndex) === Number(visibleIndex));
+    const anchor = anchors.find((item) =>
+      explicitSelectorId
+        ? String(item.selectorId || '').trim() === explicitSelectorId
+        : Number(item.visibleIndex) === Number(visibleIndex)
+    );
     if (!anchor) {
       throw new Error(`Visible post anchor ${visibleIndex} was not found on the current page.`);
     }
 
-    const article = page.locator('div[role="article"]').nth(Number(anchor.articleIndex));
+    const article = anchor.selectorId
+      ? page.locator(`[data-agent-visible-post-id="${anchor.selectorId}"]`).first()
+      : page.locator('div[role="article"]').nth(Number(anchor.articleIndex));
     await article.waitFor({ state: 'visible', timeout: 10_000 });
     await article.scrollIntoViewIfNeeded();
 
