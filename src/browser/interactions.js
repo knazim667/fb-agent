@@ -236,6 +236,7 @@ function createInteractionsApi({
       .first();
     await composer.waitFor({ state: 'visible', timeout: 15_000 });
     await composer.click({ delay: randomBetween(50, 120) });
+    await page.waitForTimeout(200);
     await composer.evaluate((element, value) => {
       element.focus();
       element.textContent = value;
@@ -247,10 +248,10 @@ function createInteractionsApi({
       }));
       element.dispatchEvent(new Event('change', { bubbles: true }));
     }, text);
-    await page.waitForTimeout(800);
+    await page.waitForTimeout(500);
     await page.keyboard.type(' ', { delay: 40 });
     await page.keyboard.press('Backspace');
-    await page.waitForTimeout(600);
+    await page.waitForTimeout(500);
 
     if (imagePath) {
       const fileInput = page.locator('div[role="dialog"] input[type="file"]').first();
@@ -267,6 +268,17 @@ function createInteractionsApi({
       }
       return button.getAttribute('aria-disabled') !== 'true' && button.disabled !== true;
     }, { timeout: 15_000 }).catch(() => null);
+
+    const disabled = await postButton.getAttribute('aria-disabled').catch(() => null);
+    if (disabled === 'true') {
+      const modifier = process.platform === 'darwin' ? 'Meta' : 'Control';
+      await composer.click({ delay: randomBetween(50, 120) }).catch(() => null);
+      await page.keyboard.press(`${modifier}+A`).catch(() => null);
+      await page.keyboard.press('Backspace').catch(() => null);
+      await page.waitForTimeout(200);
+      await page.keyboard.type(text, { delay: randomBetween(50, 150) });
+      await page.waitForTimeout(500);
+    }
 
     await lightHumanPause(page, 1_000, 2_200);
     await postButton.click({ delay: randomBetween(60, 180) });

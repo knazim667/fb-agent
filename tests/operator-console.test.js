@@ -66,6 +66,14 @@ test('heuristic router captures group list limit and activity sorting', () => {
   assert.equal(intent.limit, 10);
 });
 
+test('heuristic router captures list-of count phrasing for groups', () => {
+  const intent = inferIntentHeuristically('give me a list of 5 most active amazon groups');
+  assert.equal(intent.type, 'list_groups');
+  assert.equal(intent.amazon_only, true);
+  assert.equal(intent.sort_by, 'activity');
+  assert.equal(intent.limit, 5);
+});
+
 test('heuristic router maps random like requests', () => {
   const intent = inferIntentHeuristically('can you like at least 10 random post in group Amazon FBA PrivateLabel - plfba.com');
   assert.equal(intent.type, 'like_random_posts');
@@ -85,6 +93,45 @@ test('heuristic router maps numbered group random likes with on-group phrasing',
   assert.equal(intent.type, 'like_random_posts');
   assert.equal(intent.count, 5);
   assert.equal(intent.group_index, 22);
+  assert.equal(intent.selection, 'random');
+});
+
+test('heuristic router maps first-post like requests', () => {
+  const intent = inferIntentHeuristically('go to group 17 and like first 5 posts in this group');
+  assert.equal(intent.type, 'like_random_posts');
+  assert.equal(intent.count, 5);
+  assert.equal(intent.group_index, 17);
+  assert.equal(intent.selection, 'first');
+});
+
+test('heuristic router maps numbered group random comments', () => {
+  const intent = inferIntentHeuristically('can you comment on 5 random post on group 7');
+  assert.equal(intent.type, 'comment_random_posts');
+  assert.equal(intent.count, 5);
+  assert.equal(intent.group_index, 7);
+  assert.equal(intent.selection, 'random');
+});
+
+test('heuristic router maps first-post comment requests', () => {
+  const intent = inferIntentHeuristically('comment on first 3 posts on group 7');
+  assert.equal(intent.type, 'comment_random_posts');
+  assert.equal(intent.count, 3);
+  assert.equal(intent.group_index, 7);
+  assert.equal(intent.selection, 'first');
+});
+
+test('heuristic router maps recent posts request for numbered group', () => {
+  const intent = inferIntentHeuristically('can you give me recent 5 posts from group 2');
+  assert.equal(intent.type, 'show_posts');
+  assert.equal(intent.limit, 5);
+  assert.equal(intent.group_index, 2);
+});
+
+test('heuristic router maps random posts request for numbered group', () => {
+  const intent = inferIntentHeuristically('can you give me any random posts in group 2');
+  assert.equal(intent.type, 'show_posts');
+  assert.equal(intent.group_index, 2);
+  assert.equal(intent.random, true);
 });
 
 test('heuristic router maps draft post on numbered group', () => {
@@ -93,4 +140,14 @@ test('heuristic router maps draft post on numbered group', () => {
   assert.equal(intent.target, 'group');
   assert.equal(intent.group_index, 1);
   assert.match(intent.topic, /amazon hidden money/i);
+});
+
+test('heuristic router maps post-last-draft requests', () => {
+  const intent = inferIntentHeuristically('post the last draft');
+  assert.equal(intent.type, 'post_last_draft');
+});
+
+test('heuristic router maps debug toggle requests', () => {
+  assert.deepEqual(inferIntentHeuristically('debug on'), { type: 'debug_mode', enabled: true });
+  assert.deepEqual(inferIntentHeuristically('debug off'), { type: 'debug_mode', enabled: false });
 });

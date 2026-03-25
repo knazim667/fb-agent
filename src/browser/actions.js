@@ -5,6 +5,11 @@ function createActionsApi({
   lightHumanPause,
   randomBetween,
 }) {
+  async function hoverAndRead(page, locator) {
+    await locator.hover().catch(() => null);
+    await page.waitForTimeout(randomBetween(1_000, 2_000));
+  }
+
   async function anchorVisiblePost(page, visibleIndex, options = {}) {
     const anchors = await listVisiblePosts(page, {
       limit: options.limit || Math.max(Number(visibleIndex) + 8, 12),
@@ -99,6 +104,26 @@ function createActionsApi({
     }
   }
 
+  async function typeWithRecovery(page, textbox, text, submitButton = null) {
+    await textbox.click({ delay: randomBetween(60, 180) });
+    await page.waitForTimeout(200);
+    await page.keyboard.type(text, { delay: randomBetween(50, 150) });
+    await page.waitForTimeout(500);
+
+    if (submitButton && await submitButton.count()) {
+      const disabled = await submitButton.getAttribute('aria-disabled').catch(() => null);
+      if (disabled === 'true') {
+        const modifier = process.platform === 'darwin' ? 'Meta' : 'Control';
+        await textbox.click({ delay: randomBetween(60, 180) }).catch(() => null);
+        await page.keyboard.press(`${modifier}+A`).catch(() => null);
+        await page.keyboard.press('Backspace').catch(() => null);
+        await page.waitForTimeout(200);
+        await page.keyboard.type(text, { delay: randomBetween(50, 150) });
+        await page.waitForTimeout(500);
+      }
+    }
+  }
+
   async function likeAnchoredPost(page, visibleIndex, options = {}) {
     const { article } = await anchorVisiblePost(page, visibleIndex, options);
     const likeButton = article.getByRole('button', { name: /^like$/i }).first();
@@ -109,6 +134,7 @@ function createActionsApi({
     await likeButton.waitFor({ state: 'visible', timeout: 10_000 });
     await likeButton.scrollIntoViewIfNeeded();
     const beforeState = await readLikeState(likeButton);
+    await hoverAndRead(page, likeButton);
     await lightHumanPause(page, 800, 1_800);
     await clickWithFallback(likeButton);
 
@@ -129,16 +155,15 @@ function createActionsApi({
 
     await commentTrigger.waitFor({ state: 'visible', timeout: 10_000 });
     await commentTrigger.scrollIntoViewIfNeeded();
+    await hoverAndRead(page, commentTrigger);
     await lightHumanPause(page, 900, 1_900);
     await clickWithFallback(commentTrigger);
 
     const textbox = article.locator('div[role="textbox"][contenteditable="true"]').first();
     await textbox.waitFor({ state: 'visible', timeout: 10_000 });
-    await textbox.click({ delay: randomBetween(60, 180) });
-    await page.keyboard.type(text, { delay: randomBetween(35, 90) });
-    await page.waitForTimeout(randomBetween(800, 1_600));
-
     const submitButton = article.getByRole('button', { name: /comment|reply|post/i }).last();
+    await typeWithRecovery(page, textbox, text, submitButton);
+
     if (await submitButton.count()) {
       try {
         const disabled = await submitButton.getAttribute('aria-disabled');

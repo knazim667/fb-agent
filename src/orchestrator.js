@@ -10,6 +10,7 @@ const {
   AGENT_INSIGHTS_PATH,
   appendAgentInsights,
   callOllama,
+  classifyPostForEngagement,
   decideNextDomAction,
   DEFAULT_MODEL_PROVIDER,
   DEFAULT_OLLAMA_MODEL,
@@ -18,12 +19,16 @@ const {
   getModelRuntimeConfig,
   MORNING_BRIEFING_MODEL,
   ensureMemoryFile,
+  planObjective,
   readAgentInsights,
   resolveSkillForTask,
   setModelRuntimeConfig,
   summarizeDiscussion,
   scorePostAgainstSkill,
 } = require('./brain');
+const {
+  saveNewSkill,
+} = require('./filesystem');
 const {
   createBrowserLock,
   runQueuedJobs,
@@ -470,6 +475,7 @@ async function runPerceiveReasonActLoop(page, {
   const memorySections = [
     skill?.content || '',
     insights || '',
+    workspaceContext?.persona || '',
     workspaceContext?.memory || '',
     workspaceContext?.user || '',
     workspaceContext?.agents || '',
@@ -525,14 +531,20 @@ async function runPerceiveReasonActLoop(page, {
         }
       }
 
-      const nextStep = await decideNextDomAction({
-        url: page.url(),
-        goal,
-        memory: memorySections.join('\n\n'),
-        snapshot,
-        pageState,
-        lastError: [lastError, hintNote].filter(Boolean).join('\n'),
-      });
+      let nextStep;
+      try {
+        nextStep = await decideNextDomAction({
+          url: page.url(),
+          goal,
+          memory: memorySections.join('\n\n'),
+          snapshot,
+          pageState,
+          lastError: [lastError, hintNote].filter(Boolean).join('\n'),
+        });
+      } catch (error) {
+        lastError = error.message;
+        break;
+      }
 
       if (nextStep.action === 'complete') {
         return {
@@ -733,16 +745,20 @@ async function scanGroupWithReasoningLoop(page, group, skill, state, options = {
     return [];
   }
 
-  const loopResult = await runPerceiveReasonActLoop(page, {
-    goal: `Find and extract text from all posts in this group that match our business interests${options.topic ? ` about ${options.topic}` : ''}. Scroll if needed. Complete when visible relevant posts can be extracted or when there are clearly no relevant posts visible.`,
-    skill,
-    workspaceContext: state.workspaceContext || null,
-    maxSteps: 8,
-    onStall: options.onStall || null,
-  });
+  const immediatelyVisiblePosts = await listVisiblePosts(page, { limit: 8, scrollRounds: 1 }).catch(() => []);
 
-  if (!loopResult.success && loopResult.error) {
-    state.errors.push(`Scan loop issue for ${group.label}: ${loopResult.error}`);
+  if (!immediatelyVisiblePosts.length) {
+    const loopResult = await runPerceiveReasonActLoop(page, {
+      goal: `Find and extract text from all posts in this group that match our business interests${options.topic ? ` about ${options.topic}` : ''}. Scroll if needed. Complete when visible relevant posts can be extracted or when there are clearly no relevant posts visible.`,
+      skill,
+      workspaceContext: state.workspaceContext || null,
+      maxSteps: 8,
+      onStall: options.onStall || null,
+    });
+
+    if (!loopResult.success && loopResult.error) {
+      state.errors.push(`Scan loop issue for ${group.label}: ${loopResult.error}`);
+    }
   }
 
   const found = await extractLeadPostsFromCurrentPage(page, group.label, skill, state, options.topic || '');
@@ -1400,6 +1416,32 @@ async function likeQualifiedPost(page, candidate, state) {
 }
 
 async function draftCommentForCandidate(skill, candidate, options = {}) {
+  const classification = await classifyPostForEngagement({
+    skill,
+    postContent: candidate.content,
+  }, {
+    model: MORNING_BRIEFING_MODEL,
+  });
+
+  const isSkillRelevant = /amazon|fba|seller|fee|reimbursement|settlement|inventory|margin|profit/i.test(
+    String(candidate.content || '')
+  );
+  const contextualSummary = [
+    `Post category: [${classification.category}].`,
+    `Persona: ${classification.persona}.`,
+    `Guidance: ${classification.guidance}.`,
+    classification.category === 'PROBLEM'
+      ? 'This is a problem post. Look for a practical solution in the relevant skill before drafting.'
+      : classification.category === 'QUESTION'
+        ? 'This is a question post. Answer accurately and simply.'
+        : classification.category === 'CELEBRATION'
+          ? 'This is a celebration post. Congratulate them and mention a specific detail.'
+          : 'This is a general post. Keep the reply positive, useful, and human.',
+    isSkillRelevant
+      ? 'Use the Amazon hidden money skill only where it genuinely fits the post.'
+      : 'This is general engagement. Do not force Amazon hidden money advice if it does not fit.',
+  ].join(' ');
+
   return draftReply({
     skill,
     post: {
@@ -1407,8 +1449,8 @@ async function draftCommentForCandidate(skill, candidate, options = {}) {
       content: candidate.content,
     },
     threadId: candidate.post_id,
-    contextSummary: candidate.content,
-    tone: options.tone || 'helpful, consultative, confident, concise',
+    contextSummary: `${candidate.content}\n\n${contextualSummary}`,
+    tone: options.tone || classification.tone || 'helpful, consultative, confident, concise',
     phaseOverride: options.phaseOverride ?? 1,
   });
 }
@@ -1839,6 +1881,8 @@ async function runAssistantSession(options = {}) {
       draftCommentForCandidate: (candidate, options) => draftCommentForCandidate(skill, candidate, options),
       commentOnQualifiedPost: (candidate, options) => commentOnQualifiedPost(browser.page, skill, candidate, state, options),
       commentAnchoredPost: (visibleIndex, text, options) => commentAnchoredPost(browser.page, visibleIndex, text, options),
+      planObjective: (payload, options) => planObjective(payload, options),
+      saveNewSkill,
       postCommentOnVisiblePost: (visibleIndex, text) => postCommentOnVisiblePost(browser.page, visibleIndex, text),
       createNewPost,
       createFeedPost,

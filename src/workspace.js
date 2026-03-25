@@ -5,6 +5,8 @@ const path = require('path');
 
 const ROOT_DIR = path.join(__dirname, '..');
 const MEMORY_DIR = path.join(ROOT_DIR, 'memory');
+const PERSONA_PATH = path.join(MEMORY_DIR, 'persona.md');
+const SKILL_FEEDBACK_PATH = path.join(MEMORY_DIR, 'skill_feedback.md');
 const AGENTS_PATH = path.join(ROOT_DIR, 'AGENTS.md');
 const SOUL_PATH = path.join(ROOT_DIR, 'SOUL.md');
 const TOOLS_PATH = path.join(ROOT_DIR, 'TOOLS.md');
@@ -40,6 +42,22 @@ async function safeRead(filePath) {
 async function ensureWorkspaceDocs() {
   await fs.mkdir(MEMORY_DIR, { recursive: true });
 
+  await ensureFile(PERSONA_PATH, [
+    '# Agent Personality Profile: "The Helpful Expert"',
+    '',
+    '## Tone And Voice',
+    '- Language: simple, direct English with no fluff.',
+    '- Style: professional but friendly, like a busy business owner helping a friend.',
+    '- Never say "As an AI".',
+    '- If someone sounds frustrated, acknowledge that first.',
+    '',
+    '## Decision Logic',
+    '- Achievement: congratulate them and mention a specific detail.',
+    '- Problem: use a known skill if it fits, otherwise give a useful suggestion or one clarifying question.',
+    '- Random Feed: like real posts, skip ads and junk.',
+    '',
+  ].join('\n'), 'utf8');
+
   await ensureFile(USER_PATH, [
     '# USER',
     '',
@@ -74,6 +92,13 @@ async function ensureWorkspaceDocs() {
     '',
   ].join('\n'), 'utf8');
 
+  await ensureFile(SKILL_FEEDBACK_PATH, [
+    '# Skill Feedback',
+    '',
+    'Operational notes about which skills, replies, and patterns worked or failed.',
+    '',
+  ].join('\n'), 'utf8');
+
   const todayPath = path.join(MEMORY_DIR, todayFileName());
   await ensureFile(todayPath, [
     `# ${todayFileName().replace(/\.md$/, '')}`,
@@ -94,6 +119,7 @@ async function loadWorkspaceContext() {
     agents,
     soul,
     tools,
+    persona,
     user,
     memory,
     todayMemory,
@@ -102,6 +128,7 @@ async function loadWorkspaceContext() {
     safeRead(AGENTS_PATH),
     safeRead(SOUL_PATH),
     safeRead(TOOLS_PATH),
+    safeRead(PERSONA_PATH),
     safeRead(USER_PATH),
     safeRead(MEMORY_PATH),
     safeRead(todayPath),
@@ -112,8 +139,10 @@ async function loadWorkspaceContext() {
     agents,
     soul,
     tools,
+    persona,
     user,
     memory,
+    skillFeedback: await safeRead(SKILL_FEEDBACK_PATH),
     todayMemory,
     yesterdayMemory,
   };

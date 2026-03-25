@@ -15,12 +15,14 @@ const TOOL_NAMES = [
   'show_posts',
   'like_post',
   'like_random_posts',
+  'comment_random_posts',
   'draft_comment',
   'comment_post',
   'check_notifications',
   'reply_notification',
   'draft_post',
   'post_last_draft',
+  'debug_mode',
   'sync_groups',
   'verify_pending_groups',
   'help',
@@ -32,6 +34,7 @@ function ensureOperatorContext(state) {
   if (!state.operatorContext) {
     state.operatorContext = {
       executionMode: 'confirm',
+      debugMode: false,
       currentGroup: null,
       lastListedGroups: [],
       lastPosts: [],
@@ -58,6 +61,7 @@ async function persistOperatorContext(state, upsertAgentState) {
   const context = ensureOperatorContext(state);
   await upsertAgentState('operator_context', {
     executionMode: context.executionMode,
+    debugMode: Boolean(context.debugMode),
     currentGroup: context.currentGroup,
     lastListedGroups: context.lastListedGroups,
     lastPosts: context.lastPosts,
@@ -130,6 +134,20 @@ function formatOriginalPosts(posts = [], title = 'Original posts') {
       return `Post #${number}: ${author}\n   ${summary}`;
     }),
   ].join('\n');
+}
+
+function dedupeGroupsByUrl(groups = []) {
+  const seen = new Set();
+  const unique = [];
+  for (const group of groups) {
+    const key = String(group.url || group.group_id || group.id || group.name || '').trim().toLowerCase();
+    if (!key || seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    unique.push(group);
+  }
+  return unique;
 }
 
 function formatNotifications(notifications = [], title = 'Notifications') {
@@ -209,6 +227,13 @@ function addConversationTurn(state, role, text) {
     timestamp: new Date().toISOString(),
   });
   context.conversationHistory = context.conversationHistory.slice(-12);
+}
+
+function logDebug(context, message) {
+  if (!context?.debugMode) {
+    return;
+  }
+  console.log(`[debug] ${message}`);
 }
 
 async function summarizeRecentPostsFromDb(getCollections, callOllama, model, limit = 12) {
@@ -305,6 +330,14 @@ function inferIntentHeuristically(input) {
     return { type: 'help' };
   }
 
+  if (normalized === 'debug on') {
+    return { type: 'debug_mode', enabled: true };
+  }
+
+  if (normalized === 'debug off') {
+    return { type: 'debug_mode', enabled: false };
+  }
+
   if (normalized === 'exit' || normalized === 'quit') {
     return { type: 'exit' };
   }
@@ -314,7 +347,7 @@ function inferIntentHeuristically(input) {
     /(list|show|give|which|what)/.test(normalized) &&
     /(joined|already|all|amazon|related)/.test(normalized)
   ) {
-    const limitMatch = normalized.match(/(?:max(?:imum)?|at least|top|show|give me)\s+(\d+)/i)
+    const limitMatch = normalized.match(/(?:max(?:imum)?|at least|top|show|give me|list of|of)\s+(\d+)/i)
       || normalized.match(/^(\d+)\s+(?:most\s+active\s+)?groups?/i);
     return {
       type: 'list_groups',
@@ -356,6 +389,12 @@ function inferIntentHeuristically(input) {
     };
   }
 
+  if (/post (?:the )?(?:last )?draft|publish (?:the )?(?:last )?draft|post it now/i.test(normalized)) {
+    return {
+      type: 'post_last_draft',
+    };
+  }
+
   const draftGroupMatch = String(input || '').match(/draft (?:a )?post .*?(?:on|for) group\s+(\d+)(?:\s+about\s+(.+))?/i)
     || String(input || '').match(/draft (?:a )?post .*?(?:on|for)\s+group\s+(.+?)(?:\s+about\s+(.+))?$/i);
   if (draftGroupMatch) {
@@ -370,7 +409,7 @@ function inferIntentHeuristically(input) {
   }
 
   if (/most active .*groups?|groups? .*most active|active groups? first/i.test(normalized)) {
-    const limitMatch = normalized.match(/(?:max(?:imum)?|at least|top|show)\s+(\d+)/i);
+    const limitMatch = normalized.match(/(?:max(?:imum)?|at least|top|show|give me|list of|of)\s+(\d+)/i);
     return {
       type: 'list_groups',
       amazon_only: /amazon|fba|private label|seller/.test(normalized),
@@ -379,16 +418,39 @@ function inferIntentHeuristically(input) {
     };
   }
 
-  const randomLikeMatch = String(input || '').match(/like(?:\s+at\s+least)?\s+(\d+)\s+random\s+posts?(?:\s+(?:in|on|for)\s+group\s+(.+))?/i)
-    || String(input || '').match(/like(?:\s+at\s+least)?\s+(\d+)\s+posts?(?:\s+(?:in|on|for)\s+group\s+(.+))?/i);
+  const randomLikeMatch = String(input || '').match(/like(?:\s+at\s+least)?(?:\s+first)?\s+(\d+)\s+random\s+posts?(?:\s+(?:in|on|for)\s+group\s+(.+))?/i)
+    || String(input || '').match(/like(?:\s+at\s+least)?(?:\s+first)?\s+(\d+)\s+posts?(?:\s+(?:in|on|for)\s+group\s+(.+))?/i);
   if (randomLikeMatch) {
     const maybeIndex = Number(randomLikeMatch[2]);
+    const fallbackGroupIndex = Number((normalized.match(/\bgroup\s+(\d+)\b/i) || [])[1]);
     return {
       type: 'like_random_posts',
       count: Number(randomLikeMatch[1]),
-      group_index: Number.isFinite(maybeIndex) && maybeIndex > 0 ? maybeIndex : undefined,
+      selection: /\bfirst\b/i.test(normalized) ? 'first' : 'random',
+      group_index: Number.isFinite(maybeIndex) && maybeIndex > 0
+        ? maybeIndex
+        : (Number.isFinite(fallbackGroupIndex) && fallbackGroupIndex > 0 ? fallbackGroupIndex : undefined),
       group_name: randomLikeMatch[2] && !(Number.isFinite(maybeIndex) && maybeIndex > 0)
         ? randomLikeMatch[2].trim()
+        : '',
+    };
+  }
+
+  const randomCommentMatch = String(input || '').match(/comment(?:\s+on)?(?:\s+at\s+least)?(?:\s+first)?\s+(\d+)\s+random\s+posts?(?:\s+(?:in|on|for)\s+group\s+(.+))?/i)
+    || String(input || '').match(/comm+ment on(?:\s+first)?\s+(\d+)\s+random\s+posts?(?:\s+(?:in|on|for)\s+group\s+(.+))?/i)
+    || String(input || '').match(/comment(?:\s+on)?(?:\s+first)?\s+(\d+)\s+posts?(?:\s+(?:in|on|for)\s+group\s+(.+))?/i);
+  if (randomCommentMatch) {
+    const maybeIndex = Number(randomCommentMatch[2]);
+    const fallbackGroupIndex = Number((normalized.match(/\bgroup\s+(\d+)\b/i) || [])[1]);
+    return {
+      type: 'comment_random_posts',
+      count: Number(randomCommentMatch[1]),
+      selection: /\bfirst\b/i.test(normalized) ? 'first' : 'random',
+      group_index: Number.isFinite(maybeIndex) && maybeIndex > 0
+        ? maybeIndex
+        : (Number.isFinite(fallbackGroupIndex) && fallbackGroupIndex > 0 ? fallbackGroupIndex : undefined),
+      group_name: randomCommentMatch[2] && !(Number.isFinite(maybeIndex) && maybeIndex > 0)
+        ? randomCommentMatch[2].trim()
         : '',
     };
   }
@@ -397,6 +459,30 @@ function inferIntentHeuristically(input) {
     return normalized.includes('this group')
       ? { type: 'scan_current_group' }
       : { type: 'scan' };
+  }
+
+  const showPostsMatch = String(input || '').match(/(?:show|give|find|list)\s+(?:me\s+)?(?:recent|latest|any|random)?\s*(\d+)?\s*posts?(?:\s+from|\s+in|\s+on)?\s+group\s+(.+)/i);
+  if (showPostsMatch) {
+    const maybeIndex = Number(showPostsMatch[2]);
+    return {
+      type: 'show_posts',
+      limit: Number(showPostsMatch[1] || 0) || undefined,
+      group_index: Number.isFinite(maybeIndex) && maybeIndex > 0 ? maybeIndex : undefined,
+      group_name: showPostsMatch[2] && !(Number.isFinite(maybeIndex) && maybeIndex > 0)
+        ? showPostsMatch[2].trim()
+        : '',
+      random: /\brandom\b/i.test(normalized),
+    };
+  }
+
+  if (/\b(any|recent|latest|random)\s+posts?\b/i.test(normalized) && /\bgroup\s+\d+\b/i.test(normalized)) {
+    const match = normalized.match(/\bgroup\s+(\d+)\b/i);
+    return {
+      type: 'show_posts',
+      group_index: Number(match?.[1] || 0) || undefined,
+      random: /\brandom\b/i.test(normalized),
+      limit: Number((normalized.match(/\b(\d+)\s+posts?\b/i) || [])[1] || 0) || undefined,
+    };
   }
 
   if (/find groups? for |search groups? |look for groups? /i.test(normalized)) {
@@ -422,11 +508,15 @@ async function routeOperatorIntent(input, deps) {
 function inferDirectActionIntent(input) {
   const intent = inferIntentHeuristically(input);
   const directTypes = new Set([
+    'debug_mode',
     'list_groups',
     'check_notifications',
+    'show_posts',
     'like_random_posts',
+    'comment_random_posts',
     'draft_comment',
     'draft_post',
+    'post_last_draft',
   ]);
 
   return directTypes.has(intent.type) ? intent : null;
@@ -452,15 +542,17 @@ function plannerToolGuide() {
     '- open_group {"group_index":number,"group_name":"optional"}',
     '- scan_current_group {"topic":"optional"}',
     '- scan_joined_groups {"topic":"optional","limit":number}',
-    '- show_posts {"source":"current"}',
+    '- show_posts {"source":"current","group_index":number,"group_name":"optional","limit":number,"random":true|false}',
     '- like_post {"post_index":number}',
-    '- like_random_posts {"count":number,"group_index":number,"group_name":"optional"}',
+    '- like_random_posts {"count":number,"selection":"first|random","group_index":number,"group_name":"optional"}',
+    '- comment_random_posts {"count":number,"selection":"first|random","group_index":number,"group_name":"optional"}',
     '- draft_comment {"post_index":number,"instructions":"optional"}',
     '- comment_post {"post_index":number,"instructions":"optional"}',
     '- check_notifications {"comments_only":true|false,"unread_only":true|false,"within_hours":number,"mark_read":true|false,"limit":number}',
     '- reply_notification {"notification_index":number,"instructions":"optional"}',
     '- draft_post {"target":"feed|group","group_index":number,"group_name":"optional","topic":"optional"}',
     '- post_last_draft {}',
+    '- debug_mode {"enabled":true|false}',
     '- sync_groups {}',
     '- verify_pending_groups {}',
     '- help {}',
@@ -495,13 +587,16 @@ function buildPlannerContext(message, state, taskInput) {
     workspace: {
       agents: excerpt(workspace.agents || '', 800),
       soul: excerpt(workspace.soul || '', 600),
+      persona: excerpt(workspace.persona || '', 800),
       user: excerpt(workspace.user || '', 600),
       memory: excerpt(workspace.memory || '', 800),
+      skill_feedback: excerpt(workspace.skillFeedback || '', 800),
       today_memory: excerpt(workspace.todayMemory || '', 600),
       yesterday_memory: excerpt(workspace.yesterdayMemory || '', 600),
       tools: excerpt(workspace.tools || '', 800),
     },
     execution_mode: context.executionMode,
+    debug_mode: Boolean(context.debugMode),
     current_group: context.currentGroup
       ? { name: context.currentGroup.name || context.currentGroup.label, url: context.currentGroup.url }
       : null,
@@ -534,15 +629,21 @@ async function planOperatorMessage(message, deps) {
     model,
     state,
     taskInput,
+    objectivePlan,
   } = deps;
 
   const prompt = [
     'You are the planner for a Facebook account manager agent.',
+    'Treat the user message as a top-level objective.',
     'Read the user message, current context, and choose the smallest useful tool plan.',
+    'Decompose the objective using the chosen family: business_scan, general_engagement, or drafting.',
     'Understand the meaning, not exact commands.',
     'If the user asks for Amazon-related groups only, use list_groups with amazon_only=true.',
     'If the user refers to a numbered group or post, use the current list indexes from context.',
     'If the user asks to go to a group and then find lead posts, use open_group then scan_current_group.',
+    'If the user asks for general Facebook engagement or recent/raw posts, do not force a business-only filter.',
+    'If the user asks to draft, show the draft first. Do not publish in the same step unless they explicitly ask to post.',
+    'Use the Amazon skill only when the content clearly fits that business context. Otherwise act like a polite high-value human account manager.',
     'If the user asks for a draft, do not post unless execution mode and user intent clearly allow it.',
     'Prefer multi-step plans when the user asks for a sequence.',
     'Do not repeat list_groups if the user is clearly referring to an existing numbered list already in context.',
@@ -560,6 +661,13 @@ async function planOperatorMessage(message, deps) {
     'JSON: {"assistant_reply":"","actions":[{"tool":"comment_post","args":{"post_index":2}}]}',
     'USER: "show me only amazon related groups"',
     'JSON: {"assistant_reply":"","actions":[{"tool":"list_groups","args":{"status":"joined","amazon_only":true,"limit":200}}]}',
+    'USER: "can you give me recent 5 posts from group 2"',
+    'JSON: {"assistant_reply":"","actions":[{"tool":"show_posts","args":{"group_index":2,"limit":5}}]}',
+    'USER: "like a couple of random posts on group 2"',
+    'JSON: {"assistant_reply":"","actions":[{"tool":"like_random_posts","args":{"group_index":2,"count":2}}]}',
+    '',
+    'Objective plan JSON:',
+    JSON.stringify(objectivePlan || {}, null, 2),
     '',
     'Current context JSON:',
     buildPlannerContext(message, state, taskInput),
@@ -592,6 +700,7 @@ async function decideNextToolStep({
   deps,
   observations,
   stepNumber,
+  objectivePlan = null,
 }) {
   const {
     callOllama,
@@ -603,10 +712,13 @@ async function decideNextToolStep({
   const prompt = [
     'You are the reasoning loop for a Facebook account manager agent.',
     'Think step by step, but return JSON only.',
+    'Treat the user message as one top-level objective and choose the next best step toward completing it.',
     'Choose exactly one next tool action, or finish.',
     'Use the observations from previous tools to decide the next step.',
     'If the user is referring to a numbered group or post, use the indexes from current context and observations.',
     'Do not restart from the beginning if the needed list is already available in context.',
+    'If the user asks for general engagement or raw recent posts, do not narrow it to business-only lead scanning unless they explicitly ask for that.',
+    'If the objective family is drafting, do not publish inside the planning loop. Draft first and stop.',
     'When enough information has been gathered, finish with a concise final response.',
     '',
     plannerToolGuide(),
@@ -628,6 +740,9 @@ async function decideNextToolStep({
     'STEP JSON: {"done":false,"assistant_reply":"","action":{"tool":"show_posts","args":{"source":"current"}}}',
     'After showing posts,',
     'STEP JSON: {"done":true,"assistant_reply":"I opened the group and showed the matching posts I found."}',
+    '',
+    'Objective plan JSON:',
+    JSON.stringify(objectivePlan || {}, null, 2),
     '',
     'Loop context JSON:',
     buildLoopPlannerContext({
@@ -789,6 +904,8 @@ function startOperatorConsole(deps) {
     draftCommentForCandidate,
     commentOnQualifiedPost,
     commentAnchoredPost,
+    planObjective,
+    saveNewSkill,
     postCommentOnVisiblePost,
     createNewPost,
     createFeedPost,
@@ -894,6 +1011,8 @@ function startOperatorConsole(deps) {
         '- comment on post 2',
         '- draft a post for this group',
         '- check comments on our posts',
+        '- debug on',
+        '- debug off',
       ].join('\n');
     }
 
@@ -918,33 +1037,23 @@ function startOperatorConsole(deps) {
       return `Status: ${joined.length} joined, ${pending.length} pending, ${discovered.length} discovered. Mode: ${context.executionMode}. Current group: ${context.currentGroup?.name || 'none'}.`;
     }
 
+    if (tool === 'debug_mode') {
+      context.debugMode = Boolean(args.enabled);
+      await persistOperatorContext(state, upsertAgentState);
+      return `Debug mode is now ${context.debugMode ? 'ON' : 'OFF'}.`;
+    }
+
     if (tool === 'list_groups') {
       const requestedStatus = String(args.status || 'all').toLowerCase();
       const limit = Math.max(1, Math.min(Number(args.limit || 200), 500));
+      const fetchLimit = args.amazon_only ? Math.max(limit * 5, 100) : limit;
       let groups = [];
 
-      if ((requestedStatus === 'joined' || requestedStatus === 'all') && typeof listVisibleGroups === 'function') {
-        const liveJoined = await lock.runExclusive('operator:list-visible-groups', async () =>
-          listVisibleGroups({ limit, scrollRounds: 8 })
-        );
-        groups = liveJoined.map((group) => ({ ...group, status: 'joined' }));
-
-        if (requestedStatus === 'all') {
-          const [pending, discovered] = await Promise.all([
-            getGroupsByStatus('pending', { limit }),
-            getGroupsByStatus('discovered', { limit }),
-          ]);
-          groups = [
-            ...groups,
-            ...pending.map((group) => ({ ...group, status: 'pending' })),
-            ...discovered.map((group) => ({ ...group, status: 'discovered' })),
-          ];
-        }
-      } else if (requestedStatus === 'all') {
+      if (requestedStatus === 'all') {
         const [joined, pending, discovered] = await Promise.all([
-          getGroupsByStatus('joined', { limit }),
-          getGroupsByStatus('pending', { limit }),
-          getGroupsByStatus('discovered', { limit }),
+          getGroupsByStatus('joined', { limit: fetchLimit }),
+          getGroupsByStatus('pending', { limit: fetchLimit }),
+          getGroupsByStatus('discovered', { limit: fetchLimit }),
         ]);
         groups = [
           ...joined.map((group) => ({ ...group, status: 'joined' })),
@@ -952,13 +1061,35 @@ function startOperatorConsole(deps) {
           ...discovered.map((group) => ({ ...group, status: 'discovered' })),
         ];
       } else {
-        groups = (await getGroupsByStatus(requestedStatus, { limit }))
+        groups = (await getGroupsByStatus(requestedStatus, { limit: fetchLimit }))
           .map((group) => ({ ...group, status: requestedStatus }));
+      }
+
+      if ((requestedStatus === 'joined' || requestedStatus === 'all') && typeof listVisibleGroups === 'function') {
+        const liveJoined = await lock.runExclusive('operator:list-visible-groups', async () =>
+          listVisibleGroups({ limit: Math.max(limit, 50), scrollRounds: 8 })
+        ).catch(() => []);
+
+        if (liveJoined.length) {
+          const liveMap = new Map(
+            liveJoined.map((group) => [
+              String(group.url || group.name || '').trim().toLowerCase(),
+              group,
+            ])
+          );
+          groups = groups.map((group) => {
+            const key = String(group.url || group.name || '').trim().toLowerCase();
+            const live = liveMap.get(key);
+            return live ? { ...group, ...live, status: group.status || 'joined' } : group;
+          });
+        }
       }
 
       if (args.amazon_only) {
         groups = filterAmazonGroups(groups, isRelevantAmazonGroupName);
       }
+
+      groups = dedupeGroupsByUrl(groups);
 
       if (args.sort_by === 'activity') {
         groups = groups.sort((left, right) => {
@@ -967,6 +1098,8 @@ function startOperatorConsole(deps) {
           return leftAge - rightAge;
         });
       }
+
+      logDebug(context, `list_groups produced ${groups.length} groups before slicing to ${limit}.`);
 
       groups = groups.slice(0, limit);
 
@@ -1008,6 +1141,8 @@ function startOperatorConsole(deps) {
         await visitGroup(page, group.url);
       });
       context.currentGroup = group;
+      context.lastPosts = [];
+      logDebug(context, `Opened group URL: ${group.url || 'unknown-url'}`);
       await persistOperatorContext(state, upsertAgentState);
       return `Opened group: ${group.name}`;
     }
@@ -1029,7 +1164,18 @@ function startOperatorConsole(deps) {
           onStall: handleStall,
         })
       );
-      context.lastPosts = await filterPostsByTopic(results, args.topic || '', callOllama, model);
+      const filteredPosts = await filterPostsByTopic(results, args.topic || '', callOllama, model);
+      if (context.debugMode) {
+        const matchedIds = new Set(filteredPosts.map((post, index) => String(post.post_id || post.postId || post.visible_index || index + 1)));
+        results.forEach((post, index) => {
+          const id = String(post.post_id || post.postId || post.visible_index || index + 1);
+          logDebug(
+            context,
+            `scan post ${id}: ${matchedIds.has(id) ? 'matched business topic' : 'filtered out'} | ${excerpt(post.content || post.postText || '', 120)}`
+          );
+        });
+      }
+      context.lastPosts = filteredPosts;
       await persistOperatorContext(state, upsertAgentState);
       return formatOriginalPosts(context.lastPosts, `Matched posts in ${context.currentGroup.name || context.currentGroup.label}`);
     }
@@ -1042,14 +1188,64 @@ function startOperatorConsole(deps) {
     }
 
     if (tool === 'show_posts') {
+      if (Number.isFinite(Number(args.group_index))) {
+        const selected = context.lastListedGroups[Number(args.group_index) - 1] || null;
+        if (selected?.url) {
+          await lock.runExclusive('operator:open-group-for-show-posts', async () => {
+            await visitGroup(page, selected.url);
+          });
+          context.currentGroup = selected;
+          context.lastPosts = [];
+        }
+      } else if (args.group_name) {
+        const allJoined = await getGroupsByStatus('joined', { limit: 500 });
+        const selected = allJoined.find((item) =>
+          String(item.name || '').toLowerCase().includes(String(args.group_name).toLowerCase())
+        ) || null;
+        if (selected?.url) {
+          await lock.runExclusive('operator:open-named-group-for-show-posts', async () => {
+            await visitGroup(page, selected.url);
+          });
+          context.currentGroup = selected;
+          context.lastPosts = [];
+        }
+      }
+
       if (currentPosts().length) {
-        return formatOriginalPosts(currentPosts(), 'Current posts');
+        const chosenPosts = args.random
+          ? [...currentPosts()].sort(() => Math.random() - 0.5).slice(0, Math.max(1, Number(args.limit || 5)))
+          : currentPosts().slice(0, Math.max(1, Number(args.limit || currentPosts().length)));
+        return formatOriginalPosts(chosenPosts, 'Current posts');
       }
       if (context.currentGroup?.url && typeof listVisiblePosts === 'function') {
-        const visiblePosts = await lock.runExclusive('operator:list-visible-posts', async () =>
-          listVisiblePosts({ limit: 12, scrollRounds: 2 })
+        const visiblePostsResult = await lock.runExclusive('operator:list-visible-posts', async () =>
+          listVisiblePosts({
+            limit: Math.max(1, Number(args.limit || 12)),
+            scrollRounds: 3,
+            returnMeta: true,
+          })
         );
+        const visiblePosts = Array.isArray(visiblePostsResult?.posts) ? visiblePostsResult.posts : [];
+        if (context.debugMode) {
+          const debugInfo = visiblePostsResult?.debug || {};
+          logDebug(
+            context,
+            `visible post scan: mode=${debugInfo.pageMode || 'unknown'}, articles=${debugInfo.articleCount || 0}, kept=${debugInfo.keptCount || 0}`
+          );
+          for (const rejection of (debugInfo.rejections || []).slice(0, 20)) {
+            logDebug(
+              context,
+              `rejected article ${rejection.articleIndex}: ${rejection.reason}${rejection.detail ? ` (${rejection.detail})` : ''}`
+            );
+          }
+        }
         if (visiblePosts.length) {
+          visiblePosts.forEach((post) => {
+            logDebug(
+              context,
+              `visible post ${post.postId || post.visibleIndex}: accepted as original post anchor`
+            );
+          });
           context.lastPosts = visiblePosts.map((post) => ({
             post_id: post.postId,
             post_url: post.postUrl,
@@ -1059,11 +1255,14 @@ function startOperatorConsole(deps) {
             group: context.currentGroup?.name || context.currentGroup?.label || '',
           }));
           await persistOperatorContext(state, upsertAgentState);
-          return formatOriginalPosts(context.lastPosts, `Visible posts in ${context.currentGroup.name || context.currentGroup.label}`);
+          const chosenPosts = args.random
+            ? [...context.lastPosts].sort(() => Math.random() - 0.5).slice(0, Math.max(1, Number(args.limit || 5)))
+            : context.lastPosts.slice(0, Math.max(1, Number(args.limit || context.lastPosts.length)));
+          return formatOriginalPosts(chosenPosts, `Visible posts in ${context.currentGroup.name || context.currentGroup.label}`);
         }
       }
       if (context.currentGroup?.name) {
-        return `No matching posts are currently saved for ${context.currentGroup.name}.`;
+        return `I opened ${context.currentGroup.name}, but I could not read visible original posts right now.`;
       }
       return summarizeRecentPostsFromDb(getCollections, callOllama, model);
     }
@@ -1098,6 +1297,7 @@ function startOperatorConsole(deps) {
 
     if (tool === 'like_random_posts') {
       const requestedCount = Math.max(1, Math.min(Number(args.count || 1), 20));
+      const selection = String(args.selection || 'random').toLowerCase() === 'first' ? 'first' : 'random';
       let targetGroup = context.currentGroup || null;
 
       if (Number.isFinite(Number(args.group_index))) {
@@ -1119,12 +1319,21 @@ function startOperatorConsole(deps) {
         await visitGroup(page, targetGroup.url);
       });
       context.currentGroup = targetGroup;
+      context.lastPosts = [];
 
-      const recentPosts = await lock.runExclusive('operator:scrape-random-like-posts', async () =>
+      let recentPosts = await lock.runExclusive('operator:scrape-random-like-posts', async () =>
         (typeof listVisiblePosts === 'function'
           ? listVisiblePosts({ limit: Math.max(requestedCount * 2, 12), scrollRounds: 2 })
           : scrapeGroupFeed(page, { limit: Math.max(requestedCount * 2, 12), scrollRounds: 2 }))
       );
+
+      if (recentPosts.length < requestedCount) {
+        recentPosts = await lock.runExclusive('operator:scrape-random-like-posts-more', async () =>
+          (typeof listVisiblePosts === 'function'
+            ? listVisiblePosts({ limit: Math.max(requestedCount * 3, 15), scrollRounds: 5 })
+            : scrapeGroupFeed(page, { limit: Math.max(requestedCount * 3, 15), scrollRounds: 5 }))
+        );
+      }
 
       if (!recentPosts.length) {
         await persistOperatorContext(state, upsertAgentState);
@@ -1133,9 +1342,18 @@ function startOperatorConsole(deps) {
 
       let likedCount = 0;
       const errors = [];
-      const shuffled = [...recentPosts].sort(() => Math.random() - 0.5);
+      const candidatePosts = selection === 'first'
+        ? [...recentPosts].sort((left, right) => Number(left.visibleIndex || 0) - Number(right.visibleIndex || 0))
+        : [...recentPosts].sort(() => Math.random() - 0.5);
 
-      for (const post of shuffled) {
+      candidatePosts.forEach((post) => {
+        logDebug(
+          context,
+          `like candidate ${post.postId || post.visibleIndex}: visibleIndex=${post.visibleIndex} selection=${selection}`
+        );
+      });
+
+      for (const post of candidatePosts) {
         if (likedCount >= requestedCount) {
           break;
         }
@@ -1159,6 +1377,7 @@ function startOperatorConsole(deps) {
             }
           });
           likedCount += 1;
+          console.log(`Finished ${likedCount}/${requestedCount}, looking for the next post.`);
           await humanJitter(page, { logLabel: 'Random like jitter' });
         } catch (error) {
           errors.push(`${post.postId}: ${error.message}`);
@@ -1167,8 +1386,118 @@ function startOperatorConsole(deps) {
 
       await persistOperatorContext(state, upsertAgentState);
       return errors.length
-        ? `Liked ${likedCount}/${requestedCount} random posts in ${targetGroup.name}.\nErrors:\n- ${errors.slice(0, 3).join('\n- ')}`
-        : `Liked ${likedCount} random posts in ${targetGroup.name}.`;
+        ? `Liked ${likedCount}/${requestedCount} ${selection === 'first' ? 'visible' : 'random'} posts in ${targetGroup.name}.\nErrors:\n- ${errors.slice(0, 3).join('\n- ')}`
+        : `Liked ${likedCount} ${selection === 'first' ? 'visible' : 'random'} posts in ${targetGroup.name}.`;
+    }
+
+    if (tool === 'comment_random_posts') {
+      const requestedCount = Math.max(1, Math.min(Number(args.count || 1), 10));
+      const selection = String(args.selection || 'random').toLowerCase() === 'first' ? 'first' : 'random';
+      let targetGroup = context.currentGroup || null;
+
+      if (Number.isFinite(Number(args.group_index))) {
+        targetGroup = context.lastListedGroups[Number(args.group_index) - 1] || null;
+      }
+
+      if (args.group_name) {
+        const allJoined = await getGroupsByStatus('joined', { limit: 500 });
+        targetGroup = allJoined.find((item) =>
+          String(item.name || '').toLowerCase().includes(String(args.group_name).toLowerCase())
+        ) || null;
+      }
+
+      if (!targetGroup?.url) {
+        return 'I need a valid joined group first. Open one first, or include the group name more clearly.';
+      }
+
+      const allowed = await maybeConfirm(`Post comments on up to ${requestedCount} random posts in ${targetGroup.name}`);
+      if (!allowed) {
+        return `Cancelled random comments for ${targetGroup.name}.`;
+      }
+
+      await lock.runExclusive('operator:open-group-for-random-comments', async () => {
+        await visitGroup(page, targetGroup.url);
+      });
+      context.currentGroup = targetGroup;
+      context.lastPosts = [];
+
+      let visiblePosts = await lock.runExclusive('operator:list-visible-posts-for-random-comments', async () =>
+        (typeof listVisiblePosts === 'function'
+          ? listVisiblePosts({ limit: Math.max(requestedCount * 2, 10), scrollRounds: 2 })
+          : scrapeGroupFeed(page, { limit: Math.max(requestedCount * 2, 10), scrollRounds: 2 }))
+      );
+
+      if (visiblePosts.length < requestedCount) {
+        visiblePosts = await lock.runExclusive('operator:list-visible-posts-for-random-comments-more', async () =>
+          (typeof listVisiblePosts === 'function'
+            ? listVisiblePosts({ limit: Math.max(requestedCount * 3, 15), scrollRounds: 5 })
+            : scrapeGroupFeed(page, { limit: Math.max(requestedCount * 3, 15), scrollRounds: 5 }))
+        );
+      }
+
+      if (!visiblePosts.length) {
+        await persistOperatorContext(state, upsertAgentState);
+        return `I opened ${targetGroup.name}, but I couldn't find visible original posts to comment on right now.`;
+      }
+
+      const candidatePosts = selection === 'first'
+        ? [...visiblePosts].sort((left, right) => Number(left.visibleIndex || 0) - Number(right.visibleIndex || 0))
+        : [...visiblePosts].sort(() => Math.random() - 0.5);
+      candidatePosts.forEach((post) => {
+        logDebug(
+          context,
+          `comment candidate ${post.postId || post.visibleIndex}: visibleIndex=${post.visibleIndex} selection=${selection}`
+        );
+      });
+      let commentedCount = 0;
+      const errors = [];
+
+      for (const post of candidatePosts) {
+        if (commentedCount >= requestedCount) {
+          break;
+        }
+
+        const candidate = {
+          post_id: post.postId || `visible-post-${post.visibleIndex}`,
+          post_url: post.postUrl || '',
+          content: post.postText || '',
+          author: post.authorName || 'Unknown',
+          group: targetGroup.name,
+          visible_index: post.visibleIndex,
+        };
+
+        try {
+          const draft = await draftCommentForCandidate(candidate, {
+            phaseOverride: 1,
+            tone: 'helpful, concise, light, non-spammy',
+          });
+
+          await lock.runExclusive(`operator:random-comment:${candidate.post_id}`, async () => {
+            if (Number.isFinite(Number(candidate.visible_index)) && typeof commentAnchoredPost === 'function') {
+              await runAnchoredActionWithRecovery('Comment on random anchored post', Number(candidate.visible_index), () =>
+                commentAnchoredPost(Number(candidate.visible_index), draft.reply)
+              );
+            } else {
+              await commentOnQualifiedPost(candidate, {
+                draft,
+                phaseOverride: 1,
+                onStall: handleStall,
+              });
+            }
+          });
+
+          commentedCount += 1;
+          console.log(`Finished ${commentedCount}/${requestedCount}, looking for the next post.`);
+          await humanJitter(page, { logLabel: 'Random comment jitter' });
+        } catch (error) {
+          errors.push(`${candidate.post_id}: ${error.message}`);
+        }
+      }
+
+      await persistOperatorContext(state, upsertAgentState);
+      return errors.length
+        ? `Commented on ${commentedCount}/${requestedCount} ${selection === 'first' ? 'visible' : 'random'} posts in ${targetGroup.name}.\nErrors:\n- ${errors.slice(0, 3).join('\n- ')}`
+        : `Commented on ${commentedCount} ${selection === 'first' ? 'visible' : 'random'} posts in ${targetGroup.name}.`;
     }
 
     if (tool === 'draft_comment') {
@@ -1340,30 +1669,12 @@ function startOperatorConsole(deps) {
         target: { surface: target, group: target === 'group' ? context.currentGroup : null },
         text: draftText,
       });
-
-      const allowed = await maybeConfirm(
-        target === 'feed' ? 'Post this to your feed' : 'Post this to the current group'
-      );
-      if (!allowed) {
-        return `Draft ${target} post:\n${draftText}`;
-      }
-
-      if (target === 'feed') {
-        await lock.runExclusive('operator:feed-post', async () => {
-          await createFeedPost(page, draftText, null);
-        });
-        return 'Posted the draft to your feed.';
-      }
-
-      if (!context.currentGroup?.group_id && !context.currentGroup?.id) {
-        return `Draft group post:\n${draftText}\n\nI need you to open a tracked group first before I can post it.`;
-      }
-
-      await lock.runExclusive('operator:group-post', async () => {
-        await visitGroup(page, context.currentGroup.url);
-        await createNewPost(page, context.currentGroup.group_id || context.currentGroup.id, draftText, null);
-      });
-      return 'Posted the draft to the current group.';
+      return [
+        `Draft ${target} post:`,
+        draftText,
+        '',
+        'If you want, say "post the last draft" when you are ready.',
+      ].join('\n');
     }
 
     if (tool === 'post_last_draft') {
@@ -1385,14 +1696,19 @@ function startOperatorConsole(deps) {
           return 'Posted the last draft to your feed.';
         }
 
-        if (!context.currentGroup?.group_id && !context.currentGroup?.id) {
+        const draftGroup = draft.target?.group || context.currentGroup;
+        if (!draftGroup?.group_id && !draftGroup?.id) {
           return 'The last draft is for a group, but no current group is selected.';
         }
 
         await lock.runExclusive('operator:post-last-group-draft', async () => {
-          await createNewPost(page, context.currentGroup.group_id || context.currentGroup.id, draft.text, null);
+          if (draftGroup?.url) {
+            await visitGroup(page, draftGroup.url);
+          }
+          await createNewPost(page, draftGroup.group_id || draftGroup.id, draft.text, null);
         });
-        return 'Posted the last draft to the current group.';
+        context.currentGroup = draftGroup;
+        return `Posted the last draft to ${draftGroup.name || 'the current group'}.`;
       }
 
       if (draft.kind === 'comment') {
@@ -1485,6 +1801,18 @@ function startOperatorConsole(deps) {
       };
     }
 
+    if (routed.type === 'debug_mode') {
+      return {
+        assistantReply: '',
+        actions: [{
+          tool: 'debug_mode',
+          args: {
+            enabled: routed.enabled,
+          },
+        }],
+      };
+    }
+
     if (routed.type === 'like_random_posts') {
       return {
         assistantReply: '',
@@ -1492,6 +1820,22 @@ function startOperatorConsole(deps) {
           tool: 'like_random_posts',
           args: {
             count: routed.count,
+            selection: routed.selection || 'random',
+            group_index: routed.group_index,
+            group_name: routed.group_name || '',
+          },
+        }],
+      };
+    }
+
+    if (routed.type === 'comment_random_posts') {
+      return {
+        assistantReply: '',
+        actions: [{
+          tool: 'comment_random_posts',
+          args: {
+            count: routed.count,
+            selection: routed.selection || 'random',
             group_index: routed.group_index,
             group_name: routed.group_name || '',
           },
@@ -1521,6 +1865,29 @@ function startOperatorConsole(deps) {
             group_index: routed.group_index,
             group_name: routed.group_name || '',
             topic: routed.topic || '',
+          },
+        }],
+      };
+    }
+
+    if (routed.type === 'post_last_draft') {
+      return {
+        assistantReply: '',
+        actions: [{ tool: 'post_last_draft', args: {} }],
+      };
+    }
+
+    if (routed.type === 'show_posts') {
+      return {
+        assistantReply: '',
+        actions: [{
+          tool: 'show_posts',
+          args: {
+            source: 'current',
+            group_index: routed.group_index,
+            group_name: routed.group_name || '',
+            limit: routed.limit,
+            random: routed.random || false,
           },
         }],
       };
@@ -1583,6 +1950,81 @@ function startOperatorConsole(deps) {
     const outputs = [];
     const observations = [];
     const executed = new Set();
+    const stopAfterTools = new Set([
+      'list_groups',
+      'check_notifications',
+      'like_random_posts',
+      'comment_random_posts',
+      'draft_comment',
+      'draft_post',
+    ]);
+    let objectivePlan = null;
+    const directIntent = inferDirectActionIntent(raw);
+
+    if (directIntent) {
+      const plan = await fallbackPlan(raw);
+      if (plan.assistantReply) {
+        console.log(plan.assistantReply);
+        outputs.push(plan.assistantReply);
+      }
+      for (const action of plan.actions) {
+        const result = await executeTool(action);
+        if (result) {
+          console.log(result);
+          outputs.push(result);
+        }
+      }
+      return outputs;
+    }
+
+    try {
+      objectivePlan = await planObjective({
+        objective: raw,
+        context: {
+          current_group: context.currentGroup?.name || null,
+          last_groups: (context.lastListedGroups || []).slice(0, 10).map((group) => group.name),
+          last_posts: (context.lastPosts || []).slice(0, 5).map((post) => excerpt(post.content || post.postText || '', 120)),
+        },
+      }, {
+        model,
+      });
+    } catch (_error) {
+      objectivePlan = null;
+    }
+
+    if (objectivePlan?.steps?.length) {
+      const planText = [
+        `Objective: ${objectivePlan.objective || raw} [${objectivePlan.family || 'general_engagement'}]`,
+        ...objectivePlan.steps.slice(0, 5).map((step, index) => `${index + 1}. ${step}`),
+      ].join('\n');
+      console.log(planText);
+      outputs.push(planText);
+      observations.push({
+        type: 'objective_plan',
+        result: planText,
+      });
+    }
+
+    if (objectivePlan?.needsNewSkill && objectivePlan.topic && typeof saveNewSkill === 'function') {
+      const brief = (await ask(`Quick brief for ${objectivePlan.topic}> `)).trim();
+      if (brief) {
+        const saved = await saveNewSkill(objectivePlan.topic, brief);
+        const learnedMessage = saved.existed
+          ? `I already knew ${objectivePlan.topic}, so I refreshed that skill and kept it as ${saved.skillId}.`
+          : `I've learned the goals for ${objectivePlan.topic} and saved them to my memory as ${saved.skillId}.`;
+        console.log(learnedMessage);
+        outputs.push(learnedMessage);
+        observations.push({
+          type: 'new_skill',
+          result: learnedMessage,
+        });
+        objectivePlan = {
+          ...objectivePlan,
+          relevantSkill: saved.skillId,
+          needsNewSkill: false,
+        };
+      }
+    }
 
     let loopFailed = false;
 
@@ -1599,6 +2041,7 @@ function startOperatorConsole(deps) {
           },
           observations,
           stepNumber: step,
+          objectivePlan,
         });
       } catch (_error) {
         loopFailed = true;
@@ -1646,6 +2089,10 @@ function startOperatorConsole(deps) {
         args: decision.action.args,
         result: String(result || ''),
       });
+
+      if (stopAfterTools.has(decision.action.tool)) {
+        return outputs;
+      }
     }
 
     if (!loopFailed && outputs.length) {
@@ -1659,6 +2106,7 @@ function startOperatorConsole(deps) {
         model,
         state,
         taskInput,
+        objectivePlan,
       });
     } catch (_error) {
       plan = await fallbackPlan(raw);

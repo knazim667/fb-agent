@@ -24,7 +24,8 @@ function createPerceptionApi() {
   async function getSimplifiedDOM(page, options = {}) {
     const maxElements = options.maxElements || 120;
     const snapshot = await page.evaluate(({ maxElements }) => {
-      const TIMESTAMP_PATTERN = /^(just now|now|today|yesterday|\d+\s*(?:m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days|w|week|weeks|y|yr|yrs|year|years))$/i;
+      const RELATIVE_TIMESTAMP_PATTERN = /^(just now|now|today|yesterday|\d+\s*(?:m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days|w|week|weeks|y|yr|yrs|year|years))$/i;
+      const ABSOLUTE_TIMESTAMP_PATTERN = /^(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)(?:\s+\d{1,2})(?:\s+at\s+\d{1,2}:\d{2}(?:\s?[ap]m)?)?$/i;
       const selectors = [
         'button',
         'a[href]',
@@ -81,6 +82,11 @@ function createPerceptionApi() {
 
       function normalize(text) {
         return (text || '').trim().replace(/\s+/g, ' ');
+      }
+
+      function looksLikeTimestamp(text) {
+        const normalized = normalize(text);
+        return RELATIVE_TIMESTAMP_PATTERN.test(normalized) || ABSOLUTE_TIMESTAMP_PATTERN.test(normalized);
       }
 
       function domDepthFrom(root, node) {
@@ -152,8 +158,13 @@ function createPerceptionApi() {
       const title = document.title || '';
       const posts = [];
       const articles = Array.from(document.querySelectorAll('div[role="article"]')).slice(0, 25);
+      const feedContainer = document.querySelector('[role="feed"], div[aria-label*="Stories"], div[role="main"]');
+      const groupNavigation = document.querySelector('a[href*="/groups/"], [aria-label*="Groups"]');
+      const commentInput = document.querySelector('div[role="textbox"][contenteditable="true"][aria-label*="comment" i], div[role="textbox"][contenteditable="true"]');
+      const postButton = Array.from(document.querySelectorAll('button,[role="button"]'))
+        .find((node) => isVisible(node) && /^(post|share now)$/i.test(normalize(node.innerText || node.getAttribute('aria-label') || '')));
 
-      function extractPrimaryPostText(article, actionTop) {
+      function extractPrimaryPostText(article, headerBottom, actionTop) {
         function looksLikeUiChrome(text) {
           return /^(like|reply|share|follow|see more|write a comment|leave a comment|comment)$/i.test(text);
         }
@@ -176,6 +187,9 @@ function createPerceptionApi() {
           }
 
           const rect = node.getBoundingClientRect();
+          if (rect.top <= headerBottom + 2) {
+            continue;
+          }
           if (rect.top >= actionTop - 6) {
             continue;
           }
@@ -184,7 +198,7 @@ function createPerceptionApi() {
           if (!text || text.length < 3 || looksLikeUiChrome(text) || looksLikeCommentSnippet(text)) {
             continue;
           }
-          if (TIMESTAMP_PATTERN.test(text) || /^follow$/i.test(text) || /^top contributor$/i.test(text)) {
+          if (looksLikeTimestamp(text) || /^follow$/i.test(text) || /^top contributor$/i.test(text)) {
             continue;
           }
           if (domDepthFrom(article, node) > 12) {
@@ -200,6 +214,35 @@ function createPerceptionApi() {
         return chunks.join('\n').trim();
       }
 
+      function fallbackTimestampText(article) {
+        const articleText = normalize(article.innerText);
+        const match = articleText.match(/\b(just now|now|today|yesterday|\d+\s*(?:m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days|w|week|weeks|y|yr|yrs|year|years)|(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)(?:\s+\d{1,2})(?:\s+at\s+\d{1,2}:\d{2}(?:\s?[ap]m)?)?)\b/i);
+        return match ? normalize(match[1]) : '';
+      }
+
+      function findHeaderBoundary(article, authorNode, timestampNode) {
+        const articleTop = article.getBoundingClientRect().top;
+        const authorBottom = authorNode ? authorNode.getBoundingClientRect().bottom : articleTop;
+        const timestampBottom = timestampNode ? timestampNode.getBoundingClientRect().bottom : articleTop;
+        return Math.max(authorBottom, timestampBottom, articleTop + 48) + 12;
+      }
+
+      function classifyPageMode(articles) {
+        const bodyText = normalize(document.body?.innerText || '');
+        const url = window.location.href || '';
+        if (
+          /\/posts\/|story_fbid=|\/permalink\//i.test(url)
+          || (articles.length <= 2 && /view more answers|write an answer|write a public comment|public comment|comments?\b/i.test(bodyText))
+        ) {
+          return 'post_detail';
+        }
+        if (/\/groups\//i.test(url)) {
+          return 'group_feed';
+        }
+        return 'feed';
+      }
+
+      const pageMode = classifyPageMode(articles);
       for (const article of articles) {
         if (!isVisible(article)) {
           continue;
@@ -208,21 +251,25 @@ function createPerceptionApi() {
         const rect = article.getBoundingClientRect();
         const articleId = idMap.get(article) || `agent-post-${posts.length + 1}`;
         article.setAttribute('data-agent-id', articleId);
-        const authorNode = article.querySelector('h2 a, h3 a, strong span a, [role="link"]');
+        if (pageMode === 'post_detail' && posts.length > 0) {
+          continue;
+        }
+
+        const authorNode = article.querySelector('h2 a, h3 a, strong span a, [role="link"], strong span, h2, h3');
         const author = normalize(authorNode?.innerText || '');
         const timestampNode = Array.from(article.querySelectorAll('a[href], span, div'))
-          .find((node) => isVisible(node) && TIMESTAMP_PATTERN.test(normalize(node.innerText)));
-        const timestampText = normalize(timestampNode?.innerText || '');
-        const likeButton = Array.from(article.querySelectorAll('button,[role="button"]'))
+          .find((node) => isVisible(node) && looksLikeTimestamp(normalize(node.innerText)));
+        const timestampText = normalize(timestampNode?.innerText || '') || fallbackTimestampText(article);
+        const likeButton = Array.from(article.querySelectorAll('button,[role="button"], a[href], span, div'))
           .find((node) => isVisible(node) && matchesControl(node, /^like$/i));
-        const commentButton = Array.from(article.querySelectorAll('button,[role="button"],div[role="textbox"]'))
+        const commentButton = Array.from(article.querySelectorAll('button,[role="button"],div[role="textbox"], a[href], span, div'))
           .find((node) => isVisible(node) && matchesControl(node, /comment|leave a comment|write a comment/i));
-        const shareButton = Array.from(article.querySelectorAll('button,[role="button"]'))
+        const shareButton = Array.from(article.querySelectorAll('button,[role="button"], a[href], span, div'))
           .find((node) => isVisible(node) && matchesControl(node, /^share$/i));
-        const replyButton = Array.from(article.querySelectorAll('button,[role="button"]'))
+        const replyButton = Array.from(article.querySelectorAll('button,[role="button"], a[href], span, div'))
           .find((node) => isVisible(node) && matchesControl(node, /^reply$/i));
 
-        if (!author || !timestampText || !likeButton || !commentButton) {
+        if (!author || !timestampText || [likeButton, commentButton, shareButton].filter(Boolean).length < 2) {
           continue;
         }
 
@@ -230,10 +277,11 @@ function createPerceptionApi() {
           continue;
         }
 
+        const headerBottom = findHeaderBoundary(article, authorNode, timestampNode);
         const actionTop = Math.min(
           ...[likeButton, commentButton, shareButton].filter(Boolean).map((node) => node.getBoundingClientRect().top)
         );
-        const text = extractPrimaryPostText(article, actionTop) || normalize(article.innerText);
+        const text = extractPrimaryPostText(article, headerBottom, actionTop) || normalize(article.innerText);
         if (!text || text.length < 15) {
           continue;
         }
@@ -302,6 +350,12 @@ function createPerceptionApi() {
         url: window.location.href,
         title,
         body_excerpt: bodyText.slice(0, 1200),
+        page_anchors: {
+          has_feed_container: Boolean(feedContainer && isVisible(feedContainer)),
+          has_group_navigation: Boolean(groupNavigation && isVisible(groupNavigation)),
+          has_comment_input: Boolean(commentInput && isVisible(commentInput)),
+          has_post_button: Boolean(postButton && isVisible(postButton)),
+        },
         interactive,
         posts,
       };

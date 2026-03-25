@@ -81,7 +81,8 @@ function createGroupsApi({
       waitUntil: 'domcontentloaded',
       timeout: 90_000,
     });
-    await lightHumanPause(page, 1_000, 2_000);
+    await page.waitForLoadState('networkidle').catch(() => null);
+    await lightHumanPause(page, 3_000, 5_000);
     return page.url();
   }
 

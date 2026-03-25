@@ -4,6 +4,8 @@ const fs = require('fs/promises');
 const path = require('path');
 
 const { getContextMemory } = require('./database');
+const { SKILL_FEEDBACK_PATH } = require('./filesystem');
+const { findBestSkillForText, findSkillByTopic, loadSkillCatalog } = require('./skills');
 
 const DEFAULT_OLLAMA_URL =
   process.env.OLLAMA_URL || 'http://localhost:11434/api/generate';
@@ -23,6 +25,7 @@ const DOM_REASONER_MODEL =
 const SKILLS_DIR = path.join(__dirname, '..', 'skills');
 const MEMORY_DIR = path.join(__dirname, '..', 'memory');
 const AGENT_INSIGHTS_PATH = path.join(MEMORY_DIR, 'agent_insights.md');
+const PERSONA_PROFILE_PATH = path.join(MEMORY_DIR, 'persona.md');
 const HIGH_VALUE_PATTERNS = [
   /\bprice\b/i,
   /\bpricing\b/i,
@@ -132,6 +135,24 @@ async function ensureMemoryFile() {
       'utf8'
     );
   }
+
+  try {
+    await fs.access(PERSONA_PROFILE_PATH);
+  } catch (_error) {
+    await fs.writeFile(
+      PERSONA_PROFILE_PATH,
+      [
+        '# Agent Personality Profile: "The Helpful Expert"',
+        '',
+        '## Tone And Voice',
+        '- Language: simple, direct English with no fluff.',
+        '- Style: professional but friendly.',
+        '- Never say "As an AI".',
+        '',
+      ].join('\n'),
+      'utf8'
+    );
+  }
 }
 
 async function readAgentInsights() {
@@ -142,6 +163,30 @@ async function readAgentInsights() {
 async function appendAgentInsights(entry) {
   await ensureMemoryFile();
   await fs.appendFile(AGENT_INSIGHTS_PATH, `${entry}\n`, 'utf8');
+}
+
+async function readPersonaProfile() {
+  await ensureMemoryFile();
+  return fs.readFile(PERSONA_PROFILE_PATH, 'utf8');
+}
+
+async function readSkillFeedback(skillId = '') {
+  await ensureMemoryFile();
+
+  let content = '';
+  try {
+    content = await fs.readFile(SKILL_FEEDBACK_PATH, 'utf8');
+  } catch (_error) {
+    return '';
+  }
+
+  if (!skillId) {
+    return content;
+  }
+
+  const escaped = String(skillId || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const match = content.match(new RegExp(`^##\\s+${escaped}\\s*$([\\s\\S]*?)(?=^##\\s+|\\Z)`, 'im'));
+  return match ? `${skillId}\n${match[1].trim()}` : '';
 }
 
 function extractPhasesFromSkill(content) {
@@ -179,6 +224,10 @@ async function resolveSkillForTask(task = {}) {
   }
 
   const haystack = JSON.stringify(task).toLowerCase();
+  const learnedSkill = await findBestSkillForText(haystack).catch(() => null);
+  if (learnedSkill?.id) {
+    return loadSkill(learnedSkill.id);
+  }
 
   if (haystack.includes('amazon') || haystack.includes('fba')) {
     return loadSkill('amazon_expert');
@@ -481,6 +530,8 @@ async function draftReply({
   phaseOverride = null,
 }, options = {}) {
   const insights = await readAgentInsights();
+  const persona = await readPersonaProfile();
+  const skillFeedback = await readSkillFeedback(skill?.id);
   const threadState = threadId ? await getThreadState(threadId) : {
     context: null,
     threadHistory: [],
@@ -506,11 +557,17 @@ async function draftReply({
     `Conversation phase to send now: Phase ${targetPhase}.`,
     'Do not repeat an earlier phase already used in this thread.',
     '',
+    'Persona profile:',
+    persona,
+    '',
     'Skill instructions:',
     skill.content,
     '',
     'Agent insights:',
     insights,
+    '',
+    'Skill feedback:',
+    skillFeedback || 'No skill feedback yet.',
     '',
     'Thread history:',
     threadState.threadHistory.length
@@ -550,6 +607,298 @@ async function draftReply({
     reply,
     phase: targetPhase,
     previousPhase: threadState.currentPhase,
+  };
+}
+
+function inferObjectiveFamily(objective = '') {
+  const normalized = String(objective || '').toLowerCase();
+
+  if (/\bdraft\b|\bwrite\b.*\bpost\b|\bcreate\b.*\bpost\b/.test(normalized)) {
+    return 'drafting';
+  }
+
+  if (
+    /\blike\b|\bcomment\b|\breply\b|\breact\b|\brecent posts?\b|\blatest posts?\b|\brandom posts?\b|\bshow posts?\b|\bnotifications?\b|\blist groups?\b|\bopen group\b|\bgo to group\b/.test(normalized)
+  ) {
+    return 'general_engagement';
+  }
+
+  if (
+    /\blead\b|\bscan\b|\bfind\b.*\b(posts?|content)\b|\bhidden money\b|\breimbursement\b|\bsettlement\b|\binventory\b|\bprofit\b|\bfees?\b|\bmargins?\b/.test(normalized)
+  ) {
+    return 'business_scan';
+  }
+
+  return 'general_engagement';
+}
+
+function buildObjectiveChecklist(family, objective = '') {
+  if (family === 'drafting') {
+    return [
+      'Draft the text first.',
+      'Show the draft to the operator before opening the browser.',
+      'Only publish if the operator explicitly confirms or asks to post it.',
+    ];
+  }
+
+  if (family === 'business_scan') {
+    return [
+      'Open the requested group or page.',
+      'Collect visible original posts only.',
+      'Filter posts against the business goal and relevant skill.',
+      'Show matched posts clearly and explain if nothing matched.',
+    ];
+  }
+
+  const normalized = String(objective || '').toLowerCase();
+  if (/\blike\b/.test(normalized)) {
+    return [
+      'Resolve the target group or page.',
+      'Collect visible original post anchors.',
+      'Scroll until enough visible posts are available.',
+      'Like the requested posts one by one and verify each like registered.',
+    ];
+  }
+
+  if (/\bcomment\b|\breply\b/.test(normalized)) {
+    return [
+      'Resolve the target group or page.',
+      'Collect visible original post anchors.',
+      'Draft natural comments for the requested posts.',
+      'Post comments one by one and verify each comment appears.',
+    ];
+  }
+
+  if (/\bnotifications?\b/.test(normalized)) {
+    return [
+      'Open the notifications view.',
+      'Collect the latest visible notifications.',
+      'Filter them to the requested subset.',
+      'Show the result clearly and only mark read if requested.',
+    ];
+  }
+
+  if (/\bgroups?\b/.test(normalized)) {
+    return [
+      'Load the joined groups list.',
+      'Filter to the requested type such as Amazon-related groups.',
+      'Sort the list by recent activity if asked.',
+      'Show the requested number of groups.',
+    ];
+  }
+
+  return [
+    'Resolve the requested page or group.',
+    'Collect visible original posts or controls.',
+    'Take the requested engagement action.',
+    'Verify the UI changed before finishing.',
+  ];
+}
+
+async function planObjective({
+  objective,
+  context = {},
+}, options = {}) {
+  const persona = await readPersonaProfile().catch(() => '');
+  const knownSkills = await listAvailableSkills().catch(() => []);
+  const knownSkillCatalog = await loadSkillCatalog().catch(() => []);
+  const knownSkillIds = knownSkills.map((item) => item.id);
+  const skillSummaries = knownSkillCatalog
+    .slice(0, 20)
+    .map((skill) => `- ${skill.id}: ${skill.title}${skill.goal ? ` | ${skill.goal.replace(/\s+/g, ' ').slice(0, 180)}` : ''}`)
+    .join('\n');
+  const prompt = [
+    'Create a short execution plan for a Facebook account manager agent.',
+    'Treat the user request as a top-level objective.',
+    'Classify the objective into one family: business_scan, general_engagement, or drafting.',
+    'Return JSON only like {"objective":"string","family":"business_scan|general_engagement|drafting","steps":["...","..."],"mode":"business|general","needs_skill":true|false,"topic":"string","relevant_skill":"string","needs_new_skill":true|false}.',
+    'Make the steps specific to that family, not generic filler.',
+    '',
+    'Persona:',
+    persona || 'No persona provided.',
+    '',
+    'Known skills:',
+    skillSummaries || (knownSkillIds.length ? knownSkillIds.join(', ') : 'none'),
+    '',
+    'Context:',
+    JSON.stringify(context, null, 2),
+    '',
+    'Objective:',
+    objective,
+  ].join('\n');
+
+  try {
+    const raw = await callOllama(prompt, {
+      ...options,
+      timeoutMs: options.timeoutMs || 20_000,
+      generationOptions: {
+        temperature: 0.1,
+        num_ctx: 2048,
+        num_predict: 180,
+        ...options.generationOptions,
+      },
+    });
+    const parsed = parseRelaxedJsonObject(raw);
+    if (parsed?.objective) {
+      const relevantSkill = String(parsed.relevant_skill || '').trim();
+      const skillByTopic = parsed.topic
+        ? await findSkillByTopic(String(parsed.topic || '').trim()).catch(() => null)
+        : null;
+      const normalizedRelevantSkill = knownSkillIds.includes(relevantSkill)
+        ? relevantSkill
+        : (skillByTopic?.id && knownSkillIds.includes(skillByTopic.id) ? skillByTopic.id : '');
+      return {
+        objective: String(parsed.objective || objective).trim(),
+        family: ['business_scan', 'general_engagement', 'drafting'].includes(String(parsed.family || '').trim())
+          ? String(parsed.family || '').trim()
+          : inferObjectiveFamily(parsed.objective || objective),
+        steps: Array.isArray(parsed.steps) ? parsed.steps.map((step) => String(step).trim()).filter(Boolean) : [],
+        mode: String(parsed.mode || '').trim() || 'general',
+        needsSkill: Boolean(parsed.needs_skill),
+        topic: String(parsed.topic || '').trim(),
+        relevantSkill: normalizedRelevantSkill,
+        needsNewSkill: Boolean(parsed.needs_new_skill) && !normalizedRelevantSkill,
+      };
+    }
+  } catch (_error) {
+    // Fall through to heuristic plan.
+  }
+
+  const normalizedObjective = String(objective || '');
+  const needsSkill = /amazon|fba|seller|fees|reimbursement|settlement|inventory|profit/i.test(normalizedObjective);
+  let relevantSkill = '';
+  const learnedSkill = await findBestSkillForText(normalizedObjective).catch(() => null);
+  if (learnedSkill?.id && knownSkillIds.includes(learnedSkill.id)) {
+    relevantSkill = learnedSkill.id;
+  } else if (/amazon hidden money|reimbursement|settlement|inventory|fees|profit/i.test(normalizedObjective) && knownSkillIds.includes('amazon_hidden_money')) {
+    relevantSkill = 'amazon_hidden_money';
+  } else if (/amazon|fba|seller/i.test(normalizedObjective) && knownSkillIds.includes('amazon_expert')) {
+    relevantSkill = 'amazon_expert';
+  } else if (/website|web|landing page/i.test(normalizedObjective) && knownSkillIds.includes('web_dev')) {
+    relevantSkill = 'web_dev';
+  }
+  const fallbackTopicMatch = normalizedObjective.match(/\b(uber|driving|car detailing|detailing|real estate|shopify|walmart|ebay|airbnb)\b/i);
+  const fallbackTopic = fallbackTopicMatch ? String(fallbackTopicMatch[1] || '').trim() : '';
+  const family = inferObjectiveFamily(normalizedObjective);
+  return {
+    objective: String(objective || '').trim(),
+    family,
+    steps: buildObjectiveChecklist(family, normalizedObjective),
+    mode: needsSkill ? 'business' : 'general',
+    needsSkill,
+    topic: relevantSkill ? '' : fallbackTopic,
+    relevantSkill,
+    needsNewSkill: Boolean(fallbackTopic) && !relevantSkill,
+  };
+}
+
+async function classifyPostForEngagement({
+  skill,
+  postContent = '',
+}, options = {}) {
+  const normalized = String(postContent || '').trim();
+  if (!normalized) {
+    return {
+      category: 'GENERAL',
+      tone: 'friendly, concise, human',
+      persona: 'polite high-value human',
+      guidance: 'Keep it light and natural.',
+    };
+  }
+
+  const heuristicCategory = (() => {
+    if (/\?/.test(normalized) || /\bhow|what|why|where|when|does|can|should|help\b/i.test(normalized)) {
+      return 'QUESTION';
+    }
+    if (/\bissue|problem|stuck|lost|missing|reimbursement|settlement|fees|low profit|margin|damaged|error|suspend|wrong\b/i.test(normalized)) {
+      return 'PROBLEM';
+    }
+    if (/\bwon|launched|finally|hit|reached|grew|success|approved|celebrating|happy to share\b/i.test(normalized)) {
+      return 'CELEBRATION';
+    }
+    if (/\bupdate|news|sharing|status|progress\b/i.test(normalized)) {
+      return 'GENERAL';
+    }
+    return 'GENERAL';
+  })();
+
+  const prompt = [
+    'Categorize this Facebook post for comment strategy.',
+    'Return JSON only like {"category":"CELEBRATION|PROBLEM|QUESTION|GENERAL","tone":"string","persona":"string","guidance":"string"}.',
+    'Rules:',
+    '- If the post is about Amazon/FBA seller pain, category should usually be "PROBLEM" or "QUESTION".',
+    '- If the post is a win, launch, approval, or growth milestone, use "CELEBRATION".',
+    '- If the post is mixed or neutral, use "GENERAL".',
+    '- If it is general and not tied to a known business skill, use persona "polite high-value human".',
+    '- Avoid robotic language.',
+    '',
+    'Skill context:',
+    skill?.content || 'No skill context.',
+    '',
+    'Post:',
+    normalized,
+  ].join('\n');
+
+  try {
+    const raw = await callOllama(prompt, {
+      ...options,
+      timeoutMs: options.timeoutMs || 20_000,
+      generationOptions: {
+        temperature: 0.1,
+        num_ctx: 2048,
+        num_predict: 160,
+        ...options.generationOptions,
+      },
+    });
+    const parsed = parseRelaxedJsonObject(raw);
+    if (parsed?.category) {
+      return {
+        category: String(parsed.category || '').trim().toUpperCase() || 'GENERAL',
+        tone: String(parsed.tone || '').trim() || 'friendly, concise, human',
+        persona: String(parsed.persona || '').trim() || 'polite high-value human',
+        guidance: String(parsed.guidance || '').trim() || 'Keep it natural and useful.',
+      };
+    }
+  } catch (_error) {
+    // Fall back to heuristics below.
+  }
+
+  if (heuristicCategory === 'PROBLEM') {
+    return {
+      category: 'PROBLEM',
+      tone: 'helpful, specific, experienced, human',
+      persona: /amazon|fba|seller|settlement|fee|inventory|reimbursement/i.test(normalized)
+        ? 'amazon hidden money operator'
+        : 'polite high-value human',
+      guidance: 'Offer one concrete tip and a light next step.',
+    };
+  }
+
+  if (heuristicCategory === 'CELEBRATION') {
+    return {
+      category: 'CELEBRATION',
+      tone: 'warm, congratulatory, genuine, human',
+      persona: 'polite high-value human',
+      guidance: 'Acknowledge the win and encourage them naturally.',
+    };
+  }
+
+  if (heuristicCategory === 'QUESTION') {
+    return {
+      category: 'QUESTION',
+      tone: 'helpful, direct, accurate, human',
+      persona: /amazon|fba|seller|settlement|fee|inventory|reimbursement/i.test(normalized)
+        ? 'amazon hidden money operator'
+        : 'polite high-value human',
+      guidance: 'Answer clearly and simply. If relevant, use skill knowledge.',
+    };
+  }
+
+  return {
+    category: heuristicCategory || 'GENERAL',
+    tone: 'friendly, supportive, human',
+    persona: 'polite high-value human',
+    guidance: 'Keep it positive and not salesy.',
   };
 }
 
@@ -670,10 +1019,14 @@ module.exports = {
   SKILLS_DIR,
   appendAgentInsights,
   callOllama,
+  planObjective,
+  readPersonaProfile,
+  readSkillFeedback,
   determineNextPhase,
   detectHighValueLead,
   decideNextDomAction,
   draftReply,
+  classifyPostForEngagement,
   ensureMemoryFile,
   emitHighValueLeadAlert,
   extractManualFallbacks,
@@ -683,6 +1036,8 @@ module.exports = {
   getModelRuntimeConfig,
   listAvailableSkills,
   loadSkill,
+  buildObjectiveChecklist,
+  inferObjectiveFamily,
   readAgentInsights,
   resolveSkillForTask,
   setModelRuntimeConfig,
