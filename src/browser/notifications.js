@@ -156,6 +156,21 @@ function createNotificationsApi({
       });
   }
 
+  async function listVisibleNotifications(page, {
+    limit = 10,
+    unreadOnly = false,
+    withinHours = null,
+  } = {}) {
+    let notifications = await scrapeNotifications(page, { limit: Math.max(limit, 12) });
+    if (unreadOnly) {
+      notifications = notifications.filter((item) => item.unread);
+    }
+    if (withinHours != null) {
+      notifications = notifications.filter((item) => item.age_hours == null || item.age_hours <= withinHours);
+    }
+    return notifications.slice(0, limit);
+  }
+
   async function scrapeJoinApprovalNotifications(page, { limit = 10 } = {}) {
     const notifications = await scrapeNotifications(page, { limit: 20 });
     const approvals = [];
@@ -301,6 +316,7 @@ function createNotificationsApi({
   }
 
   return {
+    listVisibleNotifications,
     markNotificationsRead,
     scrapeInboxPreviews,
     scrapeJoinApprovalNotifications,

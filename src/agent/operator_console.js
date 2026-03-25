@@ -116,6 +116,22 @@ function formatPosts(posts = [], title = 'Posts') {
   ].join('\n');
 }
 
+function formatOriginalPosts(posts = [], title = 'Original posts') {
+  if (!posts.length) {
+    return `${title}: none`;
+  }
+
+  return [
+    `I see ${posts.length} original posts.`,
+    ...posts.map((post, index) => {
+      const number = post.visible_index || index + 1;
+      const author = post.author || 'Unknown';
+      const summary = excerpt(post.content || post.postText || '', 220);
+      return `Post #${number}: ${author}\n   ${summary}`;
+    }),
+  ].join('\n');
+}
+
 function formatNotifications(notifications = [], title = 'Notifications') {
   if (!notifications.length) {
     return `${title}: none`;
@@ -298,7 +314,8 @@ function inferIntentHeuristically(input) {
     /(list|show|give|which|what)/.test(normalized) &&
     /(joined|already|all|amazon|related)/.test(normalized)
   ) {
-    const limitMatch = normalized.match(/(?:max(?:imum)?|at least|top|show)\s+(\d+)/i);
+    const limitMatch = normalized.match(/(?:max(?:imum)?|at least|top|show|give me)\s+(\d+)/i)
+      || normalized.match(/^(\d+)\s+(?:most\s+active\s+)?groups?/i);
     return {
       type: 'list_groups',
       amazon_only: /amazon|fba|private label|seller/.test(normalized),
@@ -339,6 +356,19 @@ function inferIntentHeuristically(input) {
     };
   }
 
+  const draftGroupMatch = String(input || '').match(/draft (?:a )?post .*?(?:on|for) group\s+(\d+)(?:\s+about\s+(.+))?/i)
+    || String(input || '').match(/draft (?:a )?post .*?(?:on|for)\s+group\s+(.+?)(?:\s+about\s+(.+))?$/i);
+  if (draftGroupMatch) {
+    const numericIndex = Number(draftGroupMatch[1]);
+    return {
+      type: 'draft_post',
+      target: 'group',
+      group_index: Number.isFinite(numericIndex) && numericIndex > 0 ? numericIndex : undefined,
+      group_name: !Number.isFinite(numericIndex) ? String(draftGroupMatch[1] || '').trim() : '',
+      topic: String(draftGroupMatch[2] || '').trim() || undefined,
+    };
+  }
+
   if (/most active .*groups?|groups? .*most active|active groups? first/i.test(normalized)) {
     const limitMatch = normalized.match(/(?:max(?:imum)?|at least|top|show)\s+(\d+)/i);
     return {
@@ -349,13 +379,17 @@ function inferIntentHeuristically(input) {
     };
   }
 
-  const randomLikeMatch = normalized.match(/like(?:\s+at\s+least)?\s+(\d+)\s+random\s+posts?(?:\s+in\s+group\s+(.+))?/i)
-    || normalized.match(/like(?:\s+at\s+least)?\s+(\d+)\s+posts?(?:\s+in\s+group\s+(.+))?/i);
+  const randomLikeMatch = String(input || '').match(/like(?:\s+at\s+least)?\s+(\d+)\s+random\s+posts?(?:\s+(?:in|on|for)\s+group\s+(.+))?/i)
+    || String(input || '').match(/like(?:\s+at\s+least)?\s+(\d+)\s+posts?(?:\s+(?:in|on|for)\s+group\s+(.+))?/i);
   if (randomLikeMatch) {
+    const maybeIndex = Number(randomLikeMatch[2]);
     return {
       type: 'like_random_posts',
       count: Number(randomLikeMatch[1]),
-      group_name: randomLikeMatch[2] ? randomLikeMatch[2].trim() : '',
+      group_index: Number.isFinite(maybeIndex) && maybeIndex > 0 ? maybeIndex : undefined,
+      group_name: randomLikeMatch[2] && !(Number.isFinite(maybeIndex) && maybeIndex > 0)
+        ? randomLikeMatch[2].trim()
+        : '',
     };
   }
 
@@ -420,12 +454,12 @@ function plannerToolGuide() {
     '- scan_joined_groups {"topic":"optional","limit":number}',
     '- show_posts {"source":"current"}',
     '- like_post {"post_index":number}',
-    '- like_random_posts {"count":number,"group_name":"optional"}',
+    '- like_random_posts {"count":number,"group_index":number,"group_name":"optional"}',
     '- draft_comment {"post_index":number,"instructions":"optional"}',
     '- comment_post {"post_index":number,"instructions":"optional"}',
     '- check_notifications {"comments_only":true|false,"unread_only":true|false,"within_hours":number,"mark_read":true|false,"limit":number}',
     '- reply_notification {"notification_index":number,"instructions":"optional"}',
-    '- draft_post {"target":"feed|group","topic":"optional"}',
+    '- draft_post {"target":"feed|group","group_index":number,"group_name":"optional","topic":"optional"}',
     '- post_last_draft {}',
     '- sync_groups {}',
     '- verify_pending_groups {}',
@@ -728,6 +762,9 @@ function startOperatorConsole(deps) {
     getJobsByStatus,
     scrapeNotifications,
     markNotificationsRead,
+    listVisibleGroups,
+    listVisibleNotifications,
+    listVisiblePosts,
     scrapeGroupFeed,
     scrapeInboxPreviews,
     isRelevantAmazonGroupName,
@@ -745,8 +782,14 @@ function startOperatorConsole(deps) {
     summarizeInbox,
     handleReplyLoop,
     likeQualifiedPost,
+    clickLikeOnVisiblePost,
+    anchorVisiblePost,
+    extractAnchoredPostData,
+    likeAnchoredPost,
     draftCommentForCandidate,
     commentOnQualifiedPost,
+    commentAnchoredPost,
+    postCommentOnVisiblePost,
     createNewPost,
     createFeedPost,
     scrapeNotificationReplies,
@@ -817,6 +860,23 @@ function startOperatorConsole(deps) {
     return Array.isArray(context.lastPosts) ? context.lastPosts : [];
   }
 
+  async function runAnchoredActionWithRecovery(label, visibleIndex, runner) {
+    try {
+      return await runner();
+    } catch (error) {
+      const stall = await handleStall({
+        page,
+        goal: label,
+        step: visibleIndex,
+        lastError: error.message,
+      });
+      if (stall?.handled) {
+        return runner();
+      }
+      throw error;
+    }
+  }
+
   function currentNotifications() {
     return Array.isArray(context.lastNotifications) ? context.lastNotifications : [];
   }
@@ -863,7 +923,24 @@ function startOperatorConsole(deps) {
       const limit = Math.max(1, Math.min(Number(args.limit || 200), 500));
       let groups = [];
 
-      if (requestedStatus === 'all') {
+      if ((requestedStatus === 'joined' || requestedStatus === 'all') && typeof listVisibleGroups === 'function') {
+        const liveJoined = await lock.runExclusive('operator:list-visible-groups', async () =>
+          listVisibleGroups({ limit, scrollRounds: 8 })
+        );
+        groups = liveJoined.map((group) => ({ ...group, status: 'joined' }));
+
+        if (requestedStatus === 'all') {
+          const [pending, discovered] = await Promise.all([
+            getGroupsByStatus('pending', { limit }),
+            getGroupsByStatus('discovered', { limit }),
+          ]);
+          groups = [
+            ...groups,
+            ...pending.map((group) => ({ ...group, status: 'pending' })),
+            ...discovered.map((group) => ({ ...group, status: 'discovered' })),
+          ];
+        }
+      } else if (requestedStatus === 'all') {
         const [joined, pending, discovered] = await Promise.all([
           getGroupsByStatus('joined', { limit }),
           getGroupsByStatus('pending', { limit }),
@@ -954,7 +1031,7 @@ function startOperatorConsole(deps) {
       );
       context.lastPosts = await filterPostsByTopic(results, args.topic || '', callOllama, model);
       await persistOperatorContext(state, upsertAgentState);
-      return formatPosts(context.lastPosts, `Matched posts in ${context.currentGroup.name || context.currentGroup.label}`);
+      return formatOriginalPosts(context.lastPosts, `Matched posts in ${context.currentGroup.name || context.currentGroup.label}`);
     }
 
     if (tool === 'scan_joined_groups') {
@@ -966,7 +1043,24 @@ function startOperatorConsole(deps) {
 
     if (tool === 'show_posts') {
       if (currentPosts().length) {
-        return formatPosts(currentPosts(), 'Current posts');
+        return formatOriginalPosts(currentPosts(), 'Current posts');
+      }
+      if (context.currentGroup?.url && typeof listVisiblePosts === 'function') {
+        const visiblePosts = await lock.runExclusive('operator:list-visible-posts', async () =>
+          listVisiblePosts({ limit: 12, scrollRounds: 2 })
+        );
+        if (visiblePosts.length) {
+          context.lastPosts = visiblePosts.map((post) => ({
+            post_id: post.postId,
+            post_url: post.postUrl,
+            content: post.postText,
+            author: post.authorName || 'Unknown',
+            visible_index: post.visibleIndex,
+            group: context.currentGroup?.name || context.currentGroup?.label || '',
+          }));
+          await persistOperatorContext(state, upsertAgentState);
+          return formatOriginalPosts(context.lastPosts, `Visible posts in ${context.currentGroup.name || context.currentGroup.label}`);
+        }
       }
       if (context.currentGroup?.name) {
         return `No matching posts are currently saved for ${context.currentGroup.name}.`;
@@ -988,7 +1082,15 @@ function startOperatorConsole(deps) {
       }
 
       await lock.runExclusive('operator:like-post', async () => {
-        await likeQualifiedPost(post);
+        if (Number.isFinite(Number(post.visible_index)) && typeof likeAnchoredPost === 'function') {
+          await runAnchoredActionWithRecovery('Like anchored post', Number(post.visible_index), () =>
+            likeAnchoredPost(Number(post.visible_index))
+          );
+        } else if (Number.isFinite(Number(post.visible_index)) && typeof clickLikeOnVisiblePost === 'function') {
+          await clickLikeOnVisiblePost(Number(post.visible_index));
+        } else {
+          await likeQualifiedPost(post);
+        }
       });
       await humanJitter(page, { logLabel: 'Manual like jitter' });
       return `Liked post ${args.post_index}.`;
@@ -997,6 +1099,10 @@ function startOperatorConsole(deps) {
     if (tool === 'like_random_posts') {
       const requestedCount = Math.max(1, Math.min(Number(args.count || 1), 20));
       let targetGroup = context.currentGroup || null;
+
+      if (Number.isFinite(Number(args.group_index))) {
+        targetGroup = context.lastListedGroups[Number(args.group_index) - 1] || null;
+      }
 
       if (args.group_name) {
         const allJoined = await getGroupsByStatus('joined', { limit: 500 });
@@ -1015,7 +1121,9 @@ function startOperatorConsole(deps) {
       context.currentGroup = targetGroup;
 
       const recentPosts = await lock.runExclusive('operator:scrape-random-like-posts', async () =>
-        scrapeGroupFeed(page, { limit: Math.max(requestedCount * 2, 12), scrollRounds: 2 })
+        (typeof listVisiblePosts === 'function'
+          ? listVisiblePosts({ limit: Math.max(requestedCount * 2, 12), scrollRounds: 2 })
+          : scrapeGroupFeed(page, { limit: Math.max(requestedCount * 2, 12), scrollRounds: 2 }))
       );
 
       if (!recentPosts.length) {
@@ -1033,14 +1141,22 @@ function startOperatorConsole(deps) {
         }
 
         try {
-          await lock.runExclusive(`operator:random-like:${post.postId}`, async () => {
-            await likeQualifiedPost({
-              post_id: post.postId,
-              post_url: post.postUrl,
-              group: targetGroup.name,
-              author: post.authorName,
-              content: post.postText,
-            });
+          await lock.runExclusive(`operator:random-like:${post.postId || post.visibleIndex}`, async () => {
+            if (Number.isFinite(Number(post.visibleIndex)) && typeof likeAnchoredPost === 'function') {
+              await runAnchoredActionWithRecovery('Like random anchored post', Number(post.visibleIndex), () =>
+                likeAnchoredPost(Number(post.visibleIndex))
+              );
+            } else if (Number.isFinite(Number(post.visibleIndex)) && typeof clickLikeOnVisiblePost === 'function') {
+              await clickLikeOnVisiblePost(Number(post.visibleIndex));
+            } else {
+              await likeQualifiedPost({
+                post_id: post.postId,
+                post_url: post.postUrl,
+                group: targetGroup.name,
+                author: post.authorName,
+                content: post.postText,
+              });
+            }
           });
           likedCount += 1;
           await humanJitter(page, { logLabel: 'Random like jitter' });
@@ -1073,6 +1189,7 @@ function startOperatorConsole(deps) {
         target: {
           post_index: Number(args.post_index),
           post_id: post.post_id,
+          visible_index: post.visible_index,
         },
         text: draft.reply,
       });
@@ -1094,6 +1211,7 @@ function startOperatorConsole(deps) {
         target: {
           post_index: Number(args.post_index),
           post_id: post.post_id,
+          visible_index: post.visible_index,
         },
         text: draft.reply,
       });
@@ -1103,13 +1221,19 @@ function startOperatorConsole(deps) {
         return `Draft kept for post ${args.post_index}:\n${draft.reply}`;
       }
 
-        await lock.runExclusive('operator:comment-post', async () => {
+      await lock.runExclusive('operator:comment-post', async () => {
+        if (Number.isFinite(Number(post.visible_index)) && typeof commentAnchoredPost === 'function') {
+          await runAnchoredActionWithRecovery('Comment on anchored post', Number(post.visible_index), () =>
+            commentAnchoredPost(Number(post.visible_index), draft.reply)
+          );
+        } else {
           await commentOnQualifiedPost(post, {
             draft,
             phaseOverride: 1,
             onStall: handleStall,
           });
-        });
+        }
+      });
       await humanJitter(page, { logLabel: 'Manual comment jitter' });
       return `Comment posted on post ${args.post_index}.`;
     }
@@ -1121,15 +1245,21 @@ function startOperatorConsole(deps) {
         ? Number(args.within_hours)
         : null;
       const notifications = await lock.runExclusive('operator:notifications', async () =>
-        scrapeNotifications(page, { limit: Math.max(1, Math.min(Number(args.limit || 12), 20)) })
+        (typeof listVisibleNotifications === 'function'
+          ? listVisibleNotifications({
+              limit: Math.max(1, Math.min(Number(args.limit || 12), 20)),
+              unreadOnly,
+              withinHours,
+            })
+          : scrapeNotifications(page, { limit: Math.max(1, Math.min(Number(args.limit || 12), 20)) }))
       );
       let filteredNotifications = commentsOnly
         ? notifications.filter((item) => /commented on your post|commented on your|replied to your comment/i.test(item.text))
         : notifications;
-      if (unreadOnly) {
+      if (unreadOnly && typeof listVisibleNotifications !== 'function') {
         filteredNotifications = filteredNotifications.filter((item) => item.unread);
       }
-      if (withinHours != null) {
+      if (withinHours != null && typeof listVisibleNotifications !== 'function') {
         filteredNotifications = filteredNotifications.filter((item) =>
           item.age_hours == null ? true : item.age_hours <= withinHours
         );
@@ -1170,6 +1300,16 @@ function startOperatorConsole(deps) {
 
     if (tool === 'draft_post') {
       const target = String(args.target || 'feed').toLowerCase() === 'group' ? 'group' : 'feed';
+      if (target === 'group') {
+        if (Number.isFinite(Number(args.group_index))) {
+          context.currentGroup = context.lastListedGroups[Number(args.group_index) - 1] || context.currentGroup;
+        } else if (args.group_name) {
+          const allJoined = await getGroupsByStatus('joined', { limit: 500 });
+          context.currentGroup = allJoined.find((item) =>
+            String(item.name || '').toLowerCase().includes(String(args.group_name).toLowerCase())
+          ) || context.currentGroup;
+        }
+      }
       const prompt = [
         `Write a short Facebook post for the ${target === 'feed' ? 'personal feed' : 'current Facebook group'}.`,
         'Keep it natural, clear, and useful.',
@@ -1220,6 +1360,7 @@ function startOperatorConsole(deps) {
       }
 
       await lock.runExclusive('operator:group-post', async () => {
+        await visitGroup(page, context.currentGroup.url);
         await createNewPost(page, context.currentGroup.group_id || context.currentGroup.id, draftText, null);
       });
       return 'Posted the draft to the current group.';
@@ -1261,13 +1402,19 @@ function startOperatorConsole(deps) {
         }
 
         await lock.runExclusive('operator:post-last-comment-draft', async () => {
-          await commentOnQualifiedPost(post, {
-            draft: {
-              reply: draft.text,
-              phase: 1,
-            },
-            phaseOverride: 1,
-          });
+          if (Number.isFinite(Number(post.visible_index)) && typeof commentAnchoredPost === 'function') {
+            await runAnchoredActionWithRecovery('Post saved comment on anchored post', Number(post.visible_index), () =>
+              commentAnchoredPost(Number(post.visible_index), draft.text)
+            );
+          } else {
+            await commentOnQualifiedPost(post, {
+              draft: {
+                reply: draft.text,
+                phase: 1,
+              },
+              phaseOverride: 1,
+            });
+          }
         });
         return `Posted the saved comment on post ${draft.target?.post_index}.`;
       }
@@ -1345,6 +1492,7 @@ function startOperatorConsole(deps) {
           tool: 'like_random_posts',
           args: {
             count: routed.count,
+            group_index: routed.group_index,
             group_name: routed.group_name || '',
           },
         }],
@@ -1370,6 +1518,9 @@ function startOperatorConsole(deps) {
           tool: 'draft_post',
           args: {
             target: routed.target || 'feed',
+            group_index: routed.group_index,
+            group_name: routed.group_name || '',
+            topic: routed.topic || '',
           },
         }],
       };
@@ -1432,23 +1583,6 @@ function startOperatorConsole(deps) {
     const outputs = [];
     const observations = [];
     const executed = new Set();
-    const directIntent = inferDirectActionIntent(raw);
-
-    if (directIntent) {
-      const directPlan = await fallbackPlan(raw);
-      if (directPlan.assistantReply) {
-        console.log(directPlan.assistantReply);
-        outputs.push(directPlan.assistantReply);
-      }
-      for (const action of directPlan.actions) {
-        const result = await executeTool(action);
-        if (result) {
-          console.log(result);
-          outputs.push(result);
-        }
-      }
-      return outputs;
-    }
 
     let loopFailed = false;
 

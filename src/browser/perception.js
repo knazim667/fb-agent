@@ -1,9 +1,30 @@
 'use strict';
 
 function createPerceptionApi() {
+  function trimAriaSnapshot(node, depth = 0) {
+    if (!node || depth > 5) {
+      return null;
+    }
+
+    const trimmed = {
+      role: node.role || '',
+      name: node.name || '',
+    };
+
+    if (Array.isArray(node.children) && node.children.length) {
+      trimmed.children = node.children
+        .map((child) => trimAriaSnapshot(child, depth + 1))
+        .filter(Boolean)
+        .slice(0, 30);
+    }
+
+    return trimmed;
+  }
+
   async function getSimplifiedDOM(page, options = {}) {
     const maxElements = options.maxElements || 120;
     const snapshot = await page.evaluate(({ maxElements }) => {
+      const TIMESTAMP_PATTERN = /^(just now|now|today|yesterday|\d+\s*(?:m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days|w|week|weeks|y|yr|yrs|year|years))$/i;
       const selectors = [
         'button',
         'a[href]',
@@ -56,6 +77,24 @@ function createPerceptionApi() {
           .map((node) => node.innerText?.trim())
           .filter(Boolean);
         return texts[0] || '';
+      }
+
+      function normalize(text) {
+        return (text || '').trim().replace(/\s+/g, ' ');
+      }
+
+      function domDepthFrom(root, node) {
+        let depth = 0;
+        let current = node;
+        while (current && current !== root) {
+          current = current.parentElement;
+          depth += 1;
+        }
+        return depth;
+      }
+
+      function matchesControl(node, pattern) {
+        return pattern.test(normalize(node?.innerText || node?.getAttribute?.('aria-label') || ''));
       }
 
       for (const element of nodes) {
@@ -114,7 +153,7 @@ function createPerceptionApi() {
       const posts = [];
       const articles = Array.from(document.querySelectorAll('div[role="article"]')).slice(0, 25);
 
-      function extractPrimaryPostText(article) {
+      function extractPrimaryPostText(article, actionTop) {
         function looksLikeUiChrome(text) {
           return /^(like|reply|share|follow|see more|write a comment|leave a comment|comment)$/i.test(text);
         }
@@ -124,8 +163,6 @@ function createPerceptionApi() {
             && /\b(like|reply)\b/i.test(text);
         }
 
-        const articleRect = article.getBoundingClientRect();
-        const maxTop = articleRect.top + (articleRect.height * 0.58);
         const nodes = Array.from(article.querySelectorAll('div[dir="auto"], span[dir="auto"], [data-ad-preview="message"]'));
         const chunks = [];
         const seen = new Set();
@@ -134,17 +171,23 @@ function createPerceptionApi() {
           if (!isVisible(node)) {
             continue;
           }
-          if (node.closest('form, [role="textbox"], [aria-label*="Comment"]')) {
+          if (node.closest('form, [role="textbox"], [aria-label*="Comment"], [aria-label*="Reply"]')) {
             continue;
           }
 
           const rect = node.getBoundingClientRect();
-          if (rect.top > maxTop) {
+          if (rect.top >= actionTop - 6) {
             continue;
           }
 
-          const text = (node.innerText || '').trim().replace(/\s+/g, ' ');
+          const text = normalize(node.innerText);
           if (!text || text.length < 3 || looksLikeUiChrome(text) || looksLikeCommentSnippet(text)) {
+            continue;
+          }
+          if (TIMESTAMP_PATTERN.test(text) || /^follow$/i.test(text) || /^top contributor$/i.test(text)) {
+            continue;
+          }
+          if (domDepthFrom(article, node) > 12) {
             continue;
           }
 
@@ -165,21 +208,40 @@ function createPerceptionApi() {
         const rect = article.getBoundingClientRect();
         const articleId = idMap.get(article) || `agent-post-${posts.length + 1}`;
         article.setAttribute('data-agent-id', articleId);
-        const text = extractPrimaryPostText(article) || (article.innerText || '').trim().replace(/\s+/g, ' ');
+        const authorNode = article.querySelector('h2 a, h3 a, strong span a, [role="link"]');
+        const author = normalize(authorNode?.innerText || '');
+        const timestampNode = Array.from(article.querySelectorAll('a[href], span, div'))
+          .find((node) => isVisible(node) && TIMESTAMP_PATTERN.test(normalize(node.innerText)));
+        const timestampText = normalize(timestampNode?.innerText || '');
+        const likeButton = Array.from(article.querySelectorAll('button,[role="button"]'))
+          .find((node) => isVisible(node) && matchesControl(node, /^like$/i));
+        const commentButton = Array.from(article.querySelectorAll('button,[role="button"],div[role="textbox"]'))
+          .find((node) => isVisible(node) && matchesControl(node, /comment|leave a comment|write a comment/i));
+        const shareButton = Array.from(article.querySelectorAll('button,[role="button"]'))
+          .find((node) => isVisible(node) && matchesControl(node, /^share$/i));
+        const replyButton = Array.from(article.querySelectorAll('button,[role="button"]'))
+          .find((node) => isVisible(node) && matchesControl(node, /^reply$/i));
+
+        if (!author || !timestampText || !likeButton || !commentButton) {
+          continue;
+        }
+
+        if (replyButton && !shareButton) {
+          continue;
+        }
+
+        const actionTop = Math.min(
+          ...[likeButton, commentButton, shareButton].filter(Boolean).map((node) => node.getBoundingClientRect().top)
+        );
+        const text = extractPrimaryPostText(article, actionTop) || normalize(article.innerText);
         if (!text || text.length < 15) {
           continue;
         }
 
-        if (/\b(i'?m interested|interested|dm me|inbox me)\b/i.test(text) && text.length < 120) {
+        if (/\b(i'?m interested|interested|dm me|inbox me|available let'?s connect|available let's connect)\b/i.test(text) && text.length < 160) {
           continue;
         }
 
-        const authorNode = article.querySelector('h2 a, h3 a, strong span a');
-        const author = (authorNode?.innerText || '').trim();
-        const likeButton = Array.from(article.querySelectorAll('button,[role="button"]'))
-          .find((node) => /like/i.test((node.innerText || node.getAttribute('aria-label') || '').trim()));
-        const commentButton = Array.from(article.querySelectorAll('button,[role="button"],div[role="textbox"]'))
-          .find((node) => /comment|leave a comment|write a comment/i.test((node.innerText || node.getAttribute('aria-label') || '').trim()));
         const postLink = Array.from(article.querySelectorAll('a[href]'))
           .find((node) => /\/posts\/|story_fbid=|\/permalink\//i.test(node.getAttribute('href') || ''));
 
@@ -226,6 +288,7 @@ function createPerceptionApi() {
         posts.push({
           agent_id: articleId,
           author,
+          timestamp: timestampText,
           text: text.slice(0, 3000),
           like_button_id: likeButton ? idMap.get(likeButton) || likeButton.getAttribute('data-agent-id') || '' : '',
           comment_button_id: commentButton ? idMap.get(commentButton) || commentButton.getAttribute('data-agent-id') || '' : '',
@@ -244,7 +307,20 @@ function createPerceptionApi() {
       };
     }, { maxElements });
 
-    return snapshot;
+    let ariaSnapshot = null;
+    try {
+      if (page.accessibility && typeof page.accessibility.snapshot === 'function') {
+        const rawAria = await page.accessibility.snapshot({ interestingOnly: true });
+        ariaSnapshot = trimAriaSnapshot(rawAria);
+      }
+    } catch (_error) {
+      ariaSnapshot = null;
+    }
+
+    return {
+      ...snapshot,
+      aria_snapshot: ariaSnapshot,
+    };
   }
 
   function classifyPageState(snapshot = {}) {

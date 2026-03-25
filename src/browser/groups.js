@@ -614,12 +614,17 @@ function createGroupsApi({
     return results;
   }
 
+  async function listVisibleJoinedGroups(page, { limit = 100, scrollRounds = 8 } = {}) {
+    return scrapeJoinedGroups(page, { limit, scrollRounds });
+  }
+
   return {
     discoverGroups,
     handleJoinGroup,
     inspectGroupMembershipStatus,
     inspectGroupActivity,
     isCreatePostComposerVisible,
+    listVisibleJoinedGroups,
     parseActivityToHours,
     scrapeJoinedGroups,
     visitGroup,

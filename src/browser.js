@@ -5,6 +5,7 @@ const path = require('path');
 
 const { chromium } = require('playwright-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+const { createActionsApi } = require('./browser/actions');
 const { createFeedApi } = require('./browser/feed');
 const { createGroupsApi } = require('./browser/groups');
 const { createInteractionsApi } = require('./browser/interactions');
@@ -138,6 +139,7 @@ async function lightHumanPause(page, minMs = 500, maxMs = 2_500) {
 }
 
 const {
+  listVisibleNotifications,
   markNotificationsRead,
   scrapeInboxPreviews,
   scrapeJoinApprovalNotifications,
@@ -154,6 +156,7 @@ const {
   inspectGroupActivity,
   inspectGroupMembershipStatus,
   isCreatePostComposerVisible,
+  listVisibleJoinedGroups,
   parseActivityToHours,
   scrapeJoinedGroups,
   visitGroup,
@@ -166,6 +169,8 @@ const {
   isLikelyGroupName,
 });
 const {
+  extractVisiblePostAnchors,
+  listVisiblePosts,
   loadGroupFeedPosts,
   scrapeGroupFeed,
 } = createFeedApi({
@@ -173,10 +178,24 @@ const {
   randomBetween,
 });
 const {
+  anchorVisiblePost,
+  commentAnchoredPost,
+  extractAnchoredPostData,
+  likeAnchoredPost,
+  verifyAnchoredAction,
+} = createActionsApi({
+  listVisiblePosts: (page, options) => listVisiblePosts(page, options),
+  lightHumanPause,
+  randomBetween,
+});
+const {
   clickLike,
+  clickLikeOnVisiblePost,
   createFeedPost,
   createNewPost,
+  findVisiblePostContainer,
   postComment,
+  postCommentOnVisiblePost,
 } = createInteractionsApi({
   FACEBOOK_BASE_URL,
   randomBetween,
@@ -312,29 +331,40 @@ module.exports = {
   DEFAULT_TASK_INPUT_PATH,
   DEFAULT_USER_DATA_DIR,
   closeBrowser,
+  anchorVisiblePost,
   clickLike,
+  clickLikeOnVisiblePost,
+  commentAnchoredPost,
   createFeedPost,
   createNewPost,
   discoverGroups,
   ensureLoggedIn,
   extractGroupIdFromUrl,
+  extractAnchoredPostData,
   inspectGroupActivity,
   inspectGroupMembershipStatus,
   isCreatePostComposerVisible,
   isCanonicalGroupUrl,
   isLikelyGroupName,
   extractPostIdFromUrl,
+  findVisiblePostContainer,
   executeAgentAction,
   getSimplifiedDOM,
   handleJoinGroup,
   humanJitter,
+  likeAnchoredPost,
   launchBrowser,
+  extractVisiblePostAnchors,
+  listVisibleGroups: listVisibleJoinedGroups,
+  listVisibleNotifications,
+  listVisiblePosts,
   loadGroupFeedPosts,
   markNotificationsRead,
   lightHumanPause,
   openTaskGroups,
   parseActivityToHours,
   postComment,
+  postCommentOnVisiblePost,
   readTaskInput,
   classifyPageState,
   scrapeJoinApprovalNotifications,
@@ -343,5 +373,6 @@ module.exports = {
   scrapeNotifications,
   scrapeGroupFeed,
   sendInboxReply,
+  verifyAnchoredAction,
   visitGroup,
 };

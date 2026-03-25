@@ -78,6 +78,19 @@ function createInteractionsApi({
     throw new Error(`Unable to locate post container for post ID ${postId}.`);
   }
 
+  async function findVisiblePostContainer(page, visibleIndex) {
+    const articles = page.locator('div[role="article"]');
+    const count = await articles.count();
+    if (!count || visibleIndex < 1 || visibleIndex > count) {
+      throw new Error(`Visible post ${visibleIndex} is not available on the current page.`);
+    }
+
+    const article = articles.nth(visibleIndex - 1);
+    await article.scrollIntoViewIfNeeded();
+    await article.waitFor({ state: 'visible', timeout: 10_000 });
+    return article;
+  }
+
   async function clickLike(page, postId, options = {}) {
     const post = await findPostContainer(page, postId, options);
     const likeButton = post.getByRole('button', { name: /^like$/i }).first();
@@ -90,6 +103,50 @@ function createInteractionsApi({
     await lightHumanPause(page, 800, 1_800);
     await likeButton.click({ delay: randomBetween(60, 180) });
     await page.waitForTimeout(randomBetween(1_000, 2_500));
+    return true;
+  }
+
+  async function clickLikeOnVisiblePost(page, visibleIndex) {
+    const post = await findVisiblePostContainer(page, visibleIndex);
+    const likeButton = post.getByRole('button', { name: /^like$/i }).first();
+    if (!(await likeButton.count())) {
+      throw new Error(`Like button not found for visible post ${visibleIndex}.`);
+    }
+
+    const beforeState = await likeButton.evaluate((element) => ({
+      text: (element.innerText || '').trim(),
+      ariaLabel: element.getAttribute('aria-label') || '',
+      ariaPressed: element.getAttribute('aria-pressed') || '',
+    })).catch(() => ({ text: '', ariaLabel: '', ariaPressed: '' }));
+
+    await likeButton.waitFor({ state: 'visible', timeout: 10_000 });
+    await likeButton.scrollIntoViewIfNeeded();
+    await lightHumanPause(page, 800, 1_800);
+
+    try {
+      await likeButton.click({ delay: randomBetween(60, 180) });
+    } catch (error) {
+      if (/intercepts pointer events|another element/i.test(String(error.message || ''))) {
+        await likeButton.click({ delay: randomBetween(60, 180), force: true });
+      } else {
+        throw error;
+      }
+    }
+
+    await page.waitForTimeout(randomBetween(1_000, 2_500));
+    const afterState = await likeButton.evaluate((element) => ({
+      text: (element.innerText || '').trim(),
+      ariaLabel: element.getAttribute('aria-label') || '',
+      ariaPressed: element.getAttribute('aria-pressed') || '',
+    })).catch(() => ({ text: '', ariaLabel: '', ariaPressed: '' }));
+
+    const changed = beforeState.ariaPressed !== afterState.ariaPressed
+      || beforeState.ariaLabel !== afterState.ariaLabel
+      || /\bliked\b|remove like/i.test(`${afterState.text} ${afterState.ariaLabel}`);
+    if (!changed) {
+      throw new Error(`Like did not appear to register for visible post ${visibleIndex}.`);
+    }
+
     return true;
   }
 
@@ -108,6 +165,35 @@ function createInteractionsApi({
     await commentBox.waitFor({ state: 'visible', timeout: 10_000 });
     await commentBox.scrollIntoViewIfNeeded();
     await lightHumanPause(page, 1_000, 2_200);
+    await commentBox.click({ delay: randomBetween(60, 180) });
+    await page.keyboard.type(text, { delay: randomBetween(35, 90) });
+    await page.waitForTimeout(randomBetween(800, 1_600));
+    await page.keyboard.press('Enter');
+    await page.waitForTimeout(randomBetween(1_500, 3_500));
+    return true;
+  }
+
+  async function postCommentOnVisiblePost(page, visibleIndex, text) {
+    const post = await findVisiblePostContainer(page, visibleIndex);
+    const commentTrigger = post.getByRole('button', { name: /comment|leave a comment|write a comment/i }).first();
+    if (!(await commentTrigger.count())) {
+      throw new Error(`Comment button not found for visible post ${visibleIndex}.`);
+    }
+
+    await commentTrigger.scrollIntoViewIfNeeded();
+    await lightHumanPause(page, 900, 1_900);
+    try {
+      await commentTrigger.click({ delay: randomBetween(60, 180) });
+    } catch (error) {
+      if (/intercepts pointer events|another element/i.test(String(error.message || ''))) {
+        await commentTrigger.click({ delay: randomBetween(60, 180), force: true });
+      } else {
+        throw error;
+      }
+    }
+
+    const commentBox = post.locator('div[role="textbox"][contenteditable="true"]').first();
+    await commentBox.waitFor({ state: 'visible', timeout: 10_000 });
     await commentBox.click({ delay: randomBetween(60, 180) });
     await page.keyboard.type(text, { delay: randomBetween(35, 90) });
     await page.waitForTimeout(randomBetween(800, 1_600));
@@ -200,11 +286,14 @@ function createInteractionsApi({
 
   return {
     clickLike,
+    clickLikeOnVisiblePost,
     createFeedPost,
     createNewPost,
     findPostContainer,
+    findVisiblePostContainer,
     openPostComposer,
     postComment,
+    postCommentOnVisiblePost,
     submitComposerPost,
   };
 }

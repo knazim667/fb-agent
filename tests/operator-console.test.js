@@ -72,3 +72,25 @@ test('heuristic router maps random like requests', () => {
   assert.equal(intent.count, 10);
   assert.match(intent.group_name, /plfba\.com/i);
 });
+
+test('heuristic router maps numbered group random likes', () => {
+  const intent = inferIntentHeuristically('now can you like 5 random posts in group 1');
+  assert.equal(intent.type, 'like_random_posts');
+  assert.equal(intent.count, 5);
+  assert.equal(intent.group_index, 1);
+});
+
+test('heuristic router maps numbered group random likes with on-group phrasing', () => {
+  const intent = inferIntentHeuristically('like 5 random post on group 22');
+  assert.equal(intent.type, 'like_random_posts');
+  assert.equal(intent.count, 5);
+  assert.equal(intent.group_index, 22);
+});
+
+test('heuristic router maps draft post on numbered group', () => {
+  const intent = inferIntentHeuristically('draft a post on group 1 about our amazon hidden money business');
+  assert.equal(intent.type, 'draft_post');
+  assert.equal(intent.target, 'group');
+  assert.equal(intent.group_index, 1);
+  assert.match(intent.topic, /amazon hidden money/i);
+});

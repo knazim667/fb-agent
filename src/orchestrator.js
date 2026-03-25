@@ -2,6 +2,7 @@
 
 require('dotenv').config();
 
+const fs = require('fs/promises');
 const path = require('path');
 const readline = require('node:readline/promises');
 
@@ -35,14 +36,18 @@ const {
   startOperatorConsole,
 } = require('./agent/operator_console');
 const {
+  anchorVisiblePost,
   DEFAULT_TASK_INPUT_PATH,
   clickLike,
+  clickLikeOnVisiblePost,
+  commentAnchoredPost,
   closeBrowser,
   createFeedPost,
   createNewPost,
   discoverGroups,
   ensureLoggedIn,
   executeAgentAction,
+  extractAnchoredPostData,
   extractPostIdFromUrl,
   extractGroupIdFromUrl,
   getSimplifiedDOM,
@@ -54,8 +59,13 @@ const {
   isCanonicalGroupUrl,
   isLikelyGroupName,
   launchBrowser,
+  likeAnchoredPost,
+  listVisibleGroups,
+  listVisibleNotifications,
+  listVisiblePosts,
   markNotificationsRead,
   postComment,
+  postCommentOnVisiblePost,
   readTaskInput,
   classifyPageState,
   scrapeGroupFeed,
@@ -141,6 +151,7 @@ const JOB_TYPES = {
   BRIEF: 'brief',
 };
 const STALL_TIMEOUT_MS = 120_000;
+const TRACE_LOG_DIR = path.join(__dirname, '..', 'logs', 'traces');
 
 function isLikelyEnglishGroupName(name = '') {
   return /^[\x00-\x7F\s.,&()'"/|:+-]+$/.test(name);
@@ -450,6 +461,11 @@ async function runPerceiveReasonActLoop(page, {
   maxSteps = 8,
   onStall = null,
 }) {
+  let traceStarted = false;
+  const tracePath = path.join(
+    TRACE_LOG_DIR,
+    `pra_${new Date().toISOString().replace(/[:.]/g, '-')}.zip`
+  );
   const insights = await readAgentInsights().catch(() => '');
   const memorySections = [
     skill?.content || '',
@@ -463,75 +479,97 @@ async function runPerceiveReasonActLoop(page, {
   let lastProgressAt = Date.now();
   let hintNote = '';
 
-  for (let step = 1; step <= maxSteps; step += 1) {
-    const snapshot = await getSimplifiedDOM(page, { maxElements: 80 });
-    const pageState = classifyPageState(snapshot);
-    const now = Date.now();
-
-    if (/find and extract text from all posts in this group/i.test(goal) && Array.isArray(snapshot.posts) && snapshot.posts.length > 0) {
-      return {
-        success: true,
-        completed: true,
-        steps: step,
-        lastThought: 'Visible posts already present in the current group snapshot.',
-      };
+  try {
+    await fs.mkdir(TRACE_LOG_DIR, { recursive: true });
+    if (page.context().tracing && typeof page.context().tracing.start === 'function') {
+      await page.context().tracing.start({ screenshots: true, snapshots: true });
+      traceStarted = true;
     }
+  } catch (_error) {
+    traceStarted = false;
+  }
 
-    if (page.url() !== lastUrl) {
-      lastUrl = page.url();
-      lastProgressAt = now;
-    }
+  try {
+    for (let step = 1; step <= maxSteps; step += 1) {
+      const snapshot = await getSimplifiedDOM(page, { maxElements: 80 });
+      const pageState = classifyPageState(snapshot);
+      const now = Date.now();
 
-    if (now - lastProgressAt > STALL_TIMEOUT_MS && typeof onStall === 'function') {
-      const stallResult = await onStall({
-        page,
-        snapshot,
+      if (/find and extract text from all posts in this group/i.test(goal) && Array.isArray(snapshot.posts) && snapshot.posts.length > 0) {
+        return {
+          success: true,
+          completed: true,
+          steps: step,
+          lastThought: 'Visible posts already present in the current group snapshot.',
+        };
+      }
+
+      if (page.url() !== lastUrl) {
+        lastUrl = page.url();
+        lastProgressAt = now;
+      }
+
+      if (now - lastProgressAt > STALL_TIMEOUT_MS && typeof onStall === 'function') {
+        const stallResult = await onStall({
+          page,
+          snapshot,
+          goal,
+          step,
+          lastError,
+        });
+        if (stallResult?.handled) {
+          lastProgressAt = Date.now();
+          hintNote = stallResult.hint ? `Operator hint: ${stallResult.hint}` : '';
+          lastError = hintNote || '';
+          continue;
+        }
+      }
+
+      const nextStep = await decideNextDomAction({
+        url: page.url(),
         goal,
-        step,
-        lastError,
+        memory: memorySections.join('\n\n'),
+        snapshot,
+        pageState,
+        lastError: [lastError, hintNote].filter(Boolean).join('\n'),
       });
-      if (stallResult?.handled) {
+
+      if (nextStep.action === 'complete') {
+        return {
+          success: true,
+          completed: true,
+          steps: step,
+          lastThought: nextStep.thought,
+        };
+      }
+
+      try {
+        await executeAgentAction(page, nextStep);
+        await page.waitForTimeout(1000);
+        lastError = '';
         lastProgressAt = Date.now();
-        hintNote = stallResult.hint ? `Operator hint: ${stallResult.hint}` : '';
-        lastError = hintNote || '';
+      } catch (error) {
+        lastError = error.message;
         continue;
       }
     }
 
-    const nextStep = await decideNextDomAction({
-      url: page.url(),
-      goal,
-      memory: memorySections.join('\n\n'),
-      snapshot,
-      pageState,
-      lastError: [lastError, hintNote].filter(Boolean).join('\n'),
-    });
-
-    if (nextStep.action === 'complete') {
-      return {
-        success: true,
-        completed: true,
-        steps: step,
-        lastThought: nextStep.thought,
-      };
-    }
-
-    try {
-      await executeAgentAction(page, nextStep);
-      await page.waitForTimeout(1000);
-      lastError = '';
-      lastProgressAt = Date.now();
-    } catch (error) {
-      lastError = error.message;
-      continue;
+    return {
+      success: false,
+      completed: false,
+      error: lastError || 'Reasoning loop reached the maximum number of steps.',
+      tracePath: traceStarted ? tracePath : null,
+    };
+  } finally {
+    if (traceStarted) {
+      try {
+        const shouldPersist = Boolean(process.env.TRACE_AGENT_LOOPS) || Boolean(lastError);
+        await page.context().tracing.stop(shouldPersist ? { path: tracePath } : {});
+      } catch (_error) {
+        // Ignore tracing shutdown issues.
+      }
     }
   }
-
-  return {
-    success: false,
-    completed: false,
-    error: lastError || 'Reasoning loop reached the maximum number of steps.',
-  };
 }
 
 async function appendRecoveryLesson(hint, metadata = {}) {
@@ -552,19 +590,30 @@ function normalizePostUrl(url = '') {
 }
 
 async function extractLeadPostsFromCurrentPage(page, groupLabel, skill, state, topic = '') {
-  const snapshot = await getSimplifiedDOM(page, { maxElements: 120 });
-  const posts = Array.isArray(snapshot.posts) ? snapshot.posts : [];
+  const visiblePosts = await listVisiblePosts(page, { limit: 12, scrollRounds: 1 });
+  const posts = visiblePosts.map((post) => ({
+    visible_index: post.visibleIndex,
+    post_id: post.postId,
+    author: post.authorName || 'Unknown',
+    text: post.postText,
+    post_url: post.postUrl,
+    timestamp: post.timestampText || '',
+  }));
   const filteredByTopic = await filterPostsByRequestedTopic(posts, topic, skill);
   const aiCandidates = filteredByTopic.slice(0, 12);
   const found = [];
 
   for (const post of aiCandidates) {
     const normalizedText = String(post.text || '').replace(/\s+/g, ' ').trim();
-    if (!normalizedText || (/\b(i'?m interested|interested|dm me|inbox me)\b/i.test(normalizedText) && normalizedText.length < 120)) {
+    if (
+      !normalizedText ||
+      (/\b(i'?m interested|interested|dm me|inbox me|available let'?s connect|available let's connect)\b/i.test(normalizedText) && normalizedText.length < 160) ||
+      /\blike\s+reply\b/i.test(normalizedText)
+    ) {
       continue;
     }
 
-    const stablePostId = extractPostIdFromUrl(normalizePostUrl(post.post_url)) || post.agent_id;
+    const stablePostId = post.post_id || extractPostIdFromUrl(normalizePostUrl(post.post_url)) || `visible-post-${post.visible_index}`;
     const storedPost = await upsertPost({
       post_id: stablePostId,
       group: groupLabel,
@@ -603,8 +652,7 @@ async function extractLeadPostsFromCurrentPage(page, groupLabel, skill, state, t
         ...storedPost,
         post_url: normalizePostUrl(post.post_url),
         relevance_score: scoreResult.score,
-        comment_button_id: post.comment_button_id || '',
-        like_button_id: post.like_button_id || '',
+        visible_index: post.visible_index,
       });
     }
   }
@@ -1220,7 +1268,7 @@ async function scanGroupFeed(page, group, skill, goalSummary, state) {
     return [];
   }
 
-  const scrapedPosts = await scrapeGroupFeed(page, { limit: 18, scrollRounds: 2 });
+  const scrapedPosts = await listVisiblePosts(page, { limit: 18, scrollRounds: 2 });
   await updateGroupLastScanned(group.url, new Date());
   state.scrapedPosts += scrapedPosts.length;
   console.log(`Scraped ${scrapedPosts.length} posts from ${group.label}`);
@@ -1429,7 +1477,7 @@ async function engageQualifiedPosts(page, skill, state) {
       try {
         console.log(`Drafting Phase 1 comment for post ${candidate.post_id}`);
         const draft = await draftCommentForCandidate(skill, candidate, { phaseOverride: 1 });
-        await engageLeadWithReasoningLoop(page, skill, candidate, state, {
+        await commentOnQualifiedPost(page, skill, candidate, state, {
           draft,
         });
         await humanJitter(page, { logLabel: 'Post-comment jitter' });
@@ -1761,6 +1809,9 @@ async function runAssistantSession(options = {}) {
       enqueueUniqueJob,
       runQueuedJobs: () => runQueuedJobs(runtimeContext),
       scrapeNotifications,
+      listVisibleGroups: () => listVisibleGroups(browser.page, { limit: 200, scrollRounds: 8 }),
+      listVisibleNotifications: (optionsArg) => listVisibleNotifications(browser.page, optionsArg),
+      listVisiblePosts: (optionsArg) => listVisiblePosts(browser.page, optionsArg),
       isRelevantAmazonGroupName,
       getCollections,
       callOllama,
@@ -1781,8 +1832,14 @@ async function runAssistantSession(options = {}) {
       summarizeInbox: () => summarizeInbox(browser.page, skill, state),
       handleReplyLoop: (briefing) => handleReplyLoop(browser.page, skill, state, briefing),
       likeQualifiedPost: (candidate) => likeQualifiedPost(browser.page, candidate, state),
+      clickLikeOnVisiblePost: (visibleIndex) => clickLikeOnVisiblePost(browser.page, visibleIndex),
+      anchorVisiblePost: (visibleIndex, options) => anchorVisiblePost(browser.page, visibleIndex, options),
+      extractAnchoredPostData: (visibleIndex, options) => extractAnchoredPostData(browser.page, visibleIndex, options),
+      likeAnchoredPost: (visibleIndex, options) => likeAnchoredPost(browser.page, visibleIndex, options),
       draftCommentForCandidate: (candidate, options) => draftCommentForCandidate(skill, candidate, options),
-      commentOnQualifiedPost: (candidate, options) => engageLeadWithReasoningLoop(browser.page, skill, candidate, state, options),
+      commentOnQualifiedPost: (candidate, options) => commentOnQualifiedPost(browser.page, skill, candidate, state, options),
+      commentAnchoredPost: (visibleIndex, text, options) => commentAnchoredPost(browser.page, visibleIndex, text, options),
+      postCommentOnVisiblePost: (visibleIndex, text) => postCommentOnVisiblePost(browser.page, visibleIndex, text),
       createNewPost,
       createFeedPost,
       scrapeGroupFeed: (pageArg, optionsArg) => scrapeGroupFeed(pageArg || browser.page, optionsArg),
