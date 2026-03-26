@@ -47,6 +47,7 @@ function ensureOperatorContext(state) {
       lastNotifications: [],
       lastDraft: null,
       lastObservedRedditUrl: '',
+      lastObservedFacebookUrl: '',
       conversationHistory: [],
     };
   }
@@ -85,6 +86,7 @@ async function persistOperatorContext(state, upsertAgentState) {
     lastNotifications: context.lastNotifications,
     lastDraft: context.lastDraft,
     lastObservedRedditUrl: context.lastObservedRedditUrl || '',
+    lastObservedFacebookUrl: context.lastObservedFacebookUrl || '',
     conversationHistory: context.conversationHistory.slice(-12),
   });
 }
@@ -1110,8 +1112,10 @@ function startOperatorConsole(deps) {
     postCommentOnVisiblePost,
     createNewPost,
     createFeedPost,
+    openPostComposer,
     scrapeNotificationReplies,
     replyToNotificationItem,
+    submitComposerPost,
     upsertAgentState,
     humanJitter,
     appendRecoveryLesson,
@@ -1214,6 +1218,7 @@ function startOperatorConsole(deps) {
     context.currentGroup = null;
     context.lastPosts = [];
     context.lastObservedRedditUrl = '';
+    context.lastObservedFacebookUrl = '';
   }
 
   async function openRedditHome() {
@@ -1225,6 +1230,7 @@ function startOperatorConsole(deps) {
     context.currentGroup = null;
     context.lastPosts = [];
     context.lastObservedRedditUrl = '';
+    context.lastObservedFacebookUrl = '';
   }
 
   async function observePlatformPage(options = {}) {
@@ -1351,6 +1357,199 @@ function startOperatorConsole(deps) {
       platform: 'reddit',
       subreddit: post.subreddit || '',
     }));
+  }
+
+  function storeFacebookPosts(posts = []) {
+    context.lastPosts = posts.map((post) => ({
+      post_id: post.postId,
+      post_url: post.postUrl,
+      content: post.postText,
+      author: post.authorName || 'Unknown',
+      visible_index: post.visibleIndex,
+      selector_id: post.selectorId || '',
+      group: context.currentGroup?.name || context.currentGroup?.label || '',
+    }));
+  }
+
+  function formatFacebookObservationDebug(observation) {
+    const debugInfo = observation?.postsDebug || {};
+    const lines = [
+      `facebook observe: state=${observation?.state || 'unknown'} url=${observation?.url || page.url()} cards=${debugInfo.articleCount || 0} kept=${debugInfo.keptCount || (observation?.posts || []).length}`,
+    ];
+    if (debugInfo.feedContainerStatus) {
+      lines.push(
+        `facebook observe detail: feed_container=${debugInfo.feedContainerStatus?.found ? 'yes' : 'no'} top_level_articles=${debugInfo.feedContainerStatus?.topLevelArticleCount || 0} validation=${debugInfo.validationMode || 'engagement'}`
+      );
+    }
+    for (const rejection of (debugInfo.rejections || []).slice(0, 20)) {
+      lines.push(
+        `rejected article ${rejection.articleIndex}: ${rejection.reason}${rejection.detail ? ` (${rejection.detail})` : ''}`
+      );
+    }
+    if (!(observation?.posts || []).length && debugInfo.rejections?.[0]?.sampleText) {
+      lines.push(`first rejected article text: ${debugInfo.rejections[0].sampleText}`);
+    }
+    return lines;
+  }
+
+  async function collectFacebookVisiblePosts({
+    limit = 10,
+    scrollRounds = 2,
+    validationMode = 'engagement',
+  } = {}) {
+    const observation = await observePlatformPage({
+      includePosts: true,
+      limit,
+      scrollRounds,
+      validationMode,
+    });
+
+    if (context.debugMode) {
+      for (const line of formatFacebookObservationDebug(observation)) {
+        logDebug(context, line);
+      }
+    }
+
+    const posts = Array.isArray(observation?.posts) ? observation.posts : [];
+    if (posts.length) {
+      storeFacebookPosts(posts);
+      context.lastObservedFacebookUrl = observation?.url || page.url();
+      await persistOperatorContext(state, upsertAgentState);
+    }
+
+    return {
+      observation,
+      posts,
+    };
+  }
+
+  async function resolvePostFromObservedContext(postIndex, { limit = 12 } = {}) {
+    const desiredIndex = Number(postIndex);
+    if (!Number.isFinite(desiredIndex) || desiredIndex < 1) {
+      return null;
+    }
+
+    if (String(context.currentPlatform || 'facebook').toLowerCase() === 'reddit') {
+      const currentUrl = page.url();
+      const cachedUrl = String(context.lastObservedRedditUrl || '');
+      if (!currentPosts().length || (currentUrl && cachedUrl && currentUrl !== cachedUrl)) {
+        const observation = await observePlatformPage({
+          includePosts: true,
+          limit: Math.max(limit, desiredIndex),
+          scrollRounds: 2,
+        });
+        const posts = Array.isArray(observation?.posts) ? observation.posts : [];
+        storeRedditPosts(posts);
+        context.lastObservedRedditUrl = observation?.url || currentUrl;
+        await persistOperatorContext(state, upsertAgentState);
+      }
+      return currentPosts()[desiredIndex - 1] || null;
+    }
+
+    const currentUrl = page.url();
+    const cachedUrl = String(context.lastObservedFacebookUrl || '');
+    if (!currentPosts().length || (currentUrl && cachedUrl && currentUrl !== cachedUrl)) {
+      const observation = await observePlatformPage({
+        includePosts: true,
+        limit: Math.max(limit, desiredIndex),
+        scrollRounds: 2,
+        validationMode: 'engagement',
+      });
+      if (observation?.state === 'facebook_login') {
+        return { __error: 'Facebook needs login or checkpoint review before I can use the current post list.' };
+      }
+      const posts = Array.isArray(observation?.posts) ? observation.posts : [];
+      storeFacebookPosts(posts);
+      context.lastObservedFacebookUrl = observation?.url || currentUrl;
+      await persistOperatorContext(state, upsertAgentState);
+    }
+    return currentPosts()[desiredIndex - 1] || null;
+  }
+
+  async function ensureFacebookComposerSurface({ target = 'feed', group = null } = {}) {
+    const groupId = target === 'group' ? (group?.group_id || group?.id || null) : null;
+    await lock.runExclusive('operator:open-facebook-composer', async () => {
+      if (typeof openPostComposer !== 'function') {
+        throw new Error('Facebook composer opener is not available.');
+      }
+      await openPostComposer(groupId);
+    });
+
+    const verification = await verifyOutcome({ expectedStates: ['facebook_composer'] });
+    if (!verification.ok) {
+      throw new Error(`Facebook composer did not open correctly. I saw ${verification.observation?.state || 'unknown'} instead.`);
+    }
+
+    context.currentPlatform = 'facebook';
+    context.currentSurface = 'facebook_composer';
+    if (target === 'group' && group) {
+      context.currentGroup = group;
+    }
+    return verification.observation;
+  }
+
+  function getSurfaceAdapter(platform = context.currentPlatform || 'facebook') {
+    const normalized = String(platform || 'facebook').toLowerCase();
+    if (normalized === 'reddit') {
+      return {
+        observe: (options = {}) => observePlatformPage(options),
+        postComment: async (post, text) => {
+          await commentOnRedditPost({
+            postUrl: post.post_url,
+            text,
+          });
+        },
+        postDraft: async (draft) => {
+          throw new Error('Reddit post publishing is not wired yet.');
+        },
+      };
+    }
+
+    return {
+      observe: (options = {}) => observePlatformPage(options),
+      postComment: async (post, text) => {
+        if (Number.isFinite(Number(post.visible_index)) && typeof commentAnchoredPost === 'function') {
+          await runAnchoredActionWithRecovery('Comment on anchored post', Number(post.visible_index), () =>
+            commentAnchoredPost(Number(post.visible_index), text, { selectorId: post.selector_id || '' })
+          );
+          return;
+        }
+        await commentOnQualifiedPost(post, {
+          draft: { reply: text },
+          phaseOverride: 1,
+          onStall: handleStall,
+        });
+      },
+      postDraft: async (draft) => {
+        if (draft.target?.surface === 'feed') {
+          await ensureFacebookComposerSurface({ target: 'feed' });
+          await lock.runExclusive('operator:submit-facebook-feed-draft', async () => {
+            await submitComposerPost(draft.text, null);
+          });
+          const verification = await verifyOutcome({ expectedStates: ['facebook_home_feed', 'facebook_group_feed', 'facebook_post_detail'] });
+          if (!verification.ok && context.debugMode) {
+            logDebug(context, `facebook verify after feed post: saw ${verification.observation?.state || 'unknown'}`);
+          }
+          return 'Posted the last draft to your feed.';
+        }
+
+        const draftGroup = draft.target?.group || context.currentGroup;
+        if (!draftGroup?.group_id && !draftGroup?.id) {
+          throw new Error('The last draft is for a group, but no current group is selected.');
+        }
+
+        await ensureFacebookComposerSurface({ target: 'group', group: draftGroup });
+        await lock.runExclusive('operator:submit-facebook-group-draft', async () => {
+          await submitComposerPost(draft.text, null);
+        });
+        context.currentGroup = draftGroup;
+        const verification = await verifyOutcome({ expectedStates: ['facebook_group_feed', 'facebook_post_detail'] });
+        if (!verification.ok && context.debugMode) {
+          logDebug(context, `facebook verify after group post: saw ${verification.observation?.state || 'unknown'}`);
+        }
+        return `Posted the last draft to ${draftGroup.name || 'the current group'}.`;
+      },
+    };
   }
 
   async function resolveTargetGroup(args = {}) {
@@ -1540,6 +1739,7 @@ function startOperatorConsole(deps) {
       context.currentSurface = 'facebook_group_feed';
       context.currentGroup = group;
       context.lastPosts = [];
+      context.lastObservedFacebookUrl = '';
       logDebug(context, `Opened group URL: ${group.url || 'unknown-url'}`);
       await persistOperatorContext(state, upsertAgentState);
       return `Opened group: ${group.name}`;
@@ -1600,6 +1800,7 @@ function startOperatorConsole(deps) {
           context.currentSurface = 'facebook_group_feed';
           context.currentGroup = selected;
           context.lastPosts = [];
+          context.lastObservedFacebookUrl = '';
         }
       }
 
@@ -1609,63 +1810,24 @@ function startOperatorConsole(deps) {
           : currentPosts().slice(0, Math.max(1, Number(args.limit || currentPosts().length)));
         return formatOriginalPosts(chosenPosts, 'Current posts');
       }
-      if ((/^facebook_home_feed$/i.test(String(context.currentSurface || '')) || context.currentGroup?.url) && typeof listVisiblePosts === 'function') {
-        const visiblePostsResult = await lock.runExclusive('operator:list-visible-posts', async () =>
-          listVisiblePosts({
-            limit: Math.max(1, Number(args.limit || 12)),
-            scrollRounds: 3,
-            returnMeta: true,
-            validationMode: 'engagement',
-          })
+      const { observation } = await collectFacebookVisiblePosts({
+        limit: Math.max(1, Number(args.limit || 12)),
+        scrollRounds: 3,
+        validationMode: 'engagement',
+      });
+      if (observation?.state === 'facebook_login') {
+        return 'Facebook needs login or checkpoint review before I can read posts there.';
+      }
+      if (context.lastPosts.length) {
+        const chosenPosts = args.random
+          ? [...context.lastPosts].sort(() => Math.random() - 0.5).slice(0, Math.max(1, Number(args.limit || 5)))
+          : context.lastPosts.slice(0, Math.max(1, Number(args.limit || context.lastPosts.length)));
+        return formatOriginalPosts(
+          chosenPosts,
+          /^facebook_home_feed$/i.test(String(context.currentSurface || ''))
+            ? 'Visible posts in your home feed'
+            : `Visible posts in ${context.currentGroup.name || context.currentGroup.label}`
         );
-        const visiblePosts = Array.isArray(visiblePostsResult?.posts) ? visiblePostsResult.posts : [];
-        if (context.debugMode) {
-          const debugInfo = visiblePostsResult?.debug || {};
-          logDebug(
-            context,
-            `visible post scan: mode=${debugInfo.pageMode || 'unknown'}, articles=${debugInfo.articleCount || 0}, kept=${debugInfo.keptCount || 0}`
-          );
-          logDebug(
-            context,
-            `visible post debug: url=${debugInfo.url || page.url()} feed_container=${debugInfo.feedContainerStatus?.found ? 'yes' : 'no'} top_level_articles=${debugInfo.feedContainerStatus?.topLevelArticleCount || 0} validation=${debugInfo.validationMode || 'engagement'}`
-          );
-          for (const rejection of (debugInfo.rejections || []).slice(0, 20)) {
-            logDebug(
-              context,
-              `rejected article ${rejection.articleIndex}: ${rejection.reason}${rejection.detail ? ` (${rejection.detail})` : ''}`
-            );
-          }
-          if (!visiblePosts.length && debugInfo.rejections?.[0]?.sampleText) {
-            logDebug(context, `first rejected article text: ${debugInfo.rejections[0].sampleText}`);
-          }
-        }
-        if (visiblePosts.length) {
-          visiblePosts.forEach((post) => {
-            logDebug(
-              context,
-              `visible post ${post.postId || post.visibleIndex}: accepted as original post anchor`
-            );
-          });
-          context.lastPosts = visiblePosts.map((post) => ({
-            post_id: post.postId,
-            post_url: post.postUrl,
-            content: post.postText,
-            author: post.authorName || 'Unknown',
-            visible_index: post.visibleIndex,
-            selector_id: post.selectorId || '',
-            group: context.currentGroup?.name || context.currentGroup?.label || '',
-          }));
-          await persistOperatorContext(state, upsertAgentState);
-          const chosenPosts = args.random
-            ? [...context.lastPosts].sort(() => Math.random() - 0.5).slice(0, Math.max(1, Number(args.limit || 5)))
-            : context.lastPosts.slice(0, Math.max(1, Number(args.limit || context.lastPosts.length)));
-          return formatOriginalPosts(
-            chosenPosts,
-            /^facebook_home_feed$/i.test(String(context.currentSurface || ''))
-              ? 'Visible posts in your home feed'
-              : `Visible posts in ${context.currentGroup.name || context.currentGroup.label}`
-          );
-        }
       }
       if (context.currentGroup?.name) {
         return `I opened ${context.currentGroup.name}, but I could not read visible original posts right now.`;
@@ -1844,7 +2006,10 @@ function startOperatorConsole(deps) {
     }
 
     if (tool === 'like_post') {
-      const post = currentPosts()[Number(args.post_index) - 1];
+      const post = await resolvePostFromObservedContext(args.post_index, { limit: 12 });
+      if (post?.__error) {
+        return post.__error;
+      }
       if (!post) {
         return 'That post number is not in the current post list.';
       }
@@ -1902,18 +2067,22 @@ function startOperatorConsole(deps) {
         context.lastPosts = [];
       }
 
-      let recentPosts = await lock.runExclusive('operator:scrape-random-like-posts', async () =>
-        (typeof listVisiblePosts === 'function'
-          ? listVisiblePosts({ limit: Math.max(requestedCount * 2, 12), scrollRounds: 2, validationMode: 'engagement' })
-          : scrapeGroupFeed(page, { limit: Math.max(requestedCount * 2, 12), scrollRounds: 2, validationMode: 'engagement' }))
-      );
+      let { observation, posts: recentPosts } = await collectFacebookVisiblePosts({
+        limit: Math.max(requestedCount * 2, 12),
+        scrollRounds: 2,
+        validationMode: 'engagement',
+      });
+
+      if (observation?.state === 'facebook_login') {
+        return 'Facebook needs login or checkpoint review before I can like posts there.';
+      }
 
       if (recentPosts.length < requestedCount) {
-        recentPosts = await lock.runExclusive('operator:scrape-random-like-posts-more', async () =>
-          (typeof listVisiblePosts === 'function'
-            ? listVisiblePosts({ limit: Math.max(requestedCount * 3, 15), scrollRounds: 5, validationMode: 'engagement' })
-            : scrapeGroupFeed(page, { limit: Math.max(requestedCount * 3, 15), scrollRounds: 5, validationMode: 'engagement' }))
-        );
+        ({ observation, posts: recentPosts } = await collectFacebookVisiblePosts({
+          limit: Math.max(requestedCount * 3, 15),
+          scrollRounds: 5,
+          validationMode: 'engagement',
+        }));
       }
 
       if (!recentPosts.length) {
@@ -2009,18 +2178,22 @@ function startOperatorConsole(deps) {
         context.lastPosts = [];
       }
 
-      let visiblePosts = await lock.runExclusive('operator:list-visible-posts-for-random-comments', async () =>
-        (typeof listVisiblePosts === 'function'
-          ? listVisiblePosts({ limit: Math.max(requestedCount * 2, 10), scrollRounds: 2, validationMode: 'engagement' })
-          : scrapeGroupFeed(page, { limit: Math.max(requestedCount * 2, 10), scrollRounds: 2, validationMode: 'engagement' }))
-      );
+      let { observation, posts: visiblePosts } = await collectFacebookVisiblePosts({
+        limit: Math.max(requestedCount * 2, 10),
+        scrollRounds: 2,
+        validationMode: 'engagement',
+      });
+
+      if (observation?.state === 'facebook_login') {
+        return 'Facebook needs login or checkpoint review before I can comment there.';
+      }
 
       if (visiblePosts.length < requestedCount) {
-        visiblePosts = await lock.runExclusive('operator:list-visible-posts-for-random-comments-more', async () =>
-          (typeof listVisiblePosts === 'function'
-            ? listVisiblePosts({ limit: Math.max(requestedCount * 3, 15), scrollRounds: 5, validationMode: 'engagement' })
-            : scrapeGroupFeed(page, { limit: Math.max(requestedCount * 3, 15), scrollRounds: 5, validationMode: 'engagement' }))
-        );
+        ({ observation, posts: visiblePosts } = await collectFacebookVisiblePosts({
+          limit: Math.max(requestedCount * 3, 15),
+          scrollRounds: 5,
+          validationMode: 'engagement',
+        }));
       }
 
       if (!visiblePosts.length) {
@@ -2089,7 +2262,10 @@ function startOperatorConsole(deps) {
     }
 
     if (tool === 'draft_comment') {
-      const post = currentPosts()[Number(args.post_index) - 1];
+      const post = await resolvePostFromObservedContext(args.post_index, { limit: 12 });
+      if (post?.__error) {
+        return post.__error;
+      }
       if (!post) {
         if (context.currentGroup?.name) {
           return `That post number is not in the current post list for ${context.currentGroup.name}.`;
@@ -2114,7 +2290,10 @@ function startOperatorConsole(deps) {
     }
 
     if (tool === 'comment_post') {
-      const post = currentPosts()[Number(args.post_index) - 1];
+      const post = await resolvePostFromObservedContext(args.post_index, { limit: 12 });
+      if (post?.__error) {
+        return post.__error;
+      }
       if (!post) {
         return 'That post number is not in the current post list.';
       }
@@ -2138,31 +2317,16 @@ function startOperatorConsole(deps) {
         return `Draft kept for post ${args.post_index}:\n${draft.reply}`;
       }
 
-      if (context.currentPlatform === 'reddit') {
-        await lock.runExclusive('operator:reddit-comment-post', async () => {
-          await commentOnRedditPost({
-            postUrl: post.post_url,
-            text: draft.reply,
-          });
-        });
-        return `Comment posted on Reddit post ${args.post_index}.`;
-      }
-
-      await lock.runExclusive('operator:comment-post', async () => {
-        if (Number.isFinite(Number(post.visible_index)) && typeof commentAnchoredPost === 'function') {
-          await runAnchoredActionWithRecovery('Comment on anchored post', Number(post.visible_index), () =>
-            commentAnchoredPost(Number(post.visible_index), draft.reply, { selectorId: post.selector_id || '' })
-          );
-        } else {
-          await commentOnQualifiedPost(post, {
-            draft,
-            phaseOverride: 1,
-            onStall: handleStall,
-          });
-        }
+      const adapter = getSurfaceAdapter(context.currentPlatform === 'reddit' ? 'reddit' : 'facebook');
+      await lock.runExclusive(`operator:${context.currentPlatform === 'reddit' ? 'reddit-' : ''}comment-post`, async () => {
+        await adapter.postComment(post, draft.reply);
       });
-      await humanJitter(page, { logLabel: 'Manual comment jitter' });
-      return `Comment posted on post ${args.post_index}.`;
+      if (context.currentPlatform !== 'reddit') {
+        await humanJitter(page, { logLabel: 'Manual comment jitter' });
+      }
+      return context.currentPlatform === 'reddit'
+        ? `Comment posted on Reddit post ${args.post_index}.`
+        : `Comment posted on post ${args.post_index}.`;
     }
 
     if (tool === 'check_notifications') {
@@ -2284,60 +2448,35 @@ function startOperatorConsole(deps) {
       }
 
       if (draft.kind === 'post') {
-        if (draft.target?.surface === 'feed') {
-          await lock.runExclusive('operator:post-last-feed-draft', async () => {
-            await createFeedPost(page, draft.text, null);
-          });
-          return 'Posted the last draft to your feed.';
-        }
-
-        const draftGroup = draft.target?.group || context.currentGroup;
-        if (!draftGroup?.group_id && !draftGroup?.id) {
-          return 'The last draft is for a group, but no current group is selected.';
-        }
-
-        await lock.runExclusive('operator:post-last-group-draft', async () => {
-          if (draftGroup?.url) {
-            await visitGroup(page, draftGroup.url);
-          }
-          await createNewPost(page, draftGroup.group_id || draftGroup.id, draft.text, null);
-        });
-        context.currentGroup = draftGroup;
-        return `Posted the last draft to ${draftGroup.name || 'the current group'}.`;
+        const adapter = getSurfaceAdapter('facebook');
+        return lock.runExclusive(
+          draft.target?.surface === 'feed'
+            ? 'operator:post-last-feed-draft'
+            : 'operator:post-last-group-draft',
+          async () => adapter.postDraft(draft)
+        );
       }
 
       if (draft.kind === 'comment') {
-        const post = currentPosts()[Number(draft.target?.post_index) - 1];
+        const post = await resolvePostFromObservedContext(draft.target?.post_index, { limit: 12 });
+        if (post?.__error) {
+          return post.__error;
+        }
         if (!post) {
           return 'The saved draft comment no longer matches the current post list.';
         }
 
-        if (context.currentPlatform === 'reddit' && post?.post_url) {
-          await lock.runExclusive('operator:post-last-reddit-comment-draft', async () => {
-            await commentOnRedditPost({
-              postUrl: post.post_url,
-              text: draft.text,
-            });
-          });
-          return `Posted the last draft comment to Reddit post ${draft.target?.post_index}.`;
-        }
-
-        await lock.runExclusive('operator:post-last-comment-draft', async () => {
-          if (Number.isFinite(Number(post.visible_index)) && typeof commentAnchoredPost === 'function') {
-            await runAnchoredActionWithRecovery('Post saved comment on anchored post', Number(post.visible_index), () =>
-              commentAnchoredPost(Number(post.visible_index), draft.text, { selectorId: post.selector_id || '' })
-            );
-          } else {
-            await commentOnQualifiedPost(post, {
-              draft: {
-                reply: draft.text,
-                phase: 1,
-              },
-              phaseOverride: 1,
-            });
-          }
-        });
-        return `Posted the saved comment on post ${draft.target?.post_index}.`;
+        const platform = context.currentPlatform === 'reddit' ? 'reddit' : 'facebook';
+        const adapter = getSurfaceAdapter(platform);
+        await lock.runExclusive(
+          platform === 'reddit'
+            ? 'operator:post-last-reddit-comment-draft'
+            : 'operator:post-last-comment-draft',
+          async () => adapter.postComment(post, draft.text)
+        );
+        return platform === 'reddit'
+          ? `Posted the last draft comment to Reddit post ${draft.target?.post_index}.`
+          : `Posted the saved comment on post ${draft.target?.post_index}.`;
       }
 
       return 'I found a draft, but I do not know how to post it safely.';
