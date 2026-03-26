@@ -163,6 +163,7 @@ function formatOriginalPosts(posts = [], title = 'Original posts') {
       const meta = [
         post.relevance_score != null ? `score ${post.relevance_score}/10` : '',
         post.lead_temperature ? post.lead_temperature.toLowerCase() : '',
+        post.extractionConfidence ? `extract ${post.extractionConfidence}` : '',
       ].filter(Boolean).join(' | ');
       return `Post #${number}: ${author}${meta ? ` [${meta}]` : ''}\n   ${summary}`;
     }),
@@ -1157,6 +1158,49 @@ function dedupePostsByIdentity(posts = []) {
   return unique;
 }
 
+function inspectSemanticLeadSignals(text = '', extraSignals = []) {
+  const normalized = String(text || '').toLowerCase();
+  const matchedSignals = [];
+  let score = 0;
+  let warmTrigger = false;
+
+  const semanticRules = [
+    { key: 'reimbursement', weight: 4, pattern: /\breimburse(?:ment|ments)?\b|\bowe(?:s|d)? me money\b/ },
+    { key: 'inventory_discrepancy', weight: 4, pattern: /\blost inventory\b|\bmissing units?\b|\binventory discrepanc(?:y|ies)\b|\breceived fewer units than shipped\b|\bwarehouse lost\b/ },
+    { key: 'settlement_confusion', weight: 3, pattern: /\bsettlement\b.*\b(confus|wrong|off|lower|problem)|\bpayout\b.*\b(lower|wrong|confus|issue)|\bbalance\b.*\bwrong\b/ },
+    { key: 'fee_frustration', weight: 3, pattern: /\bfees?\b.*\btoo high\b|\bfee error\b|\bfees? (?:are )?killing\b|\bovercharg(?:ed|ing)\b/ },
+    { key: 'profit_leakage', weight: 2, pattern: /\blow profit\b|\bprofit\b.*\blow\b|\bmargins?\b.*\blow\b|\bmoney is disappearing\b|\bprofit leak\b/ },
+    { key: 'seller_confusion', weight: 2, pattern: /\bi do not understand\b|\bdoes not make sense\b|\bis this normal\b|\bcan someone explain\b|\bwhat does this mean\b|\bconfus(?:ed|ing)\b/ },
+  ];
+
+  for (const rule of semanticRules) {
+    if (rule.pattern.test(normalized)) {
+      matchedSignals.push(rule.key);
+      score += rule.weight;
+      if (['seller_confusion', 'inventory_discrepancy', 'settlement_confusion', 'fee_frustration'].includes(rule.key)) {
+        warmTrigger = true;
+      }
+    }
+  }
+
+  for (const signal of Array.isArray(extraSignals) ? extraSignals : []) {
+    const normalizedSignal = String(signal || '').trim().toLowerCase();
+    if (!normalizedSignal) {
+      continue;
+    }
+    if (normalized.includes(normalizedSignal) && !matchedSignals.includes(normalizedSignal)) {
+      matchedSignals.push(normalizedSignal);
+      score += 1;
+    }
+  }
+
+  return {
+    matchedSignals,
+    score,
+    warmTrigger,
+  };
+}
+
 function looksLikeDraftApproval(input = '') {
   const normalized = String(input || '').trim().toLowerCase();
   if (!normalized) {
@@ -1202,6 +1246,49 @@ function renderDryRunPreview({
       `   Intended action: ${item.action || 'continue browsing'}`,
     ].join('\n')),
   ].join('\n');
+}
+
+function summarizeCandidateMisses(candidates = [], { fallback = '' } = {}) {
+  const total = Array.isArray(candidates) ? candidates.length : 0;
+  const rejectionReasons = [...new Set(
+    (Array.isArray(candidates) ? candidates : [])
+      .map((candidate) => String(candidate.rejection_reason || '').trim())
+      .filter(Boolean)
+  )].slice(0, 3);
+
+  const lines = [
+    `I collected ${total} candidate ${total === 1 ? 'post' : 'posts'}, but none were strong enough to promote yet.`,
+  ];
+
+  if (rejectionReasons.length) {
+    lines.push(`Why they did not promote: ${rejectionReasons.join(' | ')}`);
+  } else {
+    lines.push('Why they did not promote: the visible posts looked weak, generic, or did not show clear seller pain.');
+  }
+
+  if (fallback) {
+    lines.push(`Fallback tried or next: ${fallback}`);
+  }
+
+  return lines.join('\n');
+}
+
+function summarizeObservationWithoutPromotion({
+  articleCount = 0,
+  keptCount = 0,
+  fallback = '',
+} = {}) {
+  const lines = [];
+  if (articleCount > 0 || keptCount > 0) {
+    lines.push(`I did see visible content here: ${articleCount} articles and ${keptCount} kept candidates.`);
+    lines.push('They were not promoted yet because the extracted text was weak, partial, or not clearly tied to the business pain signals.');
+  } else {
+    lines.push('I did not get enough structured candidates from the page yet.');
+  }
+  if (fallback) {
+    lines.push(`Fallback tried or next: ${fallback}`);
+  }
+  return lines.join('\n');
 }
 
 function startOperatorConsole(deps) {
@@ -1705,6 +1792,11 @@ function startOperatorConsole(deps) {
         `rejected article ${rejection.articleIndex}: ${rejection.reason}${rejection.detail ? ` (${rejection.detail})` : ''}`
       );
     }
+    for (const kept of (observation?.posts || []).slice(0, 10)) {
+      lines.push(
+        `kept post ${kept.visibleIndex || '?'}: raw_len=${kept.rawTextLength || 0} clean_len=${kept.cleanedTextLength || 0} fallback=${kept.fallbackUsed ? 'yes' : 'no'} confidence=${kept.extractionConfidence || 'unknown'} signals=${kept.painSignalCount || 0}`
+      );
+    }
     if (!(observation?.posts || []).length && debugInfo.rejections?.[0]?.sampleText) {
       lines.push(`first rejected article text: ${debugInfo.rejections[0].sampleText}`);
     }
@@ -1783,6 +1875,63 @@ function startOperatorConsole(deps) {
     return posts.slice(0, 10).map((post, index) => (
       `candidate ${index + 1}: temp=${post.lead_temperature || 'unknown'} action=${post.recommended_action || 'none'} score=${post.relevance_score ?? 'n/a'} reason=${post._leadScore?.reason || 'n/a'}`
     ));
+  }
+
+  async function reviewCandidatePosts(posts = [], {
+    topic = '',
+    signals = [],
+    platform = 'facebook',
+  } = {}) {
+    const reviews = [];
+    for (const post of posts) {
+      const text = [post.title || '', post.content || post.postText || ''].filter(Boolean).join('\n');
+      const semantic = inspectSemanticLeadSignals(text, signals);
+      let modelReview = null;
+      if (typeof scorePostAgainstSkill === 'function') {
+        try {
+          modelReview = await scorePostAgainstSkill({
+            content: text,
+            author: post.author || 'Unknown',
+            post_id: post.post_id || post.postId || '',
+          }, skill, {
+            model,
+            timeoutMs: 20_000,
+          });
+        } catch (_error) {
+          modelReview = null;
+        }
+      }
+
+      const modelScore = Number(modelReview?.score || 0);
+      const combinedScore = Math.max(modelScore, semantic.score);
+      const lowerWarm = semantic.warmTrigger;
+      const leadTemperature = combinedScore >= 8
+        ? 'HOT'
+        : (combinedScore >= 5 || (lowerWarm && combinedScore >= 3))
+          ? 'WARM'
+          : 'COLD';
+      const accepted = leadTemperature !== 'COLD'
+        && (semantic.matchedSignals.length > 0 || Boolean(modelReview?.is_lead));
+      const rejectionReason = accepted
+        ? ''
+        : (modelReview?.reason || 'No meaningful seller pain signals were strong enough after manual review.');
+      reviews.push({
+        ...post,
+        platform,
+        matchedSignals: semantic.matchedSignals,
+        semanticScore: semantic.score,
+        relevance_score: combinedScore,
+        lead_temperature: leadTemperature,
+        recommended_action: leadTemperature === 'HOT'
+          ? 'comment_publicly'
+          : leadTemperature === 'WARM'
+            ? 'save_for_follow_up'
+            : 'ignore',
+        _leadScore: modelReview,
+        rejection_reason: rejectionReason,
+      });
+    }
+    return reviews;
   }
 
   async function exploreFacebookCommunitiesForLeads({
@@ -1902,7 +2051,7 @@ function startOperatorConsole(deps) {
     const filtered = topic && keywordMatched.length
       ? await filterPostsByTopic(keywordMatched, topic, callOllama, model)
       : keywordMatched;
-    return rankPostsForBusinessTopic(filtered, topic);
+    return filtered;
   }
 
   async function resolvePostFromObservedContext(postIndex, { limit = 12 } = {}) {
@@ -2293,7 +2442,14 @@ function startOperatorConsole(deps) {
       }
 
       if (!ranked.length) {
-        return `I searched Facebook but found nothing clearly related to "${topic || searchQueries[0]}".`;
+        const visibleArticleCount = collectedPosts.length;
+        return visibleArticleCount > 0
+          ? summarizeCandidateMisses(collectedPosts.map((post) => ({
+              rejection_reason: 'visible Facebook posts were collected, but they did not show clear reimbursement, inventory, fee, payout, or profit-leak pain strongly enough.',
+            })), {
+              fallback: 'multi-pass Facebook search and manual group exploration were completed. Next best move is to broaden the topic or inspect a specific active group.',
+            })
+          : `I searched Facebook for "${topic || searchQueries[0]}", but the search and manual exploration passes did not surface strong lead candidates yet.\nFallback tried or next: broaden the pain wording or inspect a specific active group manually.`;
       }
 
       return formatOriginalPosts(
@@ -2571,7 +2727,13 @@ function startOperatorConsole(deps) {
         return 'Reddit search opened, but you are not logged in there yet. Please log in first, then ask again.';
       }
       if (!context.lastPosts.length) {
-        return `I searched Reddit for "${query}", but I couldn't find visible posts right now.`;
+        const articleCount = Number(observation?.postsDebug?.articleCount || observation?.articleCount || 0);
+        const keptCount = Number(observation?.postsDebug?.keptCount || 0);
+        return summarizeObservationWithoutPromotion({
+          articleCount,
+          keptCount,
+          fallback: `search results for "${query}" were checked. Next best move is to open a relevant subreddit and inspect recent posts manually.`,
+        });
       }
 
       return formatOriginalPosts(context.lastPosts, `Reddit posts for "${query}"`);
@@ -2705,30 +2867,62 @@ function startOperatorConsole(deps) {
         await persistOperatorContext(state, upsertAgentState);
       }
 
-      const signalMatched = objectiveProfile?.mustMatchAny?.length
-        ? filterPostsBySignalTerms(posts, objectiveProfile.mustMatchAny)
-        : posts;
-      const keywordMatched = topic
-        ? keywordFilterPosts(signalMatched, objectiveProfile?.topic || topic)
-        : signalMatched;
-      const filtered = topic && keywordMatched.length
-        ? await filterPostsByTopic(keywordMatched, objectiveProfile?.topic || topic, callOllama, model)
-        : keywordMatched;
-      let ranked = await rankPostsForBusinessTopic(filtered, objectiveProfile?.topic || topic);
+      const reviewedCurrentCandidates = await reviewCandidatePosts(posts, {
+        topic: objectiveProfile?.topic || topic,
+        signals: Array.isArray(objectiveProfile?.mustMatchAny) ? objectiveProfile.mustMatchAny : [],
+        platform: 'reddit',
+      });
+      let ranked = reviewedCurrentCandidates
+        .filter((item) => item.lead_temperature !== 'COLD')
+        .sort((left, right) => Number(right.relevance_score || 0) - Number(left.relevance_score || 0));
+      let allReviewedCandidates = reviewedCurrentCandidates;
       if (!ranked.length && topic) {
-        ranked = await exploreRedditCommunitiesForLeads({
+        const fallbackCandidates = await exploreRedditCommunitiesForLeads({
           topic: objectiveProfile?.topic || topic,
           signals: Array.isArray(objectiveProfile?.mustMatchAny) ? objectiveProfile.mustMatchAny : [],
           limit: Math.max(1, Number(args.limit || 10)),
           skillPolicy,
         });
+        const reviewedFallbackCandidates = await reviewCandidatePosts(fallbackCandidates, {
+          topic: objectiveProfile?.topic || topic,
+          signals: Array.isArray(objectiveProfile?.mustMatchAny) ? objectiveProfile.mustMatchAny : [],
+          platform: 'reddit',
+        });
+        allReviewedCandidates = dedupePostsByIdentity([
+          ...reviewedCurrentCandidates,
+          ...reviewedFallbackCandidates,
+        ]);
+        ranked = reviewedFallbackCandidates
+          .filter((item) => item.lead_temperature !== 'COLD')
+          .sort((left, right) => Number(right.relevance_score || 0) - Number(left.relevance_score || 0));
+        if (context.debugMode) {
+          for (const candidate of reviewedFallbackCandidates) {
+            traceDebug(
+              `reddit candidate review: title=${excerpt(candidate.title || candidate.author || 'Unknown', 120)} signals=${candidate.matchedSignals.join(',') || 'none'} temp=${candidate.lead_temperature} rejected=${candidate.rejection_reason || 'no'}`,
+              { platform: 'reddit', stage: 'manual_fallback' }
+            );
+          }
+        }
+      } else if (context.debugMode) {
+        for (const candidate of reviewedCurrentCandidates) {
+          traceDebug(
+            `reddit candidate review: title=${excerpt(candidate.title || candidate.author || 'Unknown', 120)} signals=${candidate.matchedSignals.join(',') || 'none'} temp=${candidate.lead_temperature} rejected=${candidate.rejection_reason || 'no'}`,
+            { platform: 'reddit', stage: 'search_pass_review' }
+          );
+        }
       }
-      const limit = Math.max(1, Number(args.limit || (ranked.length || filtered.length || 10)));
+      const limit = Math.max(1, Number(args.limit || (ranked.length || allReviewedCandidates.length || 10)));
 
-      if (!(ranked.length || filtered.length)) {
-        return topic
-          ? `I checked Reddit but found nothing clearly related to "${objectiveProfile?.topic || topic}".`
-          : 'I checked the current Reddit posts, but I could not find visible posts right now.';
+      if (!ranked.length) {
+        return allReviewedCandidates.length
+          ? summarizeCandidateMisses(allReviewedCandidates, {
+              fallback: 'all Reddit search passes and subreddit manual exploration were completed. Next best move is to broaden the pain language or inspect a specific subreddit in more depth.',
+            })
+          : summarizeObservationWithoutPromotion({
+              articleCount: Number(observation?.postsDebug?.articleCount || observation?.articleCount || 0),
+              keptCount: Number(observation?.postsDebug?.keptCount || 0),
+              fallback: 'Reddit search passes were completed, but there were no strong candidates to inspect. Next best move is broader search language or a direct subreddit visit.',
+            });
       }
 
       if (context.debugMode && ranked.length) {
@@ -3991,6 +4185,7 @@ module.exports = {
   buildDashboard,
   inferIntentHeuristically,
   inferPlatformScopedIntent,
+  inspectSemanticLeadSignals,
   looksLikeDraftApproval,
   planOperatorMessage,
   resolveNamedGroup,

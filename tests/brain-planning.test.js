@@ -49,6 +49,7 @@ test('interpretObjectiveForBrowser expands amazon hidden money lead search inten
   assert.ok(Array.isArray(plan.searchPasses));
   assert.ok(plan.searchPasses.some((item) => item.pass === 'community_manual_exploration'));
   assert.ok(plan.searchQueries.some((query) => /reimbursement|fees|settlement|inventory|profit/i.test(query)));
+  assert.ok(plan.searchQueries.some((query) => /received 82 out of 100|lost 18 units|payout seems low|understand this settlement report|received less than shipped/i.test(query)));
   assert.ok(plan.mustMatchAny.some((term) => /reimbursement|inventory|fees|profit|settlement/i.test(term)));
 });
 
@@ -80,4 +81,15 @@ test('buildSkillDecisionContext loads related amazon skills as policy', async ()
   assert.ok(policy.loadedSkillIds.includes('amazon_expert'));
   assert.ok(policy.searchThemes.some((item) => /reimbursement|inventory|fees|settlement/i.test(item)));
   assert.ok(policy.leadSignals.some((item) => /profit|fees|inventory|reimbursement/i.test(item)));
+});
+
+test('buildSkillDecisionContext produces short human seller symptom queries', async () => {
+  const policy = await buildSkillDecisionContext({
+    objective: 'find amazon sellers confused about missing units and low payout',
+    activeSkill: 'amazon_hidden_money',
+    family: 'business_scan',
+  });
+
+  assert.ok(policy.symptomQueries.some((item) => /received 82 out of 100|lost 18 units|missing inventory amazon|received less than shipped/i.test(item)));
+  assert.ok(policy.symptomQueries.some((item) => /payout seems low|understand this settlement report|is this normal amazon fba/i.test(item)));
 });

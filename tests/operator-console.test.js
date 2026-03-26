@@ -6,6 +6,7 @@ const assert = require('node:assert/strict');
 const {
   inferIntentHeuristically,
   inferPlatformScopedIntent,
+  inspectSemanticLeadSignals,
   looksLikeDraftApproval,
   resolveNamedGroup,
   routeOperatorIntent,
@@ -288,4 +289,16 @@ test('platform scoped reddit scan maps search-for-help requests to reddit', () =
   );
   assert.equal(intent?.tool, 'reddit_scan_posts');
   assert.match(intent?.args?.topic || '', /recover/i);
+});
+
+test('semantic lead inspection catches seller confusion and payout pain as warm trigger', () => {
+  const result = inspectSemanticLeadSignals(
+    'Can someone explain why my Amazon payout is lower than expected? This settlement report does not make sense.',
+    ['settlement', 'payout']
+  );
+
+  assert.ok(result.matchedSignals.includes('settlement_confusion'));
+  assert.ok(result.matchedSignals.includes('seller_confusion'));
+  assert.equal(result.warmTrigger, true);
+  assert.ok(result.score >= 3);
 });

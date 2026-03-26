@@ -123,3 +123,20 @@ test('isVisiblePostCandidate allows lighter facebook search-result cards', () =>
     true
   );
 });
+
+test('isVisiblePostCandidate keeps partial-confidence business candidates with pain signals', () => {
+  assert.equal(
+    isVisiblePostCandidate({
+      authorName: '',
+      bodyText: 'amazon fees are too high and payout looks wrong',
+      actionControlCount: 1,
+      timestampText: '',
+      validationMode: 'business',
+      controlNames: ['like'],
+      fallbackUsed: true,
+      painSignalCount: 2,
+      pageMode: 'group_feed',
+    }),
+    true
+  );
+});

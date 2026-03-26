@@ -765,7 +765,13 @@ function buildSymptomQueriesFromSignals(signals = []) {
         'amazon received fewer units than shipped',
         'missing units amazon fba',
         'amazon lost inventory what do i do',
-        'amazon warehouse lost my inventory'
+        'amazon warehouse lost my inventory',
+        'amazon received 82 out of 100',
+        'amazon lost 18 units',
+        'am i missing inventory amazon',
+        'where did my inventory go amazon',
+        'amazon says received less than shipped',
+        'amazon checked in fewer units'
       );
     }
     if (/fees|fba fees|incorrect fees|overcharging/.test(text)) {
@@ -773,28 +779,34 @@ function buildSymptomQueriesFromSignals(signals = []) {
         'why is my amazon profit low',
         'amazon fees too high',
         'fba fee error',
-        'amazon overcharging fees'
+        'amazon overcharging fees',
+        'is this normal amazon fba'
       );
     }
     if (/reimbursement/.test(text)) {
       results.push(
         'amazon reimbursement not received',
         'missing reimbursement amazon fba',
-        'how does amazon reimbursement work'
+        'how does amazon reimbursement work',
+        'is this normal amazon fba'
       );
     }
     if (/settlement|payout|payout numbers|payout mismatch/.test(text)) {
       results.push(
         'amazon payout lower than expected',
         'can someone explain settlement report',
-        'amazon settlement report does not make sense'
+        'amazon settlement report does not make sense',
+        'amazon payout seems low',
+        'anyone understand this settlement report'
       );
     }
     if (/profit|margin|money is leaking|margins dropped/.test(text)) {
       results.push(
         'why is my amazon profit low',
         'amazon margins dropped suddenly',
-        'amazon sales good but profit low'
+        'amazon sales good but profit low',
+        'amazon payout seems low',
+        'is this normal amazon fba'
       );
     }
   }

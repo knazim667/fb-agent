@@ -105,8 +105,12 @@ async function loadSkillCatalog() {
 
   for (const entry of files) {
     const filePath = path.join(SKILLS_DIR, entry.name);
-    const content = await fs.readFile(filePath, 'utf8');
-    catalog.push(parseSkillMetadata(entry, content));
+    try {
+      const content = await fs.readFile(filePath, 'utf8');
+      catalog.push(parseSkillMetadata(entry, content));
+    } catch (_error) {
+      // Ignore files that were removed mid-scan by parallel tests or skill refreshes.
+    }
   }
 
   return catalog;

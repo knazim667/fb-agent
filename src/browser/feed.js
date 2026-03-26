@@ -33,6 +33,8 @@ function isVisiblePostCandidate({
   validationMode = 'engagement',
   controlNames = [],
   pageMode = 'feed',
+  fallbackUsed = false,
+  painSignalCount = 0,
 } = {}) {
   const normalizedAuthor = String(authorName || '').trim();
   const normalizedBody = String(bodyText || '').trim();
@@ -46,7 +48,11 @@ function isVisiblePostCandidate({
   const hasReply = names.includes('reply');
 
   const minBodyLength = pageMode === 'search_results' ? 8 : 15;
-  if (normalizedBody.length < minBodyLength) {
+  const fallbackMinBodyLength = pageMode === 'search_results' ? 8 : 12;
+  const bodyPasses = normalizedBody.length >= minBodyLength
+    || (fallbackUsed && normalizedBody.length >= fallbackMinBodyLength)
+    || (fallbackUsed && painSignalCount > 0 && normalizedBody.length >= 8);
+  if (!bodyPasses) {
     return false;
   }
 
@@ -55,16 +61,18 @@ function isVisiblePostCandidate({
       return false;
     }
     if (!(hasComment || hasShare || hasReply || actionControlCount >= 2)) {
-      return false;
+      if (!(fallbackUsed && painSignalCount > 0 && actionControlCount >= 1)) {
+        return false;
+      }
     }
-    return Boolean(normalizedAuthor || normalizedTimestamp);
+    return Boolean(normalizedAuthor || normalizedTimestamp || painSignalCount > 0);
   }
 
   if (!hasLike && actionControlCount < 1) {
     return false;
   }
 
-  return Boolean(normalizedAuthor || normalizedTimestamp);
+  return Boolean(normalizedAuthor || normalizedTimestamp || fallbackUsed || painSignalCount > 0);
 }
 
 function createFeedApi({
@@ -352,6 +360,87 @@ function createFeedApi({
         return texts.join('\n').trim();
       }
 
+      function stripUiNoiseFromText(text) {
+        return normalize(
+          String(text || '')
+            .replace(/\b(?:Like|Comment|Share|Reply|Follow|See more|Top contributor|Write a comment|Leave a comment|View more answers|Write an answer|Send message|Message)\b/gi, ' ')
+            .replace(/\b(?:Most relevant|Public group|Suggested for you)\b/gi, ' ')
+            .replace(/\s+/g, ' ')
+        );
+      }
+
+      function cleanFallbackArticleText(text) {
+        const lines = String(text || '')
+          .split('\n')
+          .map((line) => stripUiNoiseFromText(line))
+          .filter(Boolean);
+        const uniqueLines = [];
+        const seen = new Set();
+        for (const line of lines) {
+          const key = line.toLowerCase();
+          if (seen.has(key)) {
+            continue;
+          }
+          seen.add(key);
+          uniqueLines.push(line);
+        }
+        return uniqueLines.join('\n').trim();
+      }
+
+      function extractFullVisibleArticleText(article) {
+        const texts = [];
+        const seen = new Set();
+        const nodes = Array.from(article.querySelectorAll('div, span, p, a, strong'));
+        for (const node of nodes) {
+          if (!isVisible(node)) {
+            continue;
+          }
+          if (node.closest('form, [role="textbox"], [aria-label*="Comment"], [aria-label*="Reply"]')) {
+            continue;
+          }
+          const text = normalize(node.innerText);
+          if (!text || text.length < 2) {
+            continue;
+          }
+          if (looksLikeTimestamp(text)) {
+            continue;
+          }
+          const cleaned = stripUiNoiseFromText(text);
+          if (!cleaned || cleaned.length < 2) {
+            continue;
+          }
+          const key = cleaned.toLowerCase();
+          if (seen.has(key)) {
+            continue;
+          }
+          seen.add(key);
+          texts.push(cleaned);
+        }
+        return texts.join('\n').trim();
+      }
+
+      function countPainSignals(text) {
+        const normalized = String(text || '').toLowerCase();
+        if (!normalized) {
+          return 0;
+        }
+        const patterns = [
+          /\breimburse(?:ment|ments)?\b/g,
+          /\blost inventory\b/g,
+          /\bmissing inventory\b/g,
+          /\bmissing units?\b/g,
+          /\bfees?\b/g,
+          /\blow profit\b/g,
+          /\bmargins?\b/g,
+          /\bsettlement\b/g,
+          /\bpayout\b/g,
+          /\bdiscrepanc(?:y|ies)\b/g,
+          /\bowe(?:s|d)? me money\b/g,
+          /\bprofit\b/g,
+        ];
+        return patterns.reduce((count, pattern) => count + ((normalized.match(pattern) || []).length > 0 ? 1 : 0), 0);
+      }
+
       function getTopLevelArticles(root) {
         const container = root || document.body;
         const articles = Array.from(container.querySelectorAll('div[role="article"]'));
@@ -464,11 +553,30 @@ function createFeedApi({
 
         const headerBottom = findHeaderBoundary(article, authorNode, timestampNode);
         const actionTop = findActionBarTop(article, actionControls);
-        const mainBodyText = extractMainBodyText(article, headerBottom, actionTop)
-          || extractDeepArticleText(article, actionTop);
+        const structuredBodyText = extractMainBodyText(article, headerBottom, actionTop);
+        const deepBodyText = structuredBodyText
+          ? ''
+          : extractDeepArticleText(article, actionTop);
+        const rawFallbackArticleText = (structuredBodyText || deepBodyText)
+          ? ''
+          : extractFullVisibleArticleText(article);
+        const rawText = structuredBodyText || deepBodyText || rawFallbackArticleText;
+        const cleanedFallbackText = rawFallbackArticleText ? cleanFallbackArticleText(rawFallbackArticleText) : '';
+        const mainBodyText = structuredBodyText || deepBodyText || cleanedFallbackText;
+        const fallbackUsed = !structuredBodyText && Boolean(deepBodyText || cleanedFallbackText);
         const minBodyLength = pageMode === 'search_results' ? 8 : 15;
-        if (!mainBodyText || mainBodyText.length < minBodyLength) {
-          reject(articleIndex, 'no_body_between_header_and_action_bar', '', article);
+        const rawTextLength = normalize(rawText).length;
+        const cleanedTextLength = normalize(mainBodyText).length;
+        const painSignalCount = countPainSignals(mainBodyText);
+        const hasMeaningfulFallbackText = fallbackUsed
+          && (cleanedTextLength >= Math.max(10, minBodyLength - 3) || painSignalCount > 0);
+        if ((!mainBodyText || cleanedTextLength < minBodyLength) && !hasMeaningfulFallbackText) {
+          reject(
+            articleIndex,
+            'no_body_between_header_and_action_bar',
+            `raw_len=${rawTextLength};clean_len=${cleanedTextLength};fallback=${fallbackUsed ? 'yes' : 'no'};signals=${painSignalCount}`,
+            article
+          );
           continue;
         }
 
@@ -481,11 +589,13 @@ function createFeedApi({
           validationMode,
           controlNames,
           pageMode,
+          fallbackUsed,
+          painSignalCount,
         })) {
           reject(
             articleIndex,
             'invalid_visible_post_candidate',
-            `mode=${validationMode};controls=${controlNames.join(',') || 'none'};body_len=${mainBodyText.length}`,
+            `mode=${validationMode};controls=${controlNames.join(',') || 'none'};body_len=${cleanedTextLength};raw_len=${rawTextLength};fallback=${fallbackUsed ? 'yes' : 'no'};signals=${painSignalCount}`,
             article
           );
           continue;
@@ -506,6 +616,11 @@ function createFeedApi({
           anchorConfidence: timestampConfidence,
           selectorId,
           controlNames,
+          extractionConfidence: fallbackUsed ? 'partial' : 'structured',
+          fallbackUsed,
+          rawTextLength,
+          cleanedTextLength,
+          painSignalCount,
         });
 
         if (anchors.length >= limit) {
@@ -591,6 +706,11 @@ function createFeedApi({
         selectorId: rawAnchor.selectorId || '',
         controlNames: Array.isArray(rawAnchor.controlNames) ? rawAnchor.controlNames : [],
         summary: rawAnchor.postText.split('\n')[0].slice(0, 180),
+        extractionConfidence: rawAnchor.extractionConfidence || 'structured',
+        fallbackUsed: Boolean(rawAnchor.fallbackUsed),
+        rawTextLength: Number(rawAnchor.rawTextLength || 0),
+        cleanedTextLength: Number(rawAnchor.cleanedTextLength || 0),
+        painSignalCount: Number(rawAnchor.painSignalCount || 0),
       });
 
       if (anchors.length >= limit) {
