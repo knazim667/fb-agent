@@ -193,6 +193,20 @@ test('heuristic router maps platform switch to reddit', () => {
   assert.deepEqual(inferIntentHeuristically('go to reddit'), { type: 'switch_platform', platform: 'reddit' });
 });
 
+test('heuristic router maps embedded platform switch to reddit', () => {
+  assert.deepEqual(
+    inferIntentHeuristically('you are on facebook, switch to reddit'),
+    { type: 'switch_platform', platform: 'reddit' }
+  );
+});
+
+test('heuristic router maps reddit login inspection', () => {
+  assert.deepEqual(
+    inferIntentHeuristically('are you login on reddit'),
+    { type: 'inspect_platform', platform: 'reddit' }
+  );
+});
+
 test('heuristic router maps subreddit post listing', () => {
   const intent = inferIntentHeuristically('show me 10 recent posts from r/FulfillmentByAmazon');
   assert.equal(intent.type, 'reddit_show_posts');
@@ -227,4 +241,22 @@ test('platform scoped reddit scan is ignored outside reddit', () => {
     { currentPlatform: 'facebook' }
   );
   assert.equal(intent, null);
+});
+
+test('platform scoped reddit scan maps lead-finding requests to reddit', () => {
+  const intent = inferPlatformScopedIntent(
+    'find leads about our amazon hidden money business',
+    { currentPlatform: 'reddit' }
+  );
+  assert.equal(intent?.tool, 'reddit_scan_posts');
+  assert.match(intent?.args?.topic || '', /amazon hidden money/i);
+});
+
+test('platform scoped reddit scan maps search-for-help requests to reddit', () => {
+  const intent = inferPlatformScopedIntent(
+    'search reddit on our amazon hidden money business, maybe somebody is looking for help to recover his money',
+    { currentPlatform: 'reddit' }
+  );
+  assert.equal(intent?.tool, 'reddit_scan_posts');
+  assert.match(intent?.args?.topic || '', /recover/i);
 });

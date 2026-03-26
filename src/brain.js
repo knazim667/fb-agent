@@ -695,6 +695,214 @@ function buildObjectiveChecklist(family, objective = '') {
   ];
 }
 
+function uniqueStrings(values = []) {
+  const seen = new Set();
+  const unique = [];
+  for (const value of values) {
+    const normalized = String(value || '').trim();
+    const key = normalized.toLowerCase();
+    if (!normalized || seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    unique.push(normalized);
+  }
+  return unique;
+}
+
+function extractSearchTerms(text = '') {
+  const stopWords = new Set([
+    'about', 'our', 'the', 'and', 'for', 'with', 'this', 'that', 'from', 'into', 'your',
+    'business', 'posts', 'post', 'find', 'related', 'reddit', 'group', 'groups', 'need',
+    'somebody', 'maybe', 'looking', 'help', 'search', 'scan', 'show', 'give', 'lead', 'leads',
+  ]);
+  return uniqueStrings(
+    (String(text || '').toLowerCase().match(/[a-z0-9]{3,}/gi) || [])
+      .filter((term) => !stopWords.has(term))
+  );
+}
+
+function buildHeuristicSearchPlan({
+  objective = '',
+  family = '',
+  relevantSkill = '',
+  topic = '',
+} = {}) {
+  const normalized = String(objective || '').toLowerCase();
+  const searchQueries = [];
+  const mustMatchAny = [];
+  let intent = family === 'drafting' ? 'draft' : family === 'general_engagement' ? 'engage' : 'find_leads';
+  let resolvedTopic = String(topic || '').trim();
+
+  const isAmazonHiddenMoney =
+    relevantSkill === 'amazon_hidden_money'
+    || /amazon hidden money|reimbursement|settlement|lost inventory|missing inventory|fees?\s+too\s+high|low profit|margins?|fee errors?/i.test(normalized);
+
+  if (isAmazonHiddenMoney) {
+    resolvedTopic = resolvedTopic || 'Amazon seller money leaks and recovery pain points';
+    intent = 'find_leads';
+    searchQueries.push(
+      'amazon reimbursement help',
+      'amazon lost inventory',
+      'amazon missing reimbursement',
+      'amazon fees too high',
+      'amazon low profit fba',
+      'amazon settlement confusion',
+      'fba inventory reimbursement',
+      'amazon margin problem'
+    );
+    mustMatchAny.push(
+      'reimbursement',
+      'reimbursements',
+      'lost inventory',
+      'missing inventory',
+      'fees',
+      'fee',
+      'low profit',
+      'profit',
+      'margin',
+      'settlement'
+    );
+  }
+
+  if (/\blow profit\b|\bprofit\b|\bmargins?\b/.test(normalized)) {
+    searchQueries.push('amazon low profit', 'amazon margin problem', 'fba low margins');
+    mustMatchAny.push('low profit', 'profit', 'margin', 'margins');
+  }
+
+  if (/\breimburse/i.test(normalized)) {
+    searchQueries.push('amazon reimbursement help', 'amazon reimbursement missing');
+    mustMatchAny.push('reimbursement', 'reimbursements');
+  }
+
+  if (/\binventory\b/.test(normalized)) {
+    searchQueries.push('amazon lost inventory', 'fba inventory reimbursement');
+    mustMatchAny.push('inventory', 'lost inventory', 'missing inventory');
+  }
+
+  if (/\bfees?\b/.test(normalized)) {
+    searchQueries.push('amazon fees too high', 'fba fee problem');
+    mustMatchAny.push('fees', 'fee');
+  }
+
+  if (!searchQueries.length) {
+    const terms = extractSearchTerms(objective);
+    const compact = terms.slice(0, 5).join(' ');
+    if (compact) {
+      searchQueries.push(compact);
+      mustMatchAny.push(...terms.slice(0, 6));
+      resolvedTopic = resolvedTopic || compact;
+    }
+  }
+
+  return {
+    intent,
+    topic: resolvedTopic || String(objective || '').trim(),
+    searchQueries: uniqueStrings(searchQueries).slice(0, 6),
+    mustMatchAny: uniqueStrings(mustMatchAny).slice(0, 10),
+  };
+}
+
+async function interpretObjectiveForBrowser({
+  objective,
+  currentPlatform = 'facebook',
+  currentSurface = '',
+  relevantSkill = '',
+  skillContent = '',
+  family = '',
+  topic = '',
+} = {}, options = {}) {
+  const normalizedObjective = String(objective || '').trim();
+  const resolvedFamily = family || inferObjectiveFamily(normalizedObjective);
+  const persona = await readPersonaProfile().catch(() => '');
+  const insights = await readAgentInsights().catch(() => '');
+  const heuristic = buildHeuristicSearchPlan({
+    objective: normalizedObjective,
+    family: resolvedFamily,
+    relevantSkill,
+    topic,
+  });
+
+  if (options.disableModel) {
+    return {
+      objective: normalizedObjective,
+      family: resolvedFamily,
+      platform: currentPlatform,
+      surface: currentSurface,
+      relevantSkill,
+      ...heuristic,
+    };
+  }
+
+  const prompt = [
+    'Interpret this operator request for a browser agent before it touches the browser.',
+    'Translate the user meaning into a short browser-ready objective and search plan.',
+    'Return JSON only like {"intent":"find_leads|search_posts|engage|draft","topic":"string","search_queries":["..."],"must_match_any":["..."],"family":"business_scan|general_engagement|drafting","relevant_skill":"string","reason":"string"}.',
+    'Do not use the raw user sentence as the only search query unless it is already a good search query.',
+    'If the skill is Amazon Hidden Money Recovery, expand it into seller pain-point queries like reimbursements, inventory loss, fees, low profit, and settlement confusion.',
+    '',
+    `Current platform: ${currentPlatform}`,
+    `Current surface: ${currentSurface || 'unknown'}`,
+    `Relevant skill: ${relevantSkill || 'none'}`,
+    '',
+    'Persona:',
+    persona || 'No persona provided.',
+    '',
+    'Agent insights:',
+    insights || 'No agent insights yet.',
+    '',
+    'Skill content:',
+    skillContent || 'No skill content provided.',
+    '',
+    'Objective:',
+    normalizedObjective,
+  ].join('\n');
+
+  try {
+    const raw = await callOllama(prompt, {
+      ...options,
+      timeoutMs: options.timeoutMs || 20_000,
+      generationOptions: {
+        temperature: 0.1,
+        num_ctx: 3072,
+        num_predict: 220,
+        ...options.generationOptions,
+      },
+    });
+    const parsed = parseRelaxedJsonObject(raw);
+    if (parsed) {
+      const searchQueries = uniqueStrings(Array.isArray(parsed.search_queries) ? parsed.search_queries : []);
+      const mustMatchAny = uniqueStrings(Array.isArray(parsed.must_match_any) ? parsed.must_match_any : []);
+      return {
+        objective: normalizedObjective,
+        family: ['business_scan', 'general_engagement', 'drafting'].includes(String(parsed.family || '').trim())
+          ? String(parsed.family || '').trim()
+          : resolvedFamily,
+        platform: currentPlatform,
+        surface: currentSurface,
+        intent: String(parsed.intent || '').trim() || heuristic.intent,
+        topic: String(parsed.topic || '').trim() || heuristic.topic,
+        relevantSkill: String(parsed.relevant_skill || '').trim() || relevantSkill,
+        searchQueries: searchQueries.length ? searchQueries : heuristic.searchQueries,
+        mustMatchAny: mustMatchAny.length ? mustMatchAny : heuristic.mustMatchAny,
+        reason: String(parsed.reason || '').trim(),
+      };
+    }
+  } catch (_error) {
+    // Fall back to the heuristic plan below.
+  }
+
+  return {
+    objective: normalizedObjective,
+    family: resolvedFamily,
+    platform: currentPlatform,
+    surface: currentSurface,
+    relevantSkill,
+    ...heuristic,
+    reason: 'heuristic_search_plan',
+  };
+}
+
 async function planObjective({
   objective,
   context = {},
@@ -1020,6 +1228,7 @@ module.exports = {
   appendAgentInsights,
   callOllama,
   planObjective,
+  interpretObjectiveForBrowser,
   readPersonaProfile,
   readSkillFeedback,
   determineNextPhase,

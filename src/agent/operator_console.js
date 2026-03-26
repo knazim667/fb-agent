@@ -23,6 +23,7 @@ const TOOL_NAMES = [
   'reply_notification',
   'draft_post',
   'post_last_draft',
+  'inspect_platform',
   'reddit_show_posts',
   'reddit_search_posts',
   'reddit_scan_posts',
@@ -421,12 +422,20 @@ function inferIntentHeuristically(input) {
     return { type: 'exit' };
   }
 
-  if (/^(go to|switch to|use)\s+reddit$/.test(normalized)) {
+  if (/^(?:go to|switch to|swith to|use)\s+reddit\s*$/.test(normalized) || /\bswitch to\s+reddit\b/.test(normalized) || /\bswith to\s+reddit\b/.test(normalized)) {
     return { type: 'switch_platform', platform: 'reddit' };
   }
 
-  if (/^(go to|switch to|use)\s+facebook$/.test(normalized)) {
+  if (/^(?:go to|switch to|swith to|use)\s+facebook\s*$/.test(normalized) || /\bswitch to\s+facebook\b/.test(normalized) || /\bswith to\s+facebook\b/.test(normalized)) {
     return { type: 'switch_platform', platform: 'facebook' };
+  }
+
+  if (/\b(?:are you|am i|check|status)\b.*\blog(?:ged)?\s*in\b.*\breddit\b|\breddit\b.*\blog(?:ged)?\s*in\b/.test(normalized)) {
+    return { type: 'inspect_platform', platform: 'reddit' };
+  }
+
+  if (/\b(?:are you|am i|check|status)\b.*\blog(?:ged)?\s*in\b.*\bfacebook\b|\bfacebook\b.*\blog(?:ged)?\s*in\b/.test(normalized)) {
+    return { type: 'inspect_platform', platform: 'facebook' };
   }
 
   const redditSubredditMatch = String(input || '').match(/(?:show|give|list|find)\s+(?:me\s+)?(\d+)?\s*(?:recent|latest|top)?\s*posts?\s+(?:from|in)\s+r\/([a-z0-9_]+)/i);
@@ -640,6 +649,7 @@ function inferDirectActionIntent(input) {
   const intent = inferIntentHeuristically(input);
   const directTypes = new Set([
     'switch_platform',
+    'inspect_platform',
     'debug_mode',
     'list_groups',
     'check_notifications',
@@ -687,6 +697,19 @@ function inferPlatformScopedIntent(input, context = {}) {
     };
   }
 
+  if (
+    /\b(find|search|look|scan)\b/.test(normalized)
+    && /\b(leads?|help|people|content|money|recover|reimburse|reimbursement|profit|fees?|settlement|inventory)\b/.test(normalized)
+  ) {
+    return {
+      tool: 'reddit_scan_posts',
+      args: {
+        topic: String(input || '').trim(),
+        limit: Number((normalized.match(/\b(\d+)\s+(?:posts?|threads?)\b/i) || [])[1] || 0) || 10,
+      },
+    };
+  }
+
   return null;
 }
 
@@ -720,6 +743,7 @@ function plannerToolGuide() {
     '- reply_notification {"notification_index":number,"instructions":"optional"}',
     '- draft_post {"target":"feed|group","group_index":number,"group_name":"optional","topic":"optional"}',
     '- post_last_draft {}',
+    '- inspect_platform {"platform":"facebook|reddit"}',
     '- debug_mode {"enabled":true|false}',
     '- sync_groups {}',
     '- verify_pending_groups {}',
@@ -1064,6 +1088,45 @@ function keywordFilterPosts(posts, topic) {
   return matches;
 }
 
+function filterPostsBySignalTerms(posts = [], terms = []) {
+  const normalizedTerms = [...new Set(
+    (Array.isArray(terms) ? terms : [])
+      .map((term) => String(term || '').trim().toLowerCase())
+      .filter(Boolean)
+  )];
+
+  if (!normalizedTerms.length) {
+    return posts;
+  }
+
+  return posts.filter((post) => {
+    const haystack = String([
+      post.title || '',
+      post.content || '',
+      post.postText || '',
+    ].join(' ')).toLowerCase();
+    return normalizedTerms.some((term) => haystack.includes(term));
+  });
+}
+
+function dedupePostsByIdentity(posts = []) {
+  const seen = new Set();
+  const unique = [];
+  for (const post of posts) {
+    const key = String(
+      post.post_url
+        || post.post_id
+        || `${post.title || ''}|${excerpt(post.content || post.postText || '', 120)}`
+    ).trim().toLowerCase();
+    if (!key || seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    unique.push(post);
+  }
+  return unique;
+}
+
 function startOperatorConsole(deps) {
   const {
     page,
@@ -1104,6 +1167,7 @@ function startOperatorConsole(deps) {
     commentOnQualifiedPost,
     commentAnchoredPost,
     planObjective,
+    interpretObjectiveForBrowser,
     searchRedditPosts,
     inspectRedditSession,
     observeRedditPage,
@@ -1244,8 +1308,7 @@ function startOperatorConsole(deps) {
     const bodyText = await page.locator('body').innerText().catch(() => '');
     const normalizedBody = String(bodyText || '').toLowerCase();
     const composerVisible = await page.locator("div[role=\"dialog\"] div[role=\"textbox\"][contenteditable=\"true\"], div[role=\"textbox\"][contenteditable=\"true\"][aria-label*=\"Create\"], div[aria-label*=\"What's on your mind\"]").first().isVisible().catch(() => false);
-    const notificationsVisible = /\/notifications/i.test(url)
-      || await page.locator('[aria-label*="Notifications"], a[href*="/notifications"]').first().isVisible().catch(() => false);
+    const notificationsVisible = /\/notifications/i.test(url);
     const groupUrl = /\/groups\//i.test(url);
     const postDetail = /\/posts\/|story_fbid=|\/permalink\//i.test(url);
     const loginState = /checkpoint|login/i.test(url) || /log in|password|create new account|forgot password/i.test(normalizedBody);
@@ -1647,6 +1710,42 @@ function startOperatorConsole(deps) {
       return `Debug mode is now ${context.debugMode ? 'ON' : 'OFF'}.`;
     }
 
+    if (tool === 'inspect_platform') {
+      const requested = String(args.platform || context.currentPlatform || 'facebook').toLowerCase() === 'reddit'
+        ? 'reddit'
+        : 'facebook';
+
+      if (requested !== String(context.currentPlatform || 'facebook').toLowerCase()) {
+        if (requested === 'reddit') {
+          await lock.runExclusive('operator:inspect-switch-reddit', async () => {
+            await openRedditHome();
+          });
+        } else {
+          await lock.runExclusive('operator:inspect-switch-facebook', async () => {
+            await openHomeFeed();
+          });
+        }
+      }
+
+      const observation = await observePlatformPage();
+      await persistOperatorContext(state, upsertAgentState);
+
+      if (requested === 'reddit') {
+        if (observation?.state === 'reddit_login' || observation?.needsLogin) {
+          return 'Reddit is open, but you are not logged in yet. Please log in, then tell me what to do next.';
+        }
+        if (observation?.uncertain) {
+          return `Reddit is open, but I could not confirm the login state yet. Current page: ${observation?.state || 'unknown'}.`;
+        }
+        return `Reddit is open and looks logged in. Current page: ${observation?.state || 'unknown'}.`;
+      }
+
+      if (observation?.state === 'facebook_login') {
+        return 'Facebook is open, but it needs login or checkpoint review first.';
+      }
+      return `Facebook is open. Current page: ${observation?.state || 'unknown'}.`;
+    }
+
     if (tool === 'list_groups') {
       const requestedStatus = String(args.status || 'all').toLowerCase();
       const limit = Math.max(1, Math.min(Number(args.limit || 200), 500));
@@ -1929,11 +2028,37 @@ function startOperatorConsole(deps) {
 
       const topic = String(args.topic || '').trim();
       let observation = await observePlatformPage();
+      const objectiveProfile = topic && typeof interpretObjectiveForBrowser === 'function'
+        ? await interpretObjectiveForBrowser({
+            objective: topic,
+            currentPlatform: 'reddit',
+            currentSurface: observation?.state || context.currentSurface || '',
+            relevantSkill: skill?.id || '',
+            skillContent: skill?.content || '',
+            family: 'business_scan',
+          }, {
+            model,
+          }).catch(() => null)
+        : null;
       if (context.debugMode) {
         logDebug(
           context,
           `reddit observe: state=${observation?.state || 'unknown'} url=${observation?.url || page.url()} logged_in=${observation?.loggedIn ? 'yes' : 'no'} search_visible=${observation?.searchVisible ? 'yes' : 'no'}`
         );
+        if (objectiveProfile?.searchQueries?.length) {
+          logDebug(
+            context,
+            `reddit objective plan: topic=${objectiveProfile.topic || topic} queries=${objectiveProfile.searchQueries.join(' | ')} signals=${(objectiveProfile.mustMatchAny || []).join(', ')}`
+          );
+        }
+      }
+
+      if (observation?.state === 'reddit_login' || observation?.needsLogin) {
+        return 'Reddit is open, but you are not logged in yet. Please log in first, then tell me what to do next.';
+      }
+
+      if (observation?.state === 'reddit_home' && !topic) {
+        return 'I am on the Reddit home page right now. Tell me a subreddit like r/FulfillmentByAmazon or ask me to search Reddit for a topic.';
       }
 
       const plan = planNextAction({
@@ -1960,7 +2085,48 @@ function startOperatorConsole(deps) {
       let posts = currentPosts().filter((post) => String(post.platform || '').toLowerCase() === 'reddit');
       const currentUrl = page.url();
       const cachedUrl = String(context.lastObservedRedditUrl || '');
-      if (!posts.length || (currentUrl && cachedUrl && currentUrl !== cachedUrl)) {
+      const plannedQueries = Array.isArray(objectiveProfile?.searchQueries)
+        ? objectiveProfile.searchQueries.slice(0, 4)
+        : [];
+      if (topic && plannedQueries.length) {
+        const collectedPosts = [];
+        for (const query of plannedQueries) {
+          await lock.runExclusive('operator:reddit-plan-search-query', async () => {
+            await searchRedditPosts(query);
+          });
+          const verified = await verifyOutcome({
+            expectedStates: ['reddit_search_results', 'reddit_subreddit_feed', 'reddit_post_detail'],
+          });
+          observation = await observePlatformPage({
+            includePosts: true,
+            limit: Math.max(1, Number(args.limit || 10)),
+            scrollRounds: 2,
+          });
+          const queryPosts = Array.isArray(observation?.posts)
+            ? observation.posts.map((post) => ({
+                post_id: post.postId,
+                post_url: post.postUrl,
+                content: post.postText,
+                title: post.title,
+                author: post.authorName || 'Unknown',
+                visible_index: post.visibleIndex,
+                platform: 'reddit',
+                subreddit: post.subreddit || '',
+              }))
+            : [];
+          collectedPosts.push(...queryPosts);
+          if (context.debugMode) {
+            logDebug(
+              context,
+              `reddit search plan query="${query}" state=${observation?.state || 'unknown'} verify=${verified.ok ? 'ok' : 'mismatch'} cards=${observation?.postsDebug?.articleCount || observation?.articleCount || 0} kept=${queryPosts.length}`
+            );
+          }
+        }
+        posts = dedupePostsByIdentity(collectedPosts);
+        context.lastPosts = posts;
+        context.lastObservedRedditUrl = observation?.url || page.url();
+        await persistOperatorContext(state, upsertAgentState);
+      } else if (!posts.length || (currentUrl && cachedUrl && currentUrl !== cachedUrl)) {
         observation = await observePlatformPage({
           includePosts: true,
           limit: Math.max(1, Number(args.limit || 10)),
@@ -1987,21 +2153,26 @@ function startOperatorConsole(deps) {
         await persistOperatorContext(state, upsertAgentState);
       }
 
-      const keywordMatched = topic ? keywordFilterPosts(posts, topic) : posts;
+      const signalMatched = objectiveProfile?.mustMatchAny?.length
+        ? filterPostsBySignalTerms(posts, objectiveProfile.mustMatchAny)
+        : posts;
+      const keywordMatched = topic
+        ? keywordFilterPosts(signalMatched, objectiveProfile?.topic || topic)
+        : signalMatched;
       const filtered = topic && keywordMatched.length
-        ? await filterPostsByTopic(keywordMatched, topic, callOllama, model)
+        ? await filterPostsByTopic(keywordMatched, objectiveProfile?.topic || topic, callOllama, model)
         : keywordMatched;
       const limit = Math.max(1, Number(args.limit || filtered.length || 10));
 
       if (!filtered.length) {
         return topic
-          ? `I checked the current Reddit posts but found nothing clearly related to "${topic}".`
+          ? `I checked Reddit but found nothing clearly related to "${objectiveProfile?.topic || topic}".`
           : 'I checked the current Reddit posts, but I could not find visible posts right now.';
       }
 
       return formatOriginalPosts(
         filtered.slice(0, limit),
-        topic ? `Matched Reddit posts for "${topic}"` : 'Visible Reddit posts'
+        topic ? `Matched Reddit posts for "${objectiveProfile?.topic || topic}"` : 'Visible Reddit posts'
       );
     }
 
@@ -2577,6 +2748,18 @@ function startOperatorConsole(deps) {
       };
     }
 
+    if (routed.type === 'inspect_platform') {
+      return {
+        assistantReply: '',
+        actions: [{
+          tool: 'inspect_platform',
+          args: {
+            platform: routed.platform || context.currentPlatform || 'facebook',
+          },
+        }],
+      };
+    }
+
     if (routed.type === 'reddit_show_posts') {
       return {
         assistantReply: '',
@@ -2702,6 +2885,18 @@ function startOperatorConsole(deps) {
     }
 
     if (routed.type === 'scan') {
+      if (String(context.currentPlatform || 'facebook').toLowerCase() === 'reddit') {
+        return {
+          assistantReply: '',
+          actions: [{
+            tool: 'reddit_scan_posts',
+            args: {
+              topic: String(raw || '').trim(),
+              limit: 10,
+            },
+          }],
+        };
+      }
       return { assistantReply: '', actions: [{ tool: 'scan_joined_groups', args: {} }] };
     }
 
