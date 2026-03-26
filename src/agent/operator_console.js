@@ -29,6 +29,7 @@ const TOOL_NAMES = [
   'reddit_search_posts',
   'reddit_scan_posts',
   'debug_mode',
+  'dry_run_mode',
   'sync_groups',
   'verify_pending_groups',
   'help',
@@ -41,6 +42,7 @@ function ensureOperatorContext(state) {
     state.operatorContext = {
       executionMode: 'confirm',
       debugMode: false,
+      dryRunMode: false,
       currentPlatform: 'facebook',
       currentSurface: 'group',
       currentGroup: null,
@@ -50,6 +52,7 @@ function ensureOperatorContext(state) {
       lastDraft: null,
       lastObservedRedditUrl: '',
       lastObservedFacebookUrl: '',
+      sessionLogPath: '',
       conversationHistory: [],
     };
   }
@@ -70,6 +73,7 @@ function ensureOperatorContext(state) {
 }
 
 const STALL_LOG_DIR = path.join(__dirname, '..', '..', 'logs', 'stalls');
+const SESSION_LOG_DIR = path.join(__dirname, '..', '..', 'logs', 'operator_sessions');
 
 async function persistOperatorContext(state, upsertAgentState) {
   if (typeof upsertAgentState !== 'function') {
@@ -80,6 +84,7 @@ async function persistOperatorContext(state, upsertAgentState) {
   await upsertAgentState('operator_context', {
     executionMode: context.executionMode,
     debugMode: Boolean(context.debugMode),
+    dryRunMode: Boolean(context.dryRunMode),
     currentPlatform: context.currentPlatform || 'facebook',
     currentSurface: context.currentSurface || 'group',
     currentGroup: context.currentGroup,
@@ -89,6 +94,7 @@ async function persistOperatorContext(state, upsertAgentState) {
     lastDraft: context.lastDraft,
     lastObservedRedditUrl: context.lastObservedRedditUrl || '',
     lastObservedFacebookUrl: context.lastObservedFacebookUrl || '',
+    sessionLogPath: context.sessionLogPath || '',
     conversationHistory: context.conversationHistory.slice(-12),
   });
 }
@@ -154,7 +160,11 @@ function formatOriginalPosts(posts = [], title = 'Original posts') {
       const number = post.visible_index || index + 1;
       const author = post.title || post.author || 'Unknown';
       const summary = excerpt(post.content || post.postText || '', 220);
-      return `Post #${number}: ${author}\n   ${summary}`;
+      const meta = [
+        post.relevance_score != null ? `score ${post.relevance_score}/10` : '',
+        post.lead_temperature ? post.lead_temperature.toLowerCase() : '',
+      ].filter(Boolean).join(' | ');
+      return `Post #${number}: ${author}${meta ? ` [${meta}]` : ''}\n   ${summary}`;
     }),
   ].join('\n');
 }
@@ -419,6 +429,14 @@ function inferIntentHeuristically(input) {
     return { type: 'debug_mode', enabled: false };
   }
 
+  if (normalized === 'dry run on') {
+    return { type: 'dry_run_mode', enabled: true };
+  }
+
+  if (normalized === 'dry run off') {
+    return { type: 'dry_run_mode', enabled: false };
+  }
+
   if (normalized === 'exit' || normalized === 'quit') {
     return { type: 'exit' };
   }
@@ -656,6 +674,7 @@ function inferDirectActionIntent(input) {
     'switch_platform',
     'inspect_platform',
     'debug_mode',
+    'dry_run_mode',
     'help',
     'exit',
   ]);
@@ -1138,6 +1157,53 @@ function dedupePostsByIdentity(posts = []) {
   return unique;
 }
 
+function looksLikeDraftApproval(input = '') {
+  const normalized = String(input || '').trim().toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+  return [
+    /\bi confirm\b.*\b(post|publish)\b/,
+    /\byes\b.*\b(post|publish)\b/,
+    /\bpublish it\b/,
+    /\bpost it\b/,
+    /\bpost the last draft\b/,
+    /\bpublish the last draft\b/,
+    /^\s*approved\s*$/i,
+    /^\s*go ahead\s*$/i,
+    /^\s*yes\s*$/i,
+  ].some((pattern) => pattern.test(normalized));
+}
+
+function summarizeSkillInfluence(objectiveProfile = null) {
+  const policy = objectiveProfile?.skillPolicy || {};
+  const skillIds = Array.isArray(policy.loadedSkillIds) ? policy.loadedSkillIds : [];
+  if (!skillIds.length) {
+    return 'none';
+  }
+  return skillIds.join(', ');
+}
+
+function renderDryRunPreview({
+  title = 'Dry run preview',
+  items = [],
+  fallback = 'No candidate available for dry run.',
+} = {}) {
+  if (!Array.isArray(items) || !items.length) {
+    return fallback;
+  }
+
+  return [
+    title,
+    ...items.map((item, index) => [
+      `${index + 1}. ${item.label || 'Candidate'}`,
+      `   Lead temperature: ${item.temperature || 'unknown'}`,
+      `   Why: ${item.reason || 'No reason captured yet.'}`,
+      `   Intended action: ${item.action || 'continue browsing'}`,
+    ].join('\n')),
+  ].join('\n');
+}
+
 function startOperatorConsole(deps) {
   const {
     page,
@@ -1209,6 +1275,30 @@ function startOperatorConsole(deps) {
   const ask = (question) => new Promise((resolve) => rl.question(question, resolve));
   const context = ensureOperatorContext(state);
   let busy = false;
+  const sessionId = new Date().toISOString().replace(/[:.]/g, '-');
+  const sessionLogPath = path.join(SESSION_LOG_DIR, `session_${sessionId}.jsonl`);
+  context.sessionLogPath = sessionLogPath;
+  let sessionLogQueue = Promise.resolve();
+
+  function queueSessionEvent(type, payload = {}) {
+    sessionLogQueue = sessionLogQueue
+      .then(async () => {
+        await fs.mkdir(SESSION_LOG_DIR, { recursive: true });
+        const entry = {
+          ts: new Date().toISOString(),
+          type,
+          payload,
+        };
+        await fs.appendFile(sessionLogPath, `${JSON.stringify(entry)}\n`, 'utf8');
+      })
+      .catch(() => {});
+    return sessionLogQueue;
+  }
+
+  function traceDebug(message, extra = {}) {
+    logDebug(context, message);
+    void queueSessionEvent('debug', { message, ...extra });
+  }
 
   async function maybeConfirm(label) {
     if (context.executionMode === 'execute') {
@@ -1226,8 +1316,35 @@ function startOperatorConsole(deps) {
   async function storeDraft(draft) {
     context.lastDraft = {
       ...draft,
+      status: draft.status || 'pending_approval',
+      approvalStatus: draft.approvalStatus || 'pending',
       createdAt: new Date().toISOString(),
     };
+    await persistOperatorContext(state, upsertAgentState);
+  }
+
+  async function updateDraftState(patch = {}) {
+    if (!context.lastDraft) {
+      return;
+    }
+    context.lastDraft = {
+      ...context.lastDraft,
+      ...patch,
+      updatedAt: new Date().toISOString(),
+    };
+    if (context.debugMode) {
+      traceDebug(
+        `draft transition: status=${context.lastDraft.status || ''} approval=${context.lastDraft.approvalStatus || ''} workflow=${context.lastDraft.workflowState || ''}`
+      );
+    }
+    void queueSessionEvent('draft_state_transition', {
+      kind: context.lastDraft.kind || 'unknown',
+      status: context.lastDraft.status || '',
+      approvalStatus: context.lastDraft.approvalStatus || '',
+      workflowState: context.lastDraft.workflowState || '',
+      target: context.lastDraft.target || null,
+      lastError: context.lastDraft.lastError || '',
+    });
     await persistOperatorContext(state, upsertAgentState);
   }
 
@@ -1430,11 +1547,19 @@ function startOperatorConsole(deps) {
     const observedPlatform = observation?.platform
       || ((observation?.state || '').startsWith('reddit_') ? 'reddit' : 'facebook');
     const targetPlatform = explicitPlatform || observedPlatform || String(context.currentPlatform || 'facebook').toLowerCase();
-    const searchLike = /\b(search|find|scan|look)\b/.test(normalized);
+    const searchLike = /\b(search|find|scan|look|explore|browse)\b/.test(normalized);
 
     if (!searchLike) {
       return null;
     }
+
+    const searchPasses = Array.isArray(objectiveProfile?.searchPasses)
+      ? objectiveProfile.searchPasses
+      : [];
+    const flattenedQueries = searchPasses.flatMap((item) => Array.isArray(item?.queries) ? item.queries : []);
+    const searchQueries = flattenedQueries.length
+      ? flattenedQueries
+      : (Array.isArray(objectiveProfile?.searchQueries) ? objectiveProfile.searchQueries : []);
 
     if (targetPlatform === 'facebook') {
       return {
@@ -1443,9 +1568,11 @@ function startOperatorConsole(deps) {
           tool: 'facebook_search_posts',
           args: {
             topic: String(objectiveProfile?.topic || raw || '').trim(),
-            queries: Array.isArray(objectiveProfile?.searchQueries) ? objectiveProfile.searchQueries.slice(0, 4) : [],
+            queries: searchQueries.slice(0, 12),
+            search_passes: searchPasses,
             signals: Array.isArray(objectiveProfile?.mustMatchAny) ? objectiveProfile.mustMatchAny.slice(0, 10) : [],
             limit: 10,
+            skill_policy: objectiveProfile?.skillPolicy || null,
           },
         }],
       };
@@ -1634,6 +1761,12 @@ function startOperatorConsole(deps) {
         ranked.push({
           ...post,
           relevance_score: scoreResult?.score || 0,
+          lead_temperature: scoreResult?.lead_temperature || 'COLD',
+          recommended_action: scoreResult?.lead_temperature === 'HOT'
+            ? 'comment_publicly'
+            : scoreResult?.lead_temperature === 'WARM'
+              ? 'save_for_follow_up'
+              : 'ignore',
           _leadScore: scoreResult,
         });
       } catch (_error) {
@@ -1644,6 +1777,132 @@ function startOperatorConsole(deps) {
     return ranked
       .filter((post) => (post._leadScore ? post._leadScore.score >= 5 : true))
       .sort((left, right) => Number(right.relevance_score || 0) - Number(left.relevance_score || 0));
+  }
+
+  function formatLeadDecisionDebug(posts = []) {
+    return posts.slice(0, 10).map((post, index) => (
+      `candidate ${index + 1}: temp=${post.lead_temperature || 'unknown'} action=${post.recommended_action || 'none'} score=${post.relevance_score ?? 'n/a'} reason=${post._leadScore?.reason || 'n/a'}`
+    ));
+  }
+
+  async function exploreFacebookCommunitiesForLeads({
+    topic = '',
+    signals = [],
+    limit = 10,
+  } = {}) {
+    const groups = filterAmazonGroups(
+      await getGroupsByStatus('joined', { limit: 80 }),
+      isRelevantAmazonGroupName
+    ).sort((left, right) => activityAgeForGroup(left) - activityAgeForGroup(right));
+
+    const collected = [];
+    for (const group of groups.slice(0, 4)) {
+      await lock.runExclusive('operator:facebook-manual-group-explore', async () => {
+        await visitGroup(page, group.url);
+      });
+      context.currentPlatform = 'facebook';
+      context.currentSurface = 'facebook_group_feed';
+      context.currentGroup = group;
+      const observation = await observePlatformPage({
+        includePosts: true,
+        limit: Math.max(6, limit),
+        scrollRounds: 4,
+        validationMode: 'engagement',
+      });
+      if (context.debugMode) {
+        traceDebug(`facebook manual exploration group="${group.name}" skills=${summarizeSkillInfluence({ skillPolicy: { loadedSkillIds: [skill?.id].filter(Boolean) } })}`);
+        for (const line of formatFacebookObservationDebug(observation)) {
+          traceDebug(line);
+        }
+      }
+      const posts = Array.isArray(observation?.posts) ? observation.posts : [];
+      for (const post of posts) {
+        collected.push({
+          post_id: post.postId,
+          post_url: post.postUrl,
+          content: post.postText,
+          author: post.authorName || 'Unknown',
+          visible_index: post.visibleIndex,
+          selector_id: post.selectorId || '',
+          platform: 'facebook',
+          group: group.name || '',
+        });
+      }
+      if (collected.length >= limit * 2) {
+        break;
+      }
+    }
+
+    const deduped = dedupePostsByIdentity(collected);
+    const signalMatched = signals.length ? filterPostsBySignalTerms(deduped, signals) : deduped;
+    const keywordMatched = topic ? keywordFilterPosts(signalMatched, topic) : signalMatched;
+    const filtered = topic && keywordMatched.length
+      ? await filterPostsByTopic(keywordMatched, topic, callOllama, model)
+      : keywordMatched;
+    return rankPostsForBusinessTopic(filtered, topic);
+  }
+
+  function pickRelevantSubreddits({ topic = '', skillPolicy = null } = {}) {
+    const normalized = String(topic || '').toLowerCase();
+    const defaults = ['FulfillmentByAmazon', 'AmazonSeller', 'AmazonFBA', 'ecommerce'];
+    if (/amazon|fba|reimbursement|inventory|settlement|fees?|profit|margin/.test(normalized)
+      || Array.isArray(skillPolicy?.loadedSkillIds) && skillPolicy.loadedSkillIds.some((id) => /amazon/.test(id))) {
+      return defaults;
+    }
+    return ['entrepreneur', 'smallbusiness', 'ecommerce'];
+  }
+
+  async function exploreRedditCommunitiesForLeads({
+    topic = '',
+    signals = [],
+    limit = 10,
+    skillPolicy = null,
+  } = {}) {
+    const subreddits = pickRelevantSubreddits({ topic, skillPolicy }).slice(0, 4);
+    const collected = [];
+    for (const subreddit of subreddits) {
+      await lock.runExclusive('operator:reddit-manual-subreddit-explore', async () => {
+        await visitSubreddit(subreddit);
+      });
+      context.currentPlatform = 'reddit';
+      context.currentSurface = `reddit_subreddit_feed:${subreddit}`;
+      const observation = await observePlatformPage({
+        includePosts: true,
+        limit: Math.max(6, limit),
+        scrollRounds: 3,
+      });
+      if (context.debugMode) {
+        traceDebug(`reddit manual exploration subreddit="r/${subreddit}" skills=${summarizeSkillInfluence({ skillPolicy })}`);
+        traceDebug(
+          `reddit observe: state=${observation?.state || 'unknown'} url=${observation?.url || page.url()} cards=${observation?.postsDebug?.articleCount || observation?.articleCount || 0} kept=${Array.isArray(observation?.posts) ? observation.posts.length : 0}`,
+          { subreddit }
+        );
+      }
+      const posts = Array.isArray(observation?.posts) ? observation.posts : [];
+      for (const post of posts) {
+        collected.push({
+          post_id: post.postId,
+          post_url: post.postUrl,
+          content: post.postText,
+          title: post.title,
+          author: post.authorName || 'Unknown',
+          visible_index: post.visibleIndex,
+          platform: 'reddit',
+          subreddit: post.subreddit || subreddit,
+        });
+      }
+      if (collected.length >= limit * 2) {
+        break;
+      }
+    }
+
+    const deduped = dedupePostsByIdentity(collected);
+    const signalMatched = signals.length ? filterPostsBySignalTerms(deduped, signals) : deduped;
+    const keywordMatched = topic ? keywordFilterPosts(signalMatched, topic) : signalMatched;
+    const filtered = topic && keywordMatched.length
+      ? await filterPostsByTopic(keywordMatched, topic, callOllama, model)
+      : keywordMatched;
+    return rankPostsForBusinessTopic(filtered, topic);
   }
 
   async function resolvePostFromObservedContext(postIndex, { limit = 12 } = {}) {
@@ -1866,8 +2125,16 @@ function startOperatorConsole(deps) {
 
     if (tool === 'debug_mode') {
       context.debugMode = Boolean(args.enabled);
+      void queueSessionEvent('mode_change', { mode: 'debug', enabled: context.debugMode });
       await persistOperatorContext(state, upsertAgentState);
       return `Debug mode is now ${context.debugMode ? 'ON' : 'OFF'}.`;
+    }
+
+    if (tool === 'dry_run_mode') {
+      context.dryRunMode = Boolean(args.enabled);
+      void queueSessionEvent('mode_change', { mode: 'dry_run', enabled: context.dryRunMode });
+      await persistOperatorContext(state, upsertAgentState);
+      return `Dry-run mode is now ${context.dryRunMode ? 'ON' : 'OFF'}.`;
     }
 
     if (tool === 'inspect_platform') {
@@ -1909,46 +2176,84 @@ function startOperatorConsole(deps) {
     if (tool === 'facebook_search_posts') {
       const topic = String(args.topic || '').trim();
       const queries = Array.isArray(args.queries)
-        ? args.queries.map((query) => String(query || '').trim()).filter(Boolean).slice(0, 4)
+        ? args.queries.map((query) => String(query || '').trim()).filter(Boolean).slice(0, 12)
         : [];
+      const searchPasses = Array.isArray(args.search_passes) ? args.search_passes : [];
       const signals = Array.isArray(args.signals)
         ? args.signals.map((signal) => String(signal || '').trim()).filter(Boolean)
         : [];
-      const searchQueries = queries.length ? queries : [topic].filter(Boolean);
+      const skillPolicy = args.skill_policy && typeof args.skill_policy === 'object'
+        ? args.skill_policy
+        : null;
+      const searchQueries = queries.length
+        ? queries
+        : [topic].filter(Boolean);
 
       if (!searchQueries.length) {
         return 'I need a Facebook search topic first.';
       }
 
       const collectedPosts = [];
-      for (const query of searchQueries) {
-        await lock.runExclusive('operator:facebook-search-query', async () => {
-          await searchFacebookUi(query);
-        });
-        let observation = await observePlatformPage({
-          includePosts: true,
-          limit: Math.max(1, Number(args.limit || 10)),
-          scrollRounds: 4,
-          validationMode: 'business',
-        });
-        let queryPosts = Array.isArray(observation?.posts) ? observation.posts : [];
-        if (!queryPosts.length) {
-          await page.mouse.wheel(0, 500).catch(() => null);
-          await page.waitForTimeout(1_500);
-          observation = await observePlatformPage({
+      const groupedPasses = searchPasses.length
+        ? searchPasses
+        : [{ pass: 'exact_pain_terms', queries: searchQueries }];
+      for (const searchPass of groupedPasses) {
+        const passName = String(searchPass?.pass || 'search').trim() || 'search';
+        const passQueries = Array.isArray(searchPass?.queries) && searchPass.queries.length
+          ? searchPass.queries.map((query) => String(query || '').trim()).filter(Boolean)
+          : [];
+        if (!passQueries.length) {
+          continue;
+        }
+        if (context.debugMode) {
+          traceDebug(
+            `facebook search pass=${passName} skills=${summarizeSkillInfluence({ skillPolicy })} queries=${passQueries.join(' | ')}`
+          );
+        }
+        for (const query of passQueries) {
+          await lock.runExclusive('operator:facebook-search-query', async () => {
+            await searchFacebookUi(query);
+          });
+          let observation = await observePlatformPage({
             includePosts: true,
             limit: Math.max(1, Number(args.limit || 10)),
-            scrollRounds: 6,
-            validationMode: 'business',
+            scrollRounds: 4,
+            validationMode: 'engagement',
           });
-          queryPosts = Array.isArray(observation?.posts) ? observation.posts : [];
+          let queryPosts = Array.isArray(observation?.posts) ? observation.posts : [];
+          if (!queryPosts.length) {
+            await page.mouse.wheel(0, 500).catch(() => null);
+            await page.waitForTimeout(1_500);
+            observation = await observePlatformPage({
+              includePosts: true,
+              limit: Math.max(1, Number(args.limit || 10)),
+              scrollRounds: 6,
+              validationMode: 'engagement',
+            });
+            queryPosts = Array.isArray(observation?.posts) ? observation.posts : [];
+          }
+          collectedPosts.push(...queryPosts);
+          if (context.debugMode) {
+            traceDebug(`facebook search query="${query}"`, { pass: passName, query });
+            for (const line of formatFacebookObservationDebug(observation)) {
+              traceDebug(line, { pass: passName, query });
+            }
+          }
         }
-        collectedPosts.push(...queryPosts);
-        if (context.debugMode) {
-          logDebug(
-            context,
-            `facebook search query="${query}" state=${observation?.state || 'unknown'} url=${observation?.url || page.url()} cards=${observation?.postsDebug?.articleCount || 0} kept=${queryPosts.length}`
-          );
+        const quickRank = await rankPostsForBusinessTopic(
+          dedupePostsByIdentity(collectedPosts.map((post) => ({
+            post_id: post.postId,
+            post_url: post.postUrl,
+            content: post.postText,
+            author: post.authorName || 'Unknown',
+            visible_index: post.visibleIndex,
+            selector_id: post.selectorId || '',
+            platform: 'facebook',
+          }))),
+          topic
+        );
+        if (quickRank.length >= Math.max(2, Math.min(Number(args.limit || 10), 4))) {
+          break;
         }
       }
 
@@ -1966,13 +2271,26 @@ function startOperatorConsole(deps) {
       const filtered = topic && keywordMatched.length
         ? await filterPostsByTopic(keywordMatched, topic, callOllama, model)
         : keywordMatched;
-      const ranked = await rankPostsForBusinessTopic(filtered, topic);
+      let ranked = await rankPostsForBusinessTopic(filtered, topic);
+      if (!ranked.length) {
+        ranked = await exploreFacebookCommunitiesForLeads({
+          topic,
+          signals,
+          limit: Math.max(1, Number(args.limit || 10)),
+        });
+      }
 
       context.lastPosts = ranked;
       context.currentPlatform = 'facebook';
       context.currentSurface = 'facebook_search_results';
       context.lastObservedFacebookUrl = page.url();
       await persistOperatorContext(state, upsertAgentState);
+
+      if (context.debugMode && ranked.length) {
+        for (const line of formatLeadDecisionDebug(ranked)) {
+          traceDebug(line, { platform: 'facebook', topic });
+        }
+      }
 
       if (!ranked.length) {
         return `I searched Facebook but found nothing clearly related to "${topic || searchQueries[0]}".`;
@@ -2278,16 +2596,11 @@ function startOperatorConsole(deps) {
             model,
           }).catch(() => null)
         : null;
+      const skillPolicy = objectiveProfile?.skillPolicy || null;
       if (context.debugMode) {
-        logDebug(
-          context,
-          `reddit observe: state=${observation?.state || 'unknown'} url=${observation?.url || page.url()} logged_in=${observation?.loggedIn ? 'yes' : 'no'} search_visible=${observation?.searchVisible ? 'yes' : 'no'}`
-        );
+        traceDebug(`reddit observe: state=${observation?.state || 'unknown'} url=${observation?.url || page.url()} logged_in=${observation?.loggedIn ? 'yes' : 'no'} search_visible=${observation?.searchVisible ? 'yes' : 'no'}`);
         if (objectiveProfile?.searchQueries?.length) {
-          logDebug(
-            context,
-            `reddit objective plan: topic=${objectiveProfile.topic || topic} queries=${objectiveProfile.searchQueries.join(' | ')} signals=${(objectiveProfile.mustMatchAny || []).join(', ')}`
-          );
+          traceDebug(`reddit objective plan: topic=${objectiveProfile.topic || topic} queries=${objectiveProfile.searchQueries.join(' | ')} signals=${(objectiveProfile.mustMatchAny || []).join(', ')}`);
         }
       }
 
@@ -2316,48 +2629,52 @@ function startOperatorConsole(deps) {
         });
         observation = verified.observation;
         if (!verified.ok && context.debugMode) {
-          logDebug(context, `reddit verify: expected search/subreddit/detail but saw ${observation?.state || 'unknown'}`);
+          traceDebug(`reddit verify: expected search/subreddit/detail but saw ${observation?.state || 'unknown'}`);
         }
       }
 
       let posts = currentPosts().filter((post) => String(post.platform || '').toLowerCase() === 'reddit');
       const currentUrl = page.url();
       const cachedUrl = String(context.lastObservedRedditUrl || '');
-      const plannedQueries = Array.isArray(objectiveProfile?.searchQueries)
-        ? objectiveProfile.searchQueries.slice(0, 4)
+      const plannedPasses = Array.isArray(objectiveProfile?.searchPasses)
+        ? objectiveProfile.searchPasses
+            .filter((item) => Array.isArray(item?.queries) && item.queries.length)
+            .slice(0, 6)
         : [];
-      if (topic && plannedQueries.length) {
+      if (topic && plannedPasses.length) {
         const collectedPosts = [];
-        for (const query of plannedQueries) {
-          await lock.runExclusive('operator:reddit-plan-search-query', async () => {
-            await searchRedditPosts(query);
-          });
-          const verified = await verifyOutcome({
-            expectedStates: ['reddit_search_results', 'reddit_subreddit_feed', 'reddit_post_detail'],
-          });
-          observation = await observePlatformPage({
-            includePosts: true,
-            limit: Math.max(1, Number(args.limit || 10)),
-            scrollRounds: 2,
-          });
-          const queryPosts = Array.isArray(observation?.posts)
-            ? observation.posts.map((post) => ({
-                post_id: post.postId,
-                post_url: post.postUrl,
-                content: post.postText,
-                title: post.title,
-                author: post.authorName || 'Unknown',
-                visible_index: post.visibleIndex,
-                platform: 'reddit',
-                subreddit: post.subreddit || '',
-              }))
-            : [];
-          collectedPosts.push(...queryPosts);
+        for (const searchPass of plannedPasses) {
           if (context.debugMode) {
-            logDebug(
-              context,
-              `reddit search plan query="${query}" state=${observation?.state || 'unknown'} verify=${verified.ok ? 'ok' : 'mismatch'} cards=${observation?.postsDebug?.articleCount || observation?.articleCount || 0} kept=${queryPosts.length}`
-            );
+            traceDebug(`reddit search pass=${searchPass.pass || 'search'} queries=${searchPass.queries.join(' | ')}`);
+          }
+          for (const query of searchPass.queries.slice(0, 4)) {
+            await lock.runExclusive('operator:reddit-plan-search-query', async () => {
+              await searchRedditPosts(query);
+            });
+            const verified = await verifyOutcome({
+              expectedStates: ['reddit_search_results', 'reddit_subreddit_feed', 'reddit_post_detail'],
+            });
+            observation = await observePlatformPage({
+              includePosts: true,
+              limit: Math.max(1, Number(args.limit || 10)),
+              scrollRounds: 2,
+            });
+            const queryPosts = Array.isArray(observation?.posts)
+              ? observation.posts.map((post) => ({
+                  post_id: post.postId,
+                  post_url: post.postUrl,
+                  content: post.postText,
+                  title: post.title,
+                  author: post.authorName || 'Unknown',
+                  visible_index: post.visibleIndex,
+                  platform: 'reddit',
+                  subreddit: post.subreddit || '',
+                }))
+              : [];
+            collectedPosts.push(...queryPosts);
+            if (context.debugMode) {
+              traceDebug(`reddit search pass=${searchPass.pass || 'search'} query="${query}" state=${observation?.state || 'unknown'} verify=${verified.ok ? 'ok' : 'mismatch'} cards=${observation?.postsDebug?.articleCount || observation?.articleCount || 0} kept=${queryPosts.length}`, { pass: searchPass.pass || 'search', query });
+            }
           }
         }
         posts = dedupePostsByIdentity(collectedPosts);
@@ -2381,10 +2698,7 @@ function startOperatorConsole(deps) {
           subreddit: post.subreddit || '',
         })) : [];
         if (context.debugMode) {
-          logDebug(
-            context,
-            `reddit observe: state=${observation?.state || 'unknown'} url=${observation?.url || page.url()} cards=${observation?.postsDebug?.articleCount || observation?.articleCount || 0} kept=${observation?.postsDebug?.keptCount || posts.length}`
-          );
+          traceDebug(`reddit observe: state=${observation?.state || 'unknown'} url=${observation?.url || page.url()} cards=${observation?.postsDebug?.articleCount || observation?.articleCount || 0} kept=${observation?.postsDebug?.keptCount || posts.length}`);
         }
         context.lastPosts = posts;
         context.lastObservedRedditUrl = observation?.url || currentUrl;
@@ -2400,16 +2714,37 @@ function startOperatorConsole(deps) {
       const filtered = topic && keywordMatched.length
         ? await filterPostsByTopic(keywordMatched, objectiveProfile?.topic || topic, callOllama, model)
         : keywordMatched;
-      const limit = Math.max(1, Number(args.limit || filtered.length || 10));
+      let ranked = await rankPostsForBusinessTopic(filtered, objectiveProfile?.topic || topic);
+      if (!ranked.length && topic) {
+        ranked = await exploreRedditCommunitiesForLeads({
+          topic: objectiveProfile?.topic || topic,
+          signals: Array.isArray(objectiveProfile?.mustMatchAny) ? objectiveProfile.mustMatchAny : [],
+          limit: Math.max(1, Number(args.limit || 10)),
+          skillPolicy,
+        });
+      }
+      const limit = Math.max(1, Number(args.limit || (ranked.length || filtered.length || 10)));
 
-      if (!filtered.length) {
+      if (!(ranked.length || filtered.length)) {
         return topic
           ? `I checked Reddit but found nothing clearly related to "${objectiveProfile?.topic || topic}".`
           : 'I checked the current Reddit posts, but I could not find visible posts right now.';
       }
 
+      if (context.debugMode && ranked.length) {
+        for (const line of formatLeadDecisionDebug(ranked)) {
+          traceDebug(line, { platform: 'reddit', topic: objectiveProfile?.topic || topic });
+        }
+      }
+
+      if (ranked.length) {
+        context.lastPosts = ranked;
+        context.lastObservedRedditUrl = observation?.url || page.url();
+        await persistOperatorContext(state, upsertAgentState);
+      }
+
       return formatOriginalPosts(
-        filtered.slice(0, limit),
+        (ranked.length ? ranked : filtered).slice(0, limit),
         topic ? `Matched Reddit posts for "${objectiveProfile?.topic || topic}"` : 'Visible Reddit posts'
       );
     }
@@ -2421,6 +2756,18 @@ function startOperatorConsole(deps) {
       }
       if (!post) {
         return 'That post number is not in the current post list.';
+      }
+
+      if (context.dryRunMode) {
+        return renderDryRunPreview({
+          title: `Dry run for like post ${args.post_index}`,
+          items: [{
+            label: post.author || post.title || `Post ${args.post_index}`,
+            temperature: post.lead_temperature || 'unknown',
+            reason: post._leadScore?.reason || excerpt(post.content || '', 160),
+            action: 'like only',
+          }],
+        });
       }
 
       const allowed = await maybeConfirm(`Like post ${args.post_index}`);
@@ -2505,11 +2852,20 @@ function startOperatorConsole(deps) {
         ? [...recentPosts].sort((left, right) => Number(left.visibleIndex || 0) - Number(right.visibleIndex || 0))
         : [...recentPosts].sort(() => Math.random() - 0.5);
 
+      if (context.dryRunMode) {
+        return renderDryRunPreview({
+          title: `Dry run for ${selection === 'first' ? 'first' : 'random'} likes in ${surface === 'feed' ? 'your home feed' : targetGroup.name}`,
+          items: candidatePosts.slice(0, requestedCount).map((post, index) => ({
+            label: post.authorName || post.title || `Post ${index + 1}`,
+            temperature: post.lead_temperature || 'unknown',
+            reason: excerpt(post.postText || '', 160),
+            action: 'like only',
+          })),
+        });
+      }
+
       candidatePosts.forEach((post) => {
-        logDebug(
-          context,
-          `like candidate ${post.postId || post.visibleIndex}: visibleIndex=${post.visibleIndex} selection=${selection} controls=${(post.controlNames || []).join(',') || 'none'}`
-        );
+        traceDebug(`like candidate ${post.postId || post.visibleIndex}: visibleIndex=${post.visibleIndex} selection=${selection} controls=${(post.controlNames || []).join(',') || 'none'}`);
       });
 
       for (const post of candidatePosts) {
@@ -2613,11 +2969,20 @@ function startOperatorConsole(deps) {
       const candidatePosts = selection === 'first'
         ? [...visiblePosts].sort((left, right) => Number(left.visibleIndex || 0) - Number(right.visibleIndex || 0))
         : [...visiblePosts].sort(() => Math.random() - 0.5);
+
+      if (context.dryRunMode) {
+        return renderDryRunPreview({
+          title: `Dry run for ${selection === 'first' ? 'first' : 'random'} comments in ${surface === 'feed' ? 'your home feed' : targetGroup.name}`,
+          items: candidatePosts.slice(0, requestedCount).map((post, index) => ({
+            label: post.authorName || post.title || `Post ${index + 1}`,
+            temperature: post.lead_temperature || 'unknown',
+            reason: excerpt(post.postText || '', 160),
+            action: 'comment publicly',
+          })),
+        });
+      }
       candidatePosts.forEach((post) => {
-        logDebug(
-          context,
-          `comment candidate ${post.postId || post.visibleIndex}: visibleIndex=${post.visibleIndex} selection=${selection} controls=${(post.controlNames || []).join(',') || 'none'}`
-        );
+        traceDebug(`comment candidate ${post.postId || post.visibleIndex}: visibleIndex=${post.visibleIndex} selection=${selection} controls=${(post.controlNames || []).join(',') || 'none'}`);
       });
       let commentedCount = 0;
       const errors = [];
@@ -2694,6 +3059,7 @@ function startOperatorConsole(deps) {
           visible_index: post.visible_index,
         },
         text: draft.reply,
+        workflowState: 'drafted',
       });
       return `Draft comment for post ${args.post_index}:\n${draft.reply}`;
     }
@@ -2719,19 +3085,52 @@ function startOperatorConsole(deps) {
           visible_index: post.visible_index,
         },
         text: draft.reply,
+        workflowState: 'drafted',
       });
+
+      if (context.dryRunMode) {
+        return renderDryRunPreview({
+          title: `Dry run for comment on post ${args.post_index}`,
+          items: [{
+            label: post.author || `Post ${args.post_index}`,
+            temperature: post.lead_temperature || 'unknown',
+            reason: post._leadScore?.reason || excerpt(post.content || '', 160),
+            action: 'comment publicly',
+          }],
+        }) + `\n\nDraft:\n${draft.reply}`;
+      }
 
       const allowed = await maybeConfirm(`Post this comment on post ${args.post_index}`);
       if (!allowed) {
         return `Draft kept for post ${args.post_index}:\n${draft.reply}`;
       }
 
-      const adapter = getSurfaceAdapter(context.currentPlatform === 'reddit' ? 'reddit' : 'facebook');
-      await lock.runExclusive(`operator:${context.currentPlatform === 'reddit' ? 'reddit-' : ''}comment-post`, async () => {
-        await adapter.postComment(post, draft.reply);
+      await updateDraftState({
+        status: 'approved',
+        approvalStatus: 'approved',
+        workflowState: 'publishing',
+        approvedAt: new Date().toISOString(),
       });
-      if (context.currentPlatform !== 'reddit') {
-        await humanJitter(page, { logLabel: 'Manual comment jitter' });
+      const adapter = getSurfaceAdapter(context.currentPlatform === 'reddit' ? 'reddit' : 'facebook');
+      try {
+        await lock.runExclusive(`operator:${context.currentPlatform === 'reddit' ? 'reddit-' : ''}comment-post`, async () => {
+          await adapter.postComment(post, draft.reply);
+        });
+        if (context.currentPlatform !== 'reddit') {
+          await humanJitter(page, { logLabel: 'Manual comment jitter' });
+        }
+        await updateDraftState({
+          status: 'published',
+          workflowState: 'published',
+          publishedAt: new Date().toISOString(),
+        });
+      } catch (error) {
+        await updateDraftState({
+          status: 'failed',
+          workflowState: 'failed',
+          lastError: error.message,
+        });
+        throw error;
       }
       return context.currentPlatform === 'reddit'
         ? `Comment posted on Reddit post ${args.post_index}.`
@@ -2787,6 +3186,18 @@ function startOperatorConsole(deps) {
         return 'That notification number is not in the current notification list.';
       }
 
+      if (context.dryRunMode) {
+        return renderDryRunPreview({
+          title: `Dry run for notification ${args.notification_index}`,
+          items: [{
+            label: excerpt(notification.text || `Notification ${args.notification_index}`, 120),
+            temperature: 'unknown',
+            reason: 'Notification selected for reply.',
+            action: 'reply publicly',
+          }],
+        });
+      }
+
       const allowed = await maybeConfirm(`Reply to notification ${args.notification_index}`);
       if (!allowed) {
         return `Reply cancelled for notification ${args.notification_index}.`;
@@ -2836,6 +3247,7 @@ function startOperatorConsole(deps) {
         kind: 'post',
         target: { surface: target, group: target === 'group' ? context.currentGroup : null },
         text: draftText,
+        workflowState: 'drafted',
       });
       return [
         `Draft ${target} post:`,
@@ -2851,19 +3263,55 @@ function startOperatorConsole(deps) {
         return 'There is no saved draft right now.';
       }
 
-      const allowed = await maybeConfirm('Post the last saved draft');
+      if (context.dryRunMode) {
+        return renderDryRunPreview({
+          title: 'Dry run for last draft publish',
+          items: [{
+            label: draft.kind === 'post'
+              ? `Post draft for ${draft.target?.surface === 'group' ? (draft.target?.group?.name || 'group') : 'feed'}`
+              : `Comment draft for post ${draft.target?.post_index || 'unknown'}`,
+            temperature: draft.kind === 'post' ? 'authority' : 'contextual',
+            reason: excerpt(draft.text || '', 180),
+            action: draft.kind === 'post' ? 'publish post' : 'publish comment',
+          }],
+        });
+      }
+
+      const allowed = args.skip_confirmation ? true : await maybeConfirm('Post the last saved draft');
       if (!allowed) {
         return 'Posting cancelled.';
       }
 
+      await updateDraftState({
+        status: 'approved',
+        approvalStatus: 'approved',
+        workflowState: 'publishing',
+        approvedAt: new Date().toISOString(),
+      });
+
       if (draft.kind === 'post') {
         const adapter = getSurfaceAdapter('facebook');
-        return lock.runExclusive(
-          draft.target?.surface === 'feed'
-            ? 'operator:post-last-feed-draft'
-            : 'operator:post-last-group-draft',
-          async () => adapter.postDraft(draft)
-        );
+        try {
+          const result = await lock.runExclusive(
+            draft.target?.surface === 'feed'
+              ? 'operator:post-last-feed-draft'
+              : 'operator:post-last-group-draft',
+            async () => adapter.postDraft(draft)
+          );
+          await updateDraftState({
+            status: 'published',
+            workflowState: 'published',
+            publishedAt: new Date().toISOString(),
+          });
+          return result;
+        } catch (error) {
+          await updateDraftState({
+            status: 'failed',
+            workflowState: 'failed',
+            lastError: error.message,
+          });
+          throw error;
+        }
       }
 
       if (draft.kind === 'comment') {
@@ -2877,12 +3325,26 @@ function startOperatorConsole(deps) {
 
         const platform = context.currentPlatform === 'reddit' ? 'reddit' : 'facebook';
         const adapter = getSurfaceAdapter(platform);
-        await lock.runExclusive(
-          platform === 'reddit'
-            ? 'operator:post-last-reddit-comment-draft'
-            : 'operator:post-last-comment-draft',
-          async () => adapter.postComment(post, draft.text)
-        );
+        try {
+          await lock.runExclusive(
+            platform === 'reddit'
+              ? 'operator:post-last-reddit-comment-draft'
+              : 'operator:post-last-comment-draft',
+            async () => adapter.postComment(post, draft.text)
+          );
+          await updateDraftState({
+            status: 'published',
+            workflowState: 'published',
+            publishedAt: new Date().toISOString(),
+          });
+        } catch (error) {
+          await updateDraftState({
+            status: 'failed',
+            workflowState: 'failed',
+            lastError: error.message,
+          });
+          throw error;
+        }
         return platform === 'reddit'
           ? `Posted the last draft comment to Reddit post ${draft.target?.post_index}.`
           : `Posted the saved comment on post ${draft.target?.post_index}.`;
@@ -2909,7 +3371,24 @@ function startOperatorConsole(deps) {
     return `Tool not implemented: ${tool}`;
   }
 
-  async function fallbackPlan(raw) {
+  async function runAction(action) {
+    if (context.debugMode) {
+      traceDebug(`chosen action: ${action?.tool || 'unknown'} ${JSON.stringify(action?.args || {})}`);
+    }
+    void queueSessionEvent('tool_start', {
+      tool: action?.tool || '',
+      args: action?.args || {},
+      dryRunMode: Boolean(context.dryRunMode),
+    });
+    const result = await executeTool(action);
+    void queueSessionEvent('tool_result', {
+      tool: action?.tool || '',
+      result: String(result || ''),
+    });
+    return result;
+  }
+
+  async function fallbackPlan(raw, objectiveProfile = null) {
     const platformScoped = inferPlatformScopedIntent(raw, context);
     if (platformScoped) {
       return {
@@ -2967,6 +3446,18 @@ function startOperatorConsole(deps) {
         assistantReply: '',
         actions: [{
           tool: 'debug_mode',
+          args: {
+            enabled: routed.enabled,
+          },
+        }],
+      };
+    }
+
+    if (routed.type === 'dry_run_mode') {
+      return {
+        assistantReply: '',
+        actions: [{
+          tool: 'dry_run_mode',
           args: {
             enabled: routed.enabled,
           },
@@ -3128,9 +3619,12 @@ function startOperatorConsole(deps) {
         return {
           assistantReply: '',
           actions: [{
-            tool: 'scan_joined_groups',
+            tool: 'facebook_search_posts',
             args: {
-              topic: String(raw || '').trim(),
+              topic: String(objectiveProfile?.topic || raw || '').trim(),
+              queries: Array.isArray(objectiveProfile?.searchQueries) ? objectiveProfile.searchQueries.slice(0, 12) : [],
+              search_passes: Array.isArray(objectiveProfile?.searchPasses) ? objectiveProfile.searchPasses : [],
+              signals: Array.isArray(objectiveProfile?.mustMatchAny) ? objectiveProfile.mustMatchAny.slice(0, 18) : [],
               limit: 10,
             },
           }],
@@ -3200,6 +3694,22 @@ function startOperatorConsole(deps) {
     let objectivePlan = null;
     const directIntent = inferDirectActionIntent(raw);
 
+    if (context.lastDraft?.text && looksLikeDraftApproval(raw)) {
+      logDebug(
+        context,
+        `draft state change: ${context.lastDraft.workflowState || 'drafted'} -> approved -> publishing`
+      );
+      const result = await runAction({
+        tool: 'post_last_draft',
+        args: { skip_confirmation: true },
+      });
+      if (result) {
+        console.log(result);
+        outputs.push(result);
+      }
+      return outputs;
+    }
+
     if (directIntent) {
       const plan = await fallbackPlan(raw);
       if (plan.assistantReply) {
@@ -3207,7 +3717,7 @@ function startOperatorConsole(deps) {
         outputs.push(plan.assistantReply);
       }
       for (const action of plan.actions) {
-        const result = await executeTool(action);
+        const result = await runAction(action);
         if (result) {
           console.log(result);
           outputs.push(result);
@@ -3252,6 +3762,23 @@ function startOperatorConsole(deps) {
           model,
         }).catch(() => null)
       : null;
+
+    void queueSessionEvent('objective_profile', {
+      raw,
+      family: objectiveProfile?.family || objectivePlan?.family || '',
+      topic: objectiveProfile?.topic || objectivePlan?.topic || '',
+      searchPasses: objectiveProfile?.searchPasses || [],
+      skills: objectiveProfile?.skillPolicy?.loadedSkillIds || [],
+    });
+
+    if (context.debugMode && objectiveProfile) {
+      traceDebug(`goal plan: family=${objectiveProfile.family || 'unknown'} topic=${objectiveProfile.topic || raw} skills=${summarizeSkillInfluence(objectiveProfile)}`);
+      const passes = Array.isArray(objectiveProfile.searchPasses) ? objectiveProfile.searchPasses : [];
+      for (const pass of passes.slice(0, 4)) {
+        const queries = Array.isArray(pass?.queries) ? pass.queries.filter(Boolean) : [];
+        traceDebug(`search pass ${pass?.pass || 'unknown'}: ${queries.length ? queries.join(' | ') : 'manual exploration'}`);
+      }
+    }
 
     const browserFirstPlan = await buildBrowserFirstPlan(raw, initialObservation, objectiveProfile);
     if (browserFirstPlan?.actions?.length) {
@@ -3352,7 +3879,7 @@ function startOperatorConsole(deps) {
       }
       executed.add(signature);
 
-      const result = await executeTool(decision.action);
+      const result = await runAction(decision.action);
       if (result) {
         console.log(result);
         outputs.push(result);
@@ -3382,11 +3909,11 @@ function startOperatorConsole(deps) {
         objectivePlan,
       });
     } catch (_error) {
-      plan = await fallbackPlan(raw);
+      plan = await fallbackPlan(raw, objectiveProfile);
     }
 
     if (!plan.actions.length && !plan.assistantReply) {
-      plan = await fallbackPlan(raw);
+      plan = await fallbackPlan(raw, objectiveProfile);
     }
 
     if (plan.assistantReply) {
@@ -3395,7 +3922,7 @@ function startOperatorConsole(deps) {
     }
 
     for (const action of plan.actions) {
-      const result = await executeTool(action);
+      const result = await runAction(action);
       if (result) {
         console.log(result);
         outputs.push(result);
@@ -3420,24 +3947,40 @@ function startOperatorConsole(deps) {
 
     busy = true;
     addConversationTurn(state, 'user', raw);
+    void queueSessionEvent('user_message', {
+      text: raw,
+      platform: context.currentPlatform || 'facebook',
+      surface: context.currentSurface || '',
+    });
 
     try {
       const outputs = await handleMessage(raw);
       addConversationTurn(state, 'assistant', outputs.join('\n\n') || 'Handled operator request.');
+      void queueSessionEvent('assistant_message', {
+        text: outputs.join('\n\n') || 'Handled operator request.',
+      });
     } catch (error) {
       console.log(`Request failed: ${error.message}`);
       addConversationTurn(state, 'assistant', `Request failed: ${error.message}`);
+      void queueSessionEvent('error', {
+        message: error.message,
+      });
     } finally {
       await persistOperatorContext(state, upsertAgentState);
+      await sessionLogQueue.catch(() => {});
       busy = false;
       rl.prompt();
     }
   });
 
   rl.on('close', () => {
+    void queueSessionEvent('session_closed', {});
     console.log('Operator console closed.');
   });
 
+  void queueSessionEvent('session_started', {
+    sessionLogPath,
+  });
   console.log('Operator console ready. Speak naturally and I will plan the steps.');
   rl.prompt();
   return rl;
@@ -3448,6 +3991,7 @@ module.exports = {
   buildDashboard,
   inferIntentHeuristically,
   inferPlatformScopedIntent,
+  looksLikeDraftApproval,
   planOperatorMessage,
   resolveNamedGroup,
   routeOperatorIntent,

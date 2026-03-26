@@ -4,6 +4,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const {
+  buildSkillDecisionContext,
   buildObjectiveChecklist,
   inferObjectiveFamily,
   interpretObjectiveForBrowser,
@@ -45,6 +46,8 @@ test('interpretObjectiveForBrowser expands amazon hidden money lead search inten
   assert.equal(plan.family, 'business_scan');
   assert.equal(plan.intent, 'find_leads');
   assert.ok(Array.isArray(plan.searchQueries));
+  assert.ok(Array.isArray(plan.searchPasses));
+  assert.ok(plan.searchPasses.some((item) => item.pass === 'community_manual_exploration'));
   assert.ok(plan.searchQueries.some((query) => /reimbursement|fees|settlement|inventory|profit/i.test(query)));
   assert.ok(plan.mustMatchAny.some((term) => /reimbursement|inventory|fees|profit|settlement/i.test(term)));
 });
@@ -64,4 +67,17 @@ test('interpretObjectiveForBrowser does not keep the raw sentence as the only se
     plan.searchQueries[0].toLowerCase(),
     'search reddit on our amazon hidden money business, maybe somebody is looking for help to recover his money'
   );
+});
+
+test('buildSkillDecisionContext loads related amazon skills as policy', async () => {
+  const policy = await buildSkillDecisionContext({
+    objective: 'find leads about amazon reimbursements and low profit',
+    activeSkill: 'amazon_hidden_money',
+    family: 'business_scan',
+  });
+
+  assert.ok(policy.loadedSkillIds.includes('amazon_hidden_money'));
+  assert.ok(policy.loadedSkillIds.includes('amazon_expert'));
+  assert.ok(policy.searchThemes.some((item) => /reimbursement|inventory|fees|settlement/i.test(item)));
+  assert.ok(policy.leadSignals.some((item) => /profit|fees|inventory|reimbursement/i.test(item)));
 });

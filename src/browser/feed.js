@@ -32,6 +32,7 @@ function isVisiblePostCandidate({
   timestampText = '',
   validationMode = 'engagement',
   controlNames = [],
+  pageMode = 'feed',
 } = {}) {
   const normalizedAuthor = String(authorName || '').trim();
   const normalizedBody = String(bodyText || '').trim();
@@ -44,7 +45,8 @@ function isVisiblePostCandidate({
   const hasShare = names.includes('share');
   const hasReply = names.includes('reply');
 
-  if (normalizedBody.length < 15) {
+  const minBodyLength = pageMode === 'search_results' ? 8 : 15;
+  if (normalizedBody.length < minBodyLength) {
     return false;
   }
 
@@ -410,11 +412,14 @@ function createFeedApi({
       const pageMode = (() => {
         const url = window.location.href || '';
         if (/\/posts\/|story_fbid=|\/permalink\//i.test(url)) {
-          return 'post_detail';
-        }
-        if (/\/groups\//i.test(url)) {
-          return 'group_feed';
-        }
+        return 'post_detail';
+      }
+      if (/\/search\//i.test(url)) {
+        return 'search_results';
+      }
+      if (/\/groups\//i.test(url)) {
+        return 'group_feed';
+      }
         return 'feed';
       })();
 
@@ -452,7 +457,7 @@ function createFeedApi({
           ? (timestampNode ? 'strict' : 'fallback')
           : 'missing';
 
-        if (String(validationMode || 'engagement') === 'business' && actionControls.length < 2 && !replyButton) {
+        if (pageMode !== 'search_results' && String(validationMode || 'engagement') === 'business' && actionControls.length < 2 && !replyButton) {
           reject(articleIndex, 'weak_action_bar', `controls=${controlNames.join(',') || 'none'}`, article);
           continue;
         }
@@ -461,7 +466,8 @@ function createFeedApi({
         const actionTop = findActionBarTop(article, actionControls);
         const mainBodyText = extractMainBodyText(article, headerBottom, actionTop)
           || extractDeepArticleText(article, actionTop);
-        if (!mainBodyText || mainBodyText.length < 15) {
+        const minBodyLength = pageMode === 'search_results' ? 8 : 15;
+        if (!mainBodyText || mainBodyText.length < minBodyLength) {
           reject(articleIndex, 'no_body_between_header_and_action_bar', '', article);
           continue;
         }
@@ -474,6 +480,7 @@ function createFeedApi({
           timestampText,
           validationMode,
           controlNames,
+          pageMode,
         })) {
           reject(
             articleIndex,

@@ -108,3 +108,18 @@ test('isVisiblePostCandidate keeps business scanning stricter than engagement', 
     false
   );
 });
+
+test('isVisiblePostCandidate allows lighter facebook search-result cards', () => {
+  assert.equal(
+    isVisiblePostCandidate({
+      authorName: 'Seller Example',
+      bodyText: 'Fees too high lately',
+      actionControlCount: 1,
+      timestampText: '',
+      validationMode: 'engagement',
+      controlNames: ['like'],
+      pageMode: 'search_results',
+    }),
+    true
+  );
+});

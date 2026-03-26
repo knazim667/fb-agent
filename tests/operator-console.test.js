@@ -6,6 +6,7 @@ const assert = require('node:assert/strict');
 const {
   inferIntentHeuristically,
   inferPlatformScopedIntent,
+  looksLikeDraftApproval,
   resolveNamedGroup,
   routeOperatorIntent,
 } = require('../src/agent/operator_console');
@@ -184,9 +185,22 @@ test('heuristic router maps post-last-draft requests', () => {
   assert.equal(intent.type, 'post_last_draft');
 });
 
+test('draft approval helper detects natural approval phrases', () => {
+  assert.equal(looksLikeDraftApproval('yes post it'), true);
+  assert.equal(looksLikeDraftApproval('approved'), true);
+  assert.equal(looksLikeDraftApproval('go ahead'), true);
+  assert.equal(looksLikeDraftApproval('post the last draft'), true);
+  assert.equal(looksLikeDraftApproval('show me another draft'), false);
+});
+
 test('heuristic router maps debug toggle requests', () => {
   assert.deepEqual(inferIntentHeuristically('debug on'), { type: 'debug_mode', enabled: true });
   assert.deepEqual(inferIntentHeuristically('debug off'), { type: 'debug_mode', enabled: false });
+});
+
+test('heuristic router maps dry-run toggle requests', () => {
+  assert.deepEqual(inferIntentHeuristically('dry run on'), { type: 'dry_run_mode', enabled: true });
+  assert.deepEqual(inferIntentHeuristically('dry run off'), { type: 'dry_run_mode', enabled: false });
 });
 
 test('heuristic router maps platform switch to reddit', () => {

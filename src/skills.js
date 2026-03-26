@@ -23,10 +23,34 @@ function extractHeading(content = '') {
 }
 
 function extractSection(content = '', heading = '') {
-  const escaped = String(heading || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const regex = new RegExp(`^##\\s+${escaped}\\s*$([\\s\\S]*?)(?=^##\\s+|\\Z)`, 'im');
-  const match = String(content || '').match(regex);
-  return match ? match[1].trim() : '';
+  const target = String(heading || '').trim().toLowerCase();
+  if (!target) {
+    return '';
+  }
+
+  const lines = String(content || '').split(/\r?\n/);
+  let collecting = false;
+  const buffer = [];
+
+  for (const line of lines) {
+    const headingMatch = line.match(/^#{1,6}\s+(.+?)\s*$/);
+    if (headingMatch) {
+      const currentHeading = String(headingMatch[1] || '').trim().toLowerCase();
+      if (collecting) {
+        break;
+      }
+      if (currentHeading === target) {
+        collecting = true;
+      }
+      continue;
+    }
+
+    if (collecting) {
+      buffer.push(line);
+    }
+  }
+
+  return buffer.join('\n').trim();
 }
 
 function parseSkillMetadata(entry, content = '') {
@@ -37,6 +61,11 @@ function parseSkillMetadata(entry, content = '') {
   const expertise = extractSection(content, 'Expertise') || extractSection(content, 'Core Knowledge');
   const tone = extractSection(content, 'Tone');
   const leadSignals = extractSection(content, 'Lead Signals');
+  const searchThemes = extractSection(content, 'High-Value Search Themes');
+  const goodLeadExamples = extractSection(content, 'Good Lead Examples');
+  const weakSignals = extractSection(content, 'Weak Or Non-Lead Cases')
+    || extractSection(content, 'What Not To Do')
+    || extractSection(content, 'Avoid');
   const sourceText = [
     title,
     mission,
@@ -45,6 +74,9 @@ function parseSkillMetadata(entry, content = '') {
     expertise,
     tone,
     leadSignals,
+    searchThemes,
+    goodLeadExamples,
+    weakSignals,
     entry.name,
   ].filter(Boolean).join('\n');
 
@@ -59,6 +91,9 @@ function parseSkillMetadata(entry, content = '') {
     expertise,
     tone,
     leadSignals,
+    searchThemes,
+    goodLeadExamples,
+    weakSignals,
     keywords: tokenize(sourceText),
   };
 }

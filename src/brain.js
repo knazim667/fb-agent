@@ -5,7 +5,12 @@ const path = require('path');
 
 const { getContextMemory } = require('./database');
 const { SKILL_FEEDBACK_PATH } = require('./filesystem');
-const { findBestSkillForText, findSkillByTopic, loadSkillCatalog } = require('./skills');
+const {
+  extractSection,
+  findBestSkillForText,
+  findSkillByTopic,
+  loadSkillCatalog,
+} = require('./skills');
 
 const DEFAULT_OLLAMA_URL =
   process.env.OLLAMA_URL || 'http://localhost:11434/api/generate';
@@ -449,18 +454,17 @@ async function scorePostAgainstSkill(post, skill, options = {}) {
   const insights = await readAgentInsights();
   const prompt = [
     `Analyze this Amazon Seller post: '${post.content || ''}'.`,
-    'Goal: Identify if the seller is losing money or facing financial distress.',
-    'Check for:',
-    '1. Lost/Damaged Inventory (Missing shipments, warehouse losses).',
-    '2. Fee Discrepancies (High FBA/Referral fees, overcharging).',
-    '3. Low Profit/Margins (High sales but low take-home pay).',
-    '4. Settlement/Payout Issues (Negative balance, payment mismatch).',
-    '5. Seeking Recovery/Audit help.',
+    'Goal: Identify if the seller is a lead under the active business skill.',
+    'Use the skill as operating policy, not just generic Amazon keywords.',
+    'Classify the post as HOT, WARM, or COLD.',
+    '',
+    'Business skill:',
+    skill?.content || 'No skill content.',
     '',
     'Read agent_insights.md and apply previous successful tones to this new interaction.',
     insights,
     '',
-    "Output ONLY JSON: {'is_lead': boolean, 'confidence': 1-10, 'category': 'string', 'reason': 'string'}.",
+    "Output ONLY JSON: {'is_lead': boolean, 'confidence': 1-10, 'temperature': 'HOT|WARM|COLD', 'category': 'string', 'reason': 'string'}.",
   ].join('\n');
 
   let raw = '';
@@ -516,6 +520,7 @@ async function scorePostAgainstSkill(post, skill, options = {}) {
     shouldInteract: isLead && confidence >= 7,
     is_lead: isLead,
     confidence,
+    lead_temperature: String(parsed?.temperature || (confidence >= 8 ? 'HOT' : confidence >= 5 ? 'WARM' : 'COLD')).toUpperCase(),
     category: parsed?.category || 'unknown',
     reason: parsed?.reason || '',
   };
@@ -710,6 +715,195 @@ function uniqueStrings(values = []) {
   return unique;
 }
 
+function extractBulletItems(sectionText = '') {
+  return uniqueStrings(
+    String(sectionText || '')
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => /^[-*]\s+/.test(line))
+      .map((line) => line.replace(/^[-*]\s+/, '').trim().replace(/^"|"$/g, ''))
+  );
+}
+
+function sentenceCase(text = '') {
+  const normalized = String(text || '').trim().replace(/\s+/g, ' ');
+  if (!normalized) {
+    return '';
+  }
+  return normalized.charAt(0).toUpperCase() + normalized.slice(1);
+}
+
+function buildNaturalQuestionVariants(phrases = []) {
+  const results = [];
+  for (const phrase of phrases) {
+    const normalized = String(phrase || '').trim().replace(/^"+|"+$/g, '');
+    if (!normalized) {
+      continue;
+    }
+    const compact = normalized.replace(/\.$/, '');
+    if (compact.includes('?')) {
+      results.push(compact);
+      continue;
+    }
+    results.push(compact);
+    results.push(`is this normal ${compact.toLowerCase()}`);
+    results.push(`can someone explain ${compact.toLowerCase()}`);
+  }
+  return uniqueStrings(results);
+}
+
+function buildSymptomQueriesFromSignals(signals = []) {
+  const results = [];
+  const normalizedSignals = Array.isArray(signals) ? signals : [];
+  for (const signal of normalizedSignals) {
+    const text = String(signal || '').toLowerCase();
+    if (!text) {
+      continue;
+    }
+    if (/lost inventory|missing units|missing inventory|warehouse losses|damaged stock/.test(text)) {
+      results.push(
+        'amazon received fewer units than shipped',
+        'missing units amazon fba',
+        'amazon lost inventory what do i do',
+        'amazon warehouse lost my inventory'
+      );
+    }
+    if (/fees|fba fees|incorrect fees|overcharging/.test(text)) {
+      results.push(
+        'why is my amazon profit low',
+        'amazon fees too high',
+        'fba fee error',
+        'amazon overcharging fees'
+      );
+    }
+    if (/reimbursement/.test(text)) {
+      results.push(
+        'amazon reimbursement not received',
+        'missing reimbursement amazon fba',
+        'how does amazon reimbursement work'
+      );
+    }
+    if (/settlement|payout|payout numbers|payout mismatch/.test(text)) {
+      results.push(
+        'amazon payout lower than expected',
+        'can someone explain settlement report',
+        'amazon settlement report does not make sense'
+      );
+    }
+    if (/profit|margin|money is leaking|margins dropped/.test(text)) {
+      results.push(
+        'why is my amazon profit low',
+        'amazon margins dropped suddenly',
+        'amazon sales good but profit low'
+      );
+    }
+  }
+  return uniqueStrings(results);
+}
+
+async function buildSkillDecisionContext({
+  objective = '',
+  activeSkill = '',
+  relevantSkill = '',
+  skillContent = '',
+  family = '',
+} = {}) {
+  const normalizedObjective = String(objective || '').toLowerCase();
+  const catalog = await loadSkillCatalog().catch(() => []);
+  const catalogById = new Map(catalog.map((item) => [item.id, item]));
+  const chosenSkillIds = [];
+
+  function includeSkill(id) {
+    const normalizedId = String(id || '').trim();
+    if (!normalizedId || chosenSkillIds.includes(normalizedId) || !catalogById.has(normalizedId)) {
+      return;
+    }
+    chosenSkillIds.push(normalizedId);
+  }
+
+  includeSkill(activeSkill);
+  includeSkill(relevantSkill);
+
+  const bestSkill = await findBestSkillForText(normalizedObjective, {
+    catalog,
+    minimumScore: 3,
+  }).catch(() => null);
+  includeSkill(bestSkill?.id);
+
+  const amazonFocused = /amazon|fba|reimbursement|inventory|settlement|fees?|profit|margin/.test(normalizedObjective)
+    || chosenSkillIds.includes('amazon_hidden_money')
+    || chosenSkillIds.includes('amazon_expert');
+  const visibilityFocused = family === 'general_engagement'
+    || /\b(comment|reply|engage|visibility|warm up|warm-up|like)\b/.test(normalizedObjective);
+
+  if (amazonFocused) {
+    includeSkill('amazon_hidden_money');
+    includeSkill('amazon_expert');
+  }
+
+  if (visibilityFocused) {
+    includeSkill('visibility_engagement');
+  }
+
+  const skills = [];
+  for (const skillId of chosenSkillIds) {
+    const catalogEntry = catalogById.get(skillId);
+    let content = '';
+    if (skillId === activeSkill && skillContent) {
+      content = skillContent;
+    } else if (catalogEntry?.filePath) {
+      content = await fs.readFile(catalogEntry.filePath, 'utf8').catch(() => '');
+    }
+    skills.push({
+      id: skillId,
+      title: catalogEntry?.title || skillId,
+      content,
+      leadSignals: extractBulletItems(
+        extractSection(content, 'Lead Signals')
+        || extractSection(content, 'When To Escalate To Hidden Money Offer')
+      ),
+      searchThemes: extractBulletItems(extractSection(content, 'High-Value Search Themes')),
+      goodLeadExamples: extractBulletItems(extractSection(content, 'Good Lead Examples')),
+      weakSignals: extractBulletItems(
+        extractSection(content, 'Weak Or Non-Lead Cases')
+        || extractSection(content, 'What Not To Do')
+        || extractSection(content, 'Avoid')
+      ),
+      focusAreas: extractBulletItems(extractSection(content, 'Focus Areas') || extractSection(content, 'Where To Engage')),
+      commentRules: extractBulletItems(extractSection(content, 'Comment Rules') || extractSection(content, 'Rules')),
+      toneRules: extractBulletItems(extractSection(content, 'Tone')),
+      goal: sentenceCase(extractSection(content, 'Goal') || extractSection(content, 'Purpose')),
+      mission: sentenceCase(extractSection(content, 'Mission') || extractSection(content, 'Role')),
+    });
+  }
+
+  const leadSignals = uniqueStrings(skills.flatMap((item) => item.leadSignals));
+  const searchThemes = uniqueStrings(skills.flatMap((item) => item.searchThemes));
+  const goodLeadExamples = uniqueStrings(skills.flatMap((item) => item.goodLeadExamples));
+  const weakSignals = uniqueStrings(skills.flatMap((item) => item.weakSignals));
+  const focusAreas = uniqueStrings(skills.flatMap((item) => item.focusAreas));
+  const commentRules = uniqueStrings(skills.flatMap((item) => item.commentRules));
+  const toneRules = uniqueStrings(skills.flatMap((item) => item.toneRules));
+  const symptomQueries = buildSymptomQueriesFromSignals([...leadSignals, ...focusAreas]);
+  const naturalQueries = buildNaturalQuestionVariants(goodLeadExamples);
+
+  return {
+    activeSkillId: activeSkill || relevantSkill || chosenSkillIds[0] || '',
+    loadedSkillIds: chosenSkillIds,
+    loadedSkillTitles: skills.map((item) => item.title),
+    searchThemes,
+    symptomQueries,
+    naturalQueries,
+    leadSignals,
+    weakSignals,
+    focusAreas,
+    commentRules,
+    toneRules,
+    goals: uniqueStrings(skills.map((item) => item.goal).filter(Boolean)),
+    missions: uniqueStrings(skills.map((item) => item.mission).filter(Boolean)),
+  };
+}
+
 function extractSearchTerms(text = '') {
   const stopWords = new Set([
     'about', 'our', 'the', 'and', 'for', 'with', 'this', 'that', 'from', 'into', 'your',
@@ -727,10 +921,12 @@ function buildHeuristicSearchPlan({
   family = '',
   relevantSkill = '',
   topic = '',
+  skillPolicy = null,
 } = {}) {
   const normalized = String(objective || '').toLowerCase();
   const searchQueries = [];
   const mustMatchAny = [];
+  const searchPasses = [];
   let intent = family === 'drafting' ? 'draft' : family === 'general_engagement' ? 'engage' : 'find_leads';
   let resolvedTopic = String(topic || '').trim();
 
@@ -785,6 +981,17 @@ function buildHeuristicSearchPlan({
     mustMatchAny.push('fees', 'fee');
   }
 
+  const exactQueries = uniqueStrings([
+    ...(Array.isArray(skillPolicy?.searchThemes) ? skillPolicy.searchThemes : []),
+    ...searchQueries,
+  ]).slice(0, 6);
+  const symptomQueries = uniqueStrings(
+    Array.isArray(skillPolicy?.symptomQueries) ? skillPolicy.symptomQueries : []
+  ).slice(0, 6);
+  const naturalQueries = uniqueStrings(
+    Array.isArray(skillPolicy?.naturalQueries) ? skillPolicy.naturalQueries : []
+  ).slice(0, 6);
+
   if (!searchQueries.length) {
     const terms = extractSearchTerms(objective);
     const compact = terms.slice(0, 5).join(' ');
@@ -795,11 +1002,32 @@ function buildHeuristicSearchPlan({
     }
   }
 
+  if (exactQueries.length) {
+    searchPasses.push({ pass: 'exact_pain_terms', queries: exactQueries });
+  }
+  if (symptomQueries.length) {
+    searchPasses.push({ pass: 'symptom_language', queries: symptomQueries });
+  }
+  if (naturalQueries.length) {
+    searchPasses.push({ pass: 'seller_questions', queries: naturalQueries });
+  }
+  if (family === 'business_scan') {
+    searchPasses.push({ pass: 'community_manual_exploration', queries: [] });
+  }
+
+  mustMatchAny.push(...(Array.isArray(skillPolicy?.leadSignals) ? skillPolicy.leadSignals : []));
+
   return {
     intent,
     topic: resolvedTopic || String(objective || '').trim(),
-    searchQueries: uniqueStrings(searchQueries).slice(0, 6),
-    mustMatchAny: uniqueStrings(mustMatchAny).slice(0, 10),
+    searchQueries: uniqueStrings([
+      ...exactQueries,
+      ...symptomQueries,
+      ...naturalQueries,
+      ...searchQueries,
+    ]).slice(0, 12),
+    searchPasses,
+    mustMatchAny: uniqueStrings(mustMatchAny).slice(0, 18),
   };
 }
 
@@ -816,11 +1044,19 @@ async function interpretObjectiveForBrowser({
   const resolvedFamily = family || inferObjectiveFamily(normalizedObjective);
   const persona = await readPersonaProfile().catch(() => '');
   const insights = await readAgentInsights().catch(() => '');
+  const skillPolicy = await buildSkillDecisionContext({
+    objective: normalizedObjective,
+    activeSkill: relevantSkill,
+    relevantSkill,
+    skillContent,
+    family: resolvedFamily,
+  }).catch(() => null);
   const heuristic = buildHeuristicSearchPlan({
     objective: normalizedObjective,
     family: resolvedFamily,
     relevantSkill,
     topic,
+    skillPolicy,
   });
 
   if (options.disableModel) {
@@ -837,7 +1073,7 @@ async function interpretObjectiveForBrowser({
   const prompt = [
     'Interpret this operator request for a browser agent before it touches the browser.',
     'Translate the user meaning into a short browser-ready objective and search plan.',
-    'Return JSON only like {"intent":"find_leads|search_posts|engage|draft","topic":"string","search_queries":["..."],"must_match_any":["..."],"family":"business_scan|general_engagement|drafting","relevant_skill":"string","reason":"string"}.',
+    'Return JSON only like {"intent":"find_leads|search_posts|engage|draft","topic":"string","search_queries":["..."],"search_passes":[{"pass":"string","queries":["..."]}],"must_match_any":["..."],"family":"business_scan|general_engagement|drafting","relevant_skill":"string","reason":"string"}.',
     'Do not use the raw user sentence as the only search query unless it is already a good search query.',
     'If the skill is Amazon Hidden Money Recovery, expand it into seller pain-point queries like reimbursements, inventory loss, fees, low profit, and settlement confusion.',
     '',
@@ -853,6 +1089,9 @@ async function interpretObjectiveForBrowser({
     '',
     'Skill content:',
     skillContent || 'No skill content provided.',
+    '',
+    'Structured skill policy:',
+    JSON.stringify(skillPolicy || {}, null, 2),
     '',
     'Objective:',
     normalizedObjective,
@@ -884,8 +1123,12 @@ async function interpretObjectiveForBrowser({
         topic: String(parsed.topic || '').trim() || heuristic.topic,
         relevantSkill: String(parsed.relevant_skill || '').trim() || relevantSkill,
         searchQueries: searchQueries.length ? searchQueries : heuristic.searchQueries,
+        searchPasses: Array.isArray(parsed.search_passes) && parsed.search_passes.length
+          ? parsed.search_passes
+          : heuristic.searchPasses,
         mustMatchAny: mustMatchAny.length ? mustMatchAny : heuristic.mustMatchAny,
         reason: String(parsed.reason || '').trim(),
+        skillPolicy,
       };
     }
   } catch (_error) {
@@ -900,6 +1143,7 @@ async function interpretObjectiveForBrowser({
     relevantSkill,
     ...heuristic,
     reason: 'heuristic_search_plan',
+    skillPolicy,
   };
 }
 
@@ -1226,6 +1470,7 @@ module.exports = {
   MORNING_BRIEFING_MODEL,
   SKILLS_DIR,
   appendAgentInsights,
+  buildSkillDecisionContext,
   callOllama,
   planObjective,
   interpretObjectiveForBrowser,
