@@ -1870,6 +1870,7 @@ async function runAssistantSession(options = {}) {
       callOllama,
       model: MORNING_BRIEFING_MODEL,
       jobTypes: JOB_TYPES,
+      scorePostAgainstSkill: (post, skillArg = skill, options = {}) => scorePostAgainstSkill(post, skillArg, options),
       visitGroup,
       scrapeInboxPreviews,
       syncGroups: () => syncGroups(browser.page),

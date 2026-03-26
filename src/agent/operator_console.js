@@ -24,6 +24,7 @@ const TOOL_NAMES = [
   'draft_post',
   'post_last_draft',
   'inspect_platform',
+  'facebook_search_posts',
   'reddit_show_posts',
   'reddit_search_posts',
   'reddit_scan_posts',
@@ -633,6 +634,10 @@ function inferIntentHeuristically(input) {
     };
   }
 
+  if (/\bsearch on facebook\b|\bfind on facebook\b|\bscan facebook\b/.test(normalized)) {
+    return { type: 'scan' };
+  }
+
   return { type: 'question', text: String(input || '').trim() };
 }
 
@@ -651,24 +656,29 @@ function inferDirectActionIntent(input) {
     'switch_platform',
     'inspect_platform',
     'debug_mode',
-    'list_groups',
-    'check_notifications',
-    'show_posts',
-    'reddit_show_posts',
-    'reddit_search_posts',
-    'like_random_posts',
-    'comment_random_posts',
-    'draft_comment',
-    'draft_post',
-    'post_last_draft',
+    'help',
+    'exit',
   ]);
 
   return directTypes.has(intent.type) ? intent : null;
 }
 
+function inferExplicitPlatformFromInput(input = '') {
+  const normalized = String(input || '').toLowerCase();
+  if (/\bfacebook\b/.test(normalized)) {
+    return 'facebook';
+  }
+  if (/\breddit\b/.test(normalized) || /\br\/[a-z0-9_]+\b/i.test(String(input || ''))) {
+    return 'reddit';
+  }
+  return null;
+}
+
 function inferPlatformScopedIntent(input, context = {}) {
   const normalized = String(input || '').trim().toLowerCase();
-  if (!normalized || String(context.currentPlatform || 'facebook').toLowerCase() !== 'reddit') {
+  const explicitPlatform = inferExplicitPlatformFromInput(input);
+  const activePlatform = explicitPlatform || String(context.currentPlatform || 'facebook').toLowerCase();
+  if (!normalized || activePlatform !== 'reddit') {
     return null;
   }
 
@@ -744,6 +754,7 @@ function plannerToolGuide() {
     '- draft_post {"target":"feed|group","group_index":number,"group_name":"optional","topic":"optional"}',
     '- post_last_draft {}',
     '- inspect_platform {"platform":"facebook|reddit"}',
+    '- facebook_search_posts {"topic":"string","queries":["string"],"signals":["string"],"limit":number}',
     '- debug_mode {"enabled":true|false}',
     '- sync_groups {}',
     '- verify_pending_groups {}',
@@ -1148,6 +1159,7 @@ function startOperatorConsole(deps) {
     getCollections,
     callOllama,
     model,
+    scorePostAgainstSkill,
     getAgentState,
     visitGroup,
     syncGroups,
@@ -1298,17 +1310,26 @@ function startOperatorConsole(deps) {
   }
 
   async function observePlatformPage(options = {}) {
-    if (String(context.currentPlatform || 'facebook').toLowerCase() === 'reddit' && typeof observeRedditPage === 'function') {
+    const currentUrl = page.url();
+    const inferredPlatformFromUrl = /reddit\.com/i.test(currentUrl)
+      ? 'reddit'
+      : /facebook\.com/i.test(currentUrl)
+        ? 'facebook'
+        : String(context.currentPlatform || 'facebook').toLowerCase();
+
+    if (inferredPlatformFromUrl === 'reddit' && typeof observeRedditPage === 'function') {
       const observation = await observeRedditPage(options);
+      context.currentPlatform = 'reddit';
       context.currentSurface = observation.state || context.currentSurface || 'reddit_unknown';
       return observation;
     }
 
-    const url = page.url();
+    const url = currentUrl;
     const bodyText = await page.locator('body').innerText().catch(() => '');
     const normalizedBody = String(bodyText || '').toLowerCase();
     const composerVisible = await page.locator("div[role=\"dialog\"] div[role=\"textbox\"][contenteditable=\"true\"], div[role=\"textbox\"][contenteditable=\"true\"][aria-label*=\"Create\"], div[aria-label*=\"What's on your mind\"]").first().isVisible().catch(() => false);
     const notificationsVisible = /\/notifications/i.test(url);
+    const searchResults = /\/search\//i.test(url);
     const groupUrl = /\/groups\//i.test(url);
     const postDetail = /\/posts\/|story_fbid=|\/permalink\//i.test(url);
     const loginState = /checkpoint|login/i.test(url) || /log in|password|create new account|forgot password/i.test(normalizedBody);
@@ -1318,6 +1339,8 @@ function startOperatorConsole(deps) {
       stateName = 'facebook_login';
     } else if (notificationsVisible) {
       stateName = 'facebook_notifications';
+    } else if (searchResults) {
+      stateName = 'facebook_search_results';
     } else if (composerVisible) {
       stateName = 'facebook_composer';
     } else if (postDetail) {
@@ -1330,7 +1353,7 @@ function startOperatorConsole(deps) {
 
     let posts = [];
     let postsDebug = null;
-    if (options.includePosts && typeof listVisiblePosts === 'function' && ['facebook_group_feed', 'facebook_home_feed', 'facebook_post_detail'].includes(stateName)) {
+    if (options.includePosts && typeof listVisiblePosts === 'function' && ['facebook_group_feed', 'facebook_home_feed', 'facebook_post_detail', 'facebook_search_results'].includes(stateName)) {
       const result = await listVisiblePosts({
         limit: Math.max(1, Number(options.limit || 10)),
         scrollRounds: Number(options.scrollRounds || 2),
@@ -1347,6 +1370,7 @@ function startOperatorConsole(deps) {
       url,
       composerVisible,
       notificationsVisible,
+      searchResults,
       posts,
       postsDebug,
     };
@@ -1400,6 +1424,49 @@ function startOperatorConsole(deps) {
     return null;
   }
 
+  async function buildBrowserFirstPlan(raw, observation, objectiveProfile = null) {
+    const normalized = String(raw || '').trim().toLowerCase();
+    const explicitPlatform = inferExplicitPlatformFromInput(raw);
+    const observedPlatform = observation?.platform
+      || ((observation?.state || '').startsWith('reddit_') ? 'reddit' : 'facebook');
+    const targetPlatform = explicitPlatform || observedPlatform || String(context.currentPlatform || 'facebook').toLowerCase();
+    const searchLike = /\b(search|find|scan|look)\b/.test(normalized);
+
+    if (!searchLike) {
+      return null;
+    }
+
+    if (targetPlatform === 'facebook') {
+      return {
+        assistantReply: '',
+        actions: [{
+          tool: 'facebook_search_posts',
+          args: {
+            topic: String(objectiveProfile?.topic || raw || '').trim(),
+            queries: Array.isArray(objectiveProfile?.searchQueries) ? objectiveProfile.searchQueries.slice(0, 4) : [],
+            signals: Array.isArray(objectiveProfile?.mustMatchAny) ? objectiveProfile.mustMatchAny.slice(0, 10) : [],
+            limit: 10,
+          },
+        }],
+      };
+    }
+
+    if (targetPlatform === 'reddit') {
+      return {
+        assistantReply: '',
+        actions: [{
+          tool: 'reddit_scan_posts',
+          args: {
+            topic: String(objectiveProfile?.topic || raw || '').trim(),
+            limit: 10,
+          },
+        }],
+      };
+    }
+
+    return null;
+  }
+
   async function verifyOutcome({ expectedStates = [] } = {}) {
     const observation = await observePlatformPage();
     const ok = !expectedStates.length || expectedStates.includes(observation.state);
@@ -1430,8 +1497,70 @@ function startOperatorConsole(deps) {
       author: post.authorName || 'Unknown',
       visible_index: post.visibleIndex,
       selector_id: post.selectorId || '',
+      platform: 'facebook',
       group: context.currentGroup?.name || context.currentGroup?.label || '',
     }));
+  }
+
+  async function searchFacebookUi(query) {
+    const normalizedQuery = String(query || '').trim();
+    if (!normalizedQuery) {
+      throw new Error('Facebook search needs a query.');
+    }
+
+    if (!/facebook\.com/i.test(page.url())) {
+      await openHomeFeed();
+    }
+
+    const selectors = [
+      'input[placeholder*="Search Facebook"]',
+      'input[aria-label*="Search Facebook"]',
+      '[role="search"] input',
+      'input[placeholder*="Search"]',
+      'input[aria-label*="Search"]',
+    ];
+
+    let input = null;
+    for (const selector of selectors) {
+      const candidate = page.locator(selector).first();
+      if (await candidate.isVisible().catch(() => false)) {
+        input = candidate;
+        break;
+      }
+    }
+
+    if (!input) {
+      throw new Error('I could not find the Facebook search box on the current page.');
+    }
+
+    await input.click({ timeout: 15_000 });
+    await page.waitForTimeout(200);
+    await input.fill('');
+    await input.type(normalizedQuery, { delay: 70 });
+    await page.waitForTimeout(300);
+    await input.press('Enter');
+    await page.waitForLoadState('domcontentloaded').catch(() => null);
+    await page.waitForTimeout(2_500);
+
+    const postsTabCandidates = [
+      page.getByRole('link', { name: /^posts$/i }).first(),
+      page.getByRole('button', { name: /^posts$/i }).first(),
+      page.getByText(/^Posts$/i).first(),
+    ];
+
+    for (const candidate of postsTabCandidates) {
+      if (await candidate.isVisible().catch(() => false)) {
+        await candidate.click({ timeout: 10_000 }).catch(() => null);
+        await page.waitForLoadState('domcontentloaded').catch(() => null);
+        await page.waitForTimeout(2_000);
+        break;
+      }
+    }
+
+    context.currentPlatform = 'facebook';
+    context.currentSurface = 'facebook_search_results';
+    context.currentGroup = null;
+    context.lastObservedFacebookUrl = '';
   }
 
   function formatFacebookObservationDebug(observation) {
@@ -1484,6 +1613,37 @@ function startOperatorConsole(deps) {
       observation,
       posts,
     };
+  }
+
+  async function rankPostsForBusinessTopic(posts = [], topic = '') {
+    if (!Array.isArray(posts) || !posts.length || typeof scorePostAgainstSkill !== 'function') {
+      return posts;
+    }
+
+    const ranked = [];
+    for (const post of posts.slice(0, 12)) {
+      try {
+        const scoreResult = await scorePostAgainstSkill({
+          content: post.content || post.postText || '',
+          author: post.author || 'Unknown',
+          post_id: post.post_id || post.postId || '',
+        }, skill, {
+          model,
+          timeoutMs: 20_000,
+        });
+        ranked.push({
+          ...post,
+          relevance_score: scoreResult?.score || 0,
+          _leadScore: scoreResult,
+        });
+      } catch (_error) {
+        ranked.push(post);
+      }
+    }
+
+    return ranked
+      .filter((post) => (post._leadScore ? post._leadScore.score >= 5 : true))
+      .sort((left, right) => Number(right.relevance_score || 0) - Number(left.relevance_score || 0));
   }
 
   async function resolvePostFromObservedContext(postIndex, { limit = 12 } = {}) {
@@ -1744,6 +1904,84 @@ function startOperatorConsole(deps) {
         return 'Facebook is open, but it needs login or checkpoint review first.';
       }
       return `Facebook is open. Current page: ${observation?.state || 'unknown'}.`;
+    }
+
+    if (tool === 'facebook_search_posts') {
+      const topic = String(args.topic || '').trim();
+      const queries = Array.isArray(args.queries)
+        ? args.queries.map((query) => String(query || '').trim()).filter(Boolean).slice(0, 4)
+        : [];
+      const signals = Array.isArray(args.signals)
+        ? args.signals.map((signal) => String(signal || '').trim()).filter(Boolean)
+        : [];
+      const searchQueries = queries.length ? queries : [topic].filter(Boolean);
+
+      if (!searchQueries.length) {
+        return 'I need a Facebook search topic first.';
+      }
+
+      const collectedPosts = [];
+      for (const query of searchQueries) {
+        await lock.runExclusive('operator:facebook-search-query', async () => {
+          await searchFacebookUi(query);
+        });
+        let observation = await observePlatformPage({
+          includePosts: true,
+          limit: Math.max(1, Number(args.limit || 10)),
+          scrollRounds: 4,
+          validationMode: 'business',
+        });
+        let queryPosts = Array.isArray(observation?.posts) ? observation.posts : [];
+        if (!queryPosts.length) {
+          await page.mouse.wheel(0, 500).catch(() => null);
+          await page.waitForTimeout(1_500);
+          observation = await observePlatformPage({
+            includePosts: true,
+            limit: Math.max(1, Number(args.limit || 10)),
+            scrollRounds: 6,
+            validationMode: 'business',
+          });
+          queryPosts = Array.isArray(observation?.posts) ? observation.posts : [];
+        }
+        collectedPosts.push(...queryPosts);
+        if (context.debugMode) {
+          logDebug(
+            context,
+            `facebook search query="${query}" state=${observation?.state || 'unknown'} url=${observation?.url || page.url()} cards=${observation?.postsDebug?.articleCount || 0} kept=${queryPosts.length}`
+          );
+        }
+      }
+
+      const dedupedPosts = dedupePostsByIdentity(collectedPosts.map((post) => ({
+        post_id: post.postId,
+        post_url: post.postUrl,
+        content: post.postText,
+        author: post.authorName || 'Unknown',
+        visible_index: post.visibleIndex,
+        selector_id: post.selectorId || '',
+        platform: 'facebook',
+      })));
+      const signalMatched = signals.length ? filterPostsBySignalTerms(dedupedPosts, signals) : dedupedPosts;
+      const keywordMatched = topic ? keywordFilterPosts(signalMatched, topic) : signalMatched;
+      const filtered = topic && keywordMatched.length
+        ? await filterPostsByTopic(keywordMatched, topic, callOllama, model)
+        : keywordMatched;
+      const ranked = await rankPostsForBusinessTopic(filtered, topic);
+
+      context.lastPosts = ranked;
+      context.currentPlatform = 'facebook';
+      context.currentSurface = 'facebook_search_results';
+      context.lastObservedFacebookUrl = page.url();
+      await persistOperatorContext(state, upsertAgentState);
+
+      if (!ranked.length) {
+        return `I searched Facebook but found nothing clearly related to "${topic || searchQueries[0]}".`;
+      }
+
+      return formatOriginalPosts(
+        ranked.slice(0, Math.max(1, Number(args.limit || ranked.length || 10))),
+        topic ? `Matched Facebook posts for "${topic}"` : 'Matched Facebook posts'
+      );
     }
 
     if (tool === 'list_groups') {
@@ -2885,6 +3123,19 @@ function startOperatorConsole(deps) {
     }
 
     if (routed.type === 'scan') {
+      const explicitPlatform = inferExplicitPlatformFromInput(raw);
+      if (explicitPlatform === 'facebook') {
+        return {
+          assistantReply: '',
+          actions: [{
+            tool: 'scan_joined_groups',
+            args: {
+              topic: String(raw || '').trim(),
+              limit: 10,
+            },
+          }],
+        };
+      }
       if (String(context.currentPlatform || 'facebook').toLowerCase() === 'reddit') {
         return {
           assistantReply: '',
@@ -2947,13 +3198,10 @@ function startOperatorConsole(deps) {
       'draft_post',
     ]);
     let objectivePlan = null;
-    const platformScopedIntent = inferPlatformScopedIntent(raw, context);
     const directIntent = inferDirectActionIntent(raw);
 
-    if (platformScopedIntent || directIntent) {
-      const plan = platformScopedIntent
-        ? { assistantReply: '', actions: [platformScopedIntent] }
-        : await fallbackPlan(raw);
+    if (directIntent) {
+      const plan = await fallbackPlan(raw);
       if (plan.assistantReply) {
         console.log(plan.assistantReply);
         outputs.push(plan.assistantReply);
@@ -2968,10 +3216,18 @@ function startOperatorConsole(deps) {
       return outputs;
     }
 
+    const initialObservation = await observePlatformPage().catch(() => ({
+      platform: String(context.currentPlatform || 'facebook').toLowerCase(),
+      state: context.currentSurface || 'unknown',
+      url: page.url(),
+    }));
+
     try {
       objectivePlan = await planObjective({
         objective: raw,
         context: {
+          current_platform: initialObservation?.platform || context.currentPlatform || 'facebook',
+          current_surface: initialObservation?.state || context.currentSurface || '',
           current_group: context.currentGroup?.name || null,
           last_groups: (context.lastListedGroups || []).slice(0, 10).map((group) => group.name),
           last_posts: (context.lastPosts || []).slice(0, 5).map((post) => excerpt(post.content || post.postText || '', 120)),
@@ -2981,6 +3237,32 @@ function startOperatorConsole(deps) {
       });
     } catch (_error) {
       objectivePlan = null;
+    }
+
+    const objectiveProfile = typeof interpretObjectiveForBrowser === 'function'
+      ? await interpretObjectiveForBrowser({
+          objective: raw,
+          currentPlatform: initialObservation?.platform || context.currentPlatform || 'facebook',
+          currentSurface: initialObservation?.state || context.currentSurface || '',
+          relevantSkill: objectivePlan?.relevantSkill || skill?.id || '',
+          skillContent: skill?.content || '',
+          family: objectivePlan?.family || '',
+          topic: objectivePlan?.topic || '',
+        }, {
+          model,
+        }).catch(() => null)
+      : null;
+
+    const browserFirstPlan = await buildBrowserFirstPlan(raw, initialObservation, objectiveProfile);
+    if (browserFirstPlan?.actions?.length) {
+      for (const action of browserFirstPlan.actions) {
+        const result = await executeTool(action);
+        if (result) {
+          console.log(result);
+          outputs.push(result);
+        }
+      }
+      return outputs;
     }
 
     if (objectivePlan?.steps?.length) {
