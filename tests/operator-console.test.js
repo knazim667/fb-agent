@@ -5,6 +5,7 @@ const assert = require('node:assert/strict');
 
 const {
   inferIntentHeuristically,
+  inferPlatformScopedIntent,
   resolveNamedGroup,
   routeOperatorIntent,
 } = require('../src/agent/operator_console');
@@ -186,4 +187,44 @@ test('heuristic router maps post-last-draft requests', () => {
 test('heuristic router maps debug toggle requests', () => {
   assert.deepEqual(inferIntentHeuristically('debug on'), { type: 'debug_mode', enabled: true });
   assert.deepEqual(inferIntentHeuristically('debug off'), { type: 'debug_mode', enabled: false });
+});
+
+test('heuristic router maps platform switch to reddit', () => {
+  assert.deepEqual(inferIntentHeuristically('go to reddit'), { type: 'switch_platform', platform: 'reddit' });
+});
+
+test('heuristic router maps subreddit post listing', () => {
+  const intent = inferIntentHeuristically('show me 10 recent posts from r/FulfillmentByAmazon');
+  assert.equal(intent.type, 'reddit_show_posts');
+  assert.equal(intent.subreddit, 'FulfillmentByAmazon');
+  assert.equal(intent.limit, 10);
+});
+
+test('heuristic router maps reddit search requests', () => {
+  const intent = inferIntentHeuristically('go to reddit and find posts about amazon reimbursement');
+  assert.equal(intent.type, 'reddit_search_posts');
+  assert.match(intent.query, /amazon reimbursement/i);
+});
+
+test('heuristic router maps reddit search requests with on-reddit phrasing', () => {
+  const intent = inferIntentHeuristically('find posts about low profit on reddit');
+  assert.equal(intent.type, 'reddit_search_posts');
+  assert.match(intent.query, /low profit/i);
+});
+
+test('platform scoped reddit scan stays on reddit for generic related-post requests', () => {
+  const intent = inferPlatformScopedIntent(
+    'find post related about our amazon hidden money business',
+    { currentPlatform: 'reddit' }
+  );
+  assert.equal(intent?.tool, 'reddit_scan_posts');
+  assert.match(intent?.args?.topic || '', /amazon hidden money/i);
+});
+
+test('platform scoped reddit scan is ignored outside reddit', () => {
+  const intent = inferPlatformScopedIntent(
+    'find post related about our amazon hidden money business',
+    { currentPlatform: 'facebook' }
+  );
+  assert.equal(intent, null);
 });

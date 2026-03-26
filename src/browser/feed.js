@@ -30,16 +30,35 @@ function isVisiblePostCandidate({
   bodyText = '',
   actionControlCount = 0,
   timestampText = '',
+  validationMode = 'engagement',
+  controlNames = [],
 } = {}) {
   const normalizedAuthor = String(authorName || '').trim();
   const normalizedBody = String(bodyText || '').trim();
   const normalizedTimestamp = String(timestampText || '').trim();
+  const names = Array.isArray(controlNames)
+    ? controlNames.map((name) => String(name || '').toLowerCase()).filter(Boolean)
+    : [];
+  const hasLike = names.includes('like');
+  const hasComment = names.includes('comment');
+  const hasShare = names.includes('share');
+  const hasReply = names.includes('reply');
 
-  if (actionControlCount < 2) {
+  if (normalizedBody.length < 15) {
     return false;
   }
 
-  if (normalizedBody.length < 15) {
+  if (String(validationMode || 'engagement') === 'business') {
+    if (!hasLike) {
+      return false;
+    }
+    if (!(hasComment || hasShare || hasReply || actionControlCount >= 2)) {
+      return false;
+    }
+    return Boolean(normalizedAuthor || normalizedTimestamp);
+  }
+
+  if (!hasLike && actionControlCount < 1) {
     return false;
   }
 
@@ -97,12 +116,17 @@ function createFeedApi({
     }
   }
 
-  async function extractVisiblePostAnchors(page, { limit = 20, scrollRounds = 2, returnMeta = false } = {}) {
+  async function extractVisiblePostAnchors(page, {
+    limit = 20,
+    scrollRounds = 2,
+    returnMeta = false,
+    validationMode = 'engagement',
+  } = {}) {
     await page.waitForLoadState('domcontentloaded');
     await page.waitForTimeout(randomBetween(1_000, 2_000));
     await loadGroupFeedPosts(page, { scrollRounds });
 
-    const extractInPage = async () => page.evaluate(({ limit }) => {
+    const extractInPage = async () => page.evaluate(({ limit, validationMode }) => {
       const RELATIVE_TIMESTAMP_PATTERN = /^(?:just now|now|today|yesterday|\d+\s*(?:m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days|w|week|weeks|y|yr|yrs|year|years))(?:\s+ago)?$/i;
       const ABSOLUTE_TIMESTAMP_PATTERN = /^(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)(?:\s+\d{1,2})(?:,\s*\d{4})?(?:\s+at\s+\d{1,2}:\d{2}(?:\s?[ap]m)?)?$/i;
 
@@ -202,6 +226,15 @@ function createFeedApi({
       function findActionButton(article, pattern) {
         return Array.from(article.querySelectorAll('button,[role="button"], a[href], span, div'))
           .find((node) => isVisible(node) && matchesControl(node, pattern)) || null;
+      }
+
+      function describeControls({ likeButton, commentButton, shareButton, replyButton }) {
+        return [
+          likeButton ? 'like' : '',
+          commentButton ? 'comment' : '',
+          shareButton ? 'share' : '',
+          replyButton ? 'reply' : '',
+        ].filter(Boolean);
       }
 
       function fallbackTimestampText(article) {
@@ -413,13 +446,14 @@ function createFeedApi({
         const replyButton = findActionButton(article, /^reply$/i);
         const shareButton = findActionButton(article, /^share$/i);
         const actionControls = [likeButton, commentButton, shareButton].filter(Boolean);
+        const controlNames = describeControls({ likeButton, commentButton, shareButton, replyButton });
         const timestampText = normalize(timestampNode?.innerText || '') || fallbackTimestampText(article);
         const timestampConfidence = timestampText
           ? (timestampNode ? 'strict' : 'fallback')
           : 'missing';
 
-        if (actionControls.length < 2) {
-          reject(articleIndex, 'weak_action_bar', `controls=${actionControls.length}`, article);
+        if (String(validationMode || 'engagement') === 'business' && actionControls.length < 2 && !replyButton) {
+          reject(articleIndex, 'weak_action_bar', `controls=${controlNames.join(',') || 'none'}`, article);
           continue;
         }
 
@@ -436,26 +470,25 @@ function createFeedApi({
         if (!isVisiblePostCandidate({
           authorName: authorName === 'Unknown' ? '' : authorName,
           bodyText: mainBodyText,
-          actionControlCount: actionControls.length,
+          actionControlCount: [...actionControls, replyButton].filter(Boolean).length,
           timestampText,
+          validationMode,
+          controlNames,
         })) {
-          reject(articleIndex, 'invalid_visible_post_candidate', '', article);
+          reject(
+            articleIndex,
+            'invalid_visible_post_candidate',
+            `mode=${validationMode};controls=${controlNames.join(',') || 'none'};body_len=${mainBodyText.length}`,
+            article
+          );
           continue;
         }
         const urlNode = (timestampNode?.closest('a[href]')) || Array.from(article.querySelectorAll('a[href]'))
           .find((node) => /\/posts\/|story_fbid=|\/permalink\//i.test(node.getAttribute('href') || '')) || null;
         const postUrl = urlNode ? urlNode.getAttribute('href') || '' : '';
-        const ignoreAsComment = Boolean(replyButton)
-          && !shareButton
-          && /\b(reply|replies)\b/i.test(normalize(article.innerText));
         const selectorId = article.getAttribute('data-agent-visible-post-id')
           || `agent-visible-post-${articleIndex + 1}`;
         article.setAttribute('data-agent-visible-post-id', selectorId);
-
-        if (ignoreAsComment) {
-          reject(articleIndex, 'comment_thread_below_action_bar', '', article);
-          continue;
-        }
 
         anchors.push({
           articleIndex,
@@ -465,6 +498,7 @@ function createFeedApi({
           postUrl,
           anchorConfidence: timestampConfidence,
           selectorId,
+          controlNames,
         });
 
         if (anchors.length >= limit) {
@@ -479,8 +513,9 @@ function createFeedApi({
         pageMode,
         url: window.location.href || '',
         feedContainerStatus,
+        validationMode,
       };
-    }, { limit: Math.max(limit * 2, 20) });
+    }, { limit: Math.max(limit * 2, 20), validationMode: String(validationMode || 'engagement') });
 
     const desiredCount = Math.min(Math.max(1, Number(limit || 1)), 5);
     const maxAttempts = Math.max(2, Math.min(Number(scrollRounds || 2) + 2, 6));
@@ -547,6 +582,7 @@ function createFeedApi({
         postUrl: normalizedUrl,
         anchorConfidence: rawAnchor.anchorConfidence || 'fallback',
         selectorId: rawAnchor.selectorId || '',
+        controlNames: Array.isArray(rawAnchor.controlNames) ? rawAnchor.controlNames : [],
         summary: rawAnchor.postText.split('\n')[0].slice(0, 180),
       });
 
@@ -563,6 +599,7 @@ function createFeedApi({
           url: String(extracted?.url || page.url() || ''),
           keptCount: anchors.length,
           pageMode: String(extracted?.pageMode || 'unknown'),
+          validationMode: String(extracted?.validationMode || validationMode || 'engagement'),
           feedContainerStatus: extracted?.feedContainerStatus || {
             found: false,
             tag: '',
@@ -578,12 +615,17 @@ function createFeedApi({
     return anchors;
   }
 
-  async function scrapeGroupFeed(page, { limit = 20, scrollRounds = 5 } = {}) {
-    return extractVisiblePostAnchors(page, { limit, scrollRounds });
+  async function scrapeGroupFeed(page, { limit = 20, scrollRounds = 5, validationMode = 'business' } = {}) {
+    return extractVisiblePostAnchors(page, { limit, scrollRounds, validationMode });
   }
 
-  async function listVisiblePosts(page, { limit = 20, scrollRounds = 2, returnMeta = false } = {}) {
-    return extractVisiblePostAnchors(page, { limit, scrollRounds, returnMeta });
+  async function listVisiblePosts(page, {
+    limit = 20,
+    scrollRounds = 2,
+    returnMeta = false,
+    validationMode = 'engagement',
+  } = {}) {
+    return extractVisiblePostAnchors(page, { limit, scrollRounds, returnMeta, validationMode });
   }
 
   return {

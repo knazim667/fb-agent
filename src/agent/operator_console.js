@@ -7,6 +7,7 @@ const path = require('path');
 const TOOL_NAMES = [
   'dashboard',
   'status',
+  'switch_platform',
   'list_groups',
   'search_groups',
   'open_group',
@@ -22,6 +23,9 @@ const TOOL_NAMES = [
   'reply_notification',
   'draft_post',
   'post_last_draft',
+  'reddit_show_posts',
+  'reddit_search_posts',
+  'reddit_scan_posts',
   'debug_mode',
   'sync_groups',
   'verify_pending_groups',
@@ -35,6 +39,7 @@ function ensureOperatorContext(state) {
     state.operatorContext = {
       executionMode: 'confirm',
       debugMode: false,
+      currentPlatform: 'facebook',
       currentSurface: 'group',
       currentGroup: null,
       lastListedGroups: [],
@@ -53,6 +58,10 @@ function ensureOperatorContext(state) {
     state.operatorContext.currentSurface = 'group';
   }
 
+  if (!state.operatorContext.currentPlatform) {
+    state.operatorContext.currentPlatform = 'facebook';
+  }
+
   return state.operatorContext;
 }
 
@@ -67,6 +76,7 @@ async function persistOperatorContext(state, upsertAgentState) {
   await upsertAgentState('operator_context', {
     executionMode: context.executionMode,
     debugMode: Boolean(context.debugMode),
+    currentPlatform: context.currentPlatform || 'facebook',
     currentSurface: context.currentSurface || 'group',
     currentGroup: context.currentGroup,
     lastListedGroups: context.lastListedGroups,
@@ -121,7 +131,8 @@ function formatPosts(posts = [], title = 'Posts') {
     `${title}:`,
     ...posts.map((post, index) => {
       const score = post.relevance_score != null ? ` | score ${post.relevance_score}/10` : '';
-      return `${index + 1}. ${post.author || 'Unknown'}${score}\n   ${excerpt(post.content || post.postText || '', 220)}`;
+      const label = post.title || post.author || 'Unknown';
+      return `${index + 1}. ${label}${score}\n   ${excerpt(post.content || post.postText || '', 220)}`;
     }),
   ].join('\n');
 }
@@ -135,7 +146,7 @@ function formatOriginalPosts(posts = [], title = 'Original posts') {
     `I see ${posts.length} original posts.`,
     ...posts.map((post, index) => {
       const number = post.visible_index || index + 1;
-      const author = post.author || 'Unknown';
+      const author = post.title || post.author || 'Unknown';
       const summary = excerpt(post.content || post.postText || '', 220);
       return `Post #${number}: ${author}\n   ${summary}`;
     }),
@@ -372,6 +383,7 @@ async function buildDashboard(deps) {
   return [
     '=== Agent Dashboard ===',
     `Mode: ${context.executionMode}`,
+    `Platform: ${context.currentPlatform || 'facebook'}`,
     `Current group: ${context.currentGroup?.name || 'none selected'}`,
     `Account-level joined groups: ${totalJoined}`,
     `Tracked groups in DB: ${joined.length} joined, ${pending.length} pending, ${discovered.length} discovered`,
@@ -403,6 +415,33 @@ function inferIntentHeuristically(input) {
 
   if (normalized === 'exit' || normalized === 'quit') {
     return { type: 'exit' };
+  }
+
+  if (/^(go to|switch to|use)\s+reddit$/.test(normalized)) {
+    return { type: 'switch_platform', platform: 'reddit' };
+  }
+
+  if (/^(go to|switch to|use)\s+facebook$/.test(normalized)) {
+    return { type: 'switch_platform', platform: 'facebook' };
+  }
+
+  const redditSubredditMatch = String(input || '').match(/(?:show|give|list|find)\s+(?:me\s+)?(\d+)?\s*(?:recent|latest|top)?\s*posts?\s+(?:from|in)\s+r\/([a-z0-9_]+)/i);
+  if (redditSubredditMatch) {
+    return {
+      type: 'reddit_show_posts',
+      subreddit: String(redditSubredditMatch[2] || '').trim(),
+      limit: Number(redditSubredditMatch[1] || 0) || undefined,
+    };
+  }
+
+  const redditSearchMatch = String(input || '').match(/(?:go to\s+reddit\s+and\s+)?(?:find|search|show|give)\s+(?:me\s+)?reddit\s+posts?\s+about\s+(.+)$/i)
+    || String(input || '').match(/go to\s+reddit\s+and\s+find\s+posts?\s+about\s+(.+)$/i)
+    || String(input || '').match(/(?:find|search|show|give)\s+(?:me\s+)?posts?\s+about\s+(.+?)\s+on\s+reddit$/i);
+  if (redditSearchMatch) {
+    return {
+      type: 'reddit_search_posts',
+      query: String(redditSearchMatch[1] || '').trim(),
+    };
   }
 
   if (
@@ -596,10 +635,13 @@ async function routeOperatorIntent(input, deps) {
 function inferDirectActionIntent(input) {
   const intent = inferIntentHeuristically(input);
   const directTypes = new Set([
+    'switch_platform',
     'debug_mode',
     'list_groups',
     'check_notifications',
     'show_posts',
+    'reddit_show_posts',
+    'reddit_search_posts',
     'like_random_posts',
     'comment_random_posts',
     'draft_comment',
@@ -608,6 +650,40 @@ function inferDirectActionIntent(input) {
   ]);
 
   return directTypes.has(intent.type) ? intent : null;
+}
+
+function inferPlatformScopedIntent(input, context = {}) {
+  const normalized = String(input || '').trim().toLowerCase();
+  if (!normalized || String(context.currentPlatform || 'facebook').toLowerCase() !== 'reddit') {
+    return null;
+  }
+
+  const exactTopicMatch = String(input || '').match(
+    /(?:find|scan|show|give|list)\s+(?:me\s+)?posts?\s+(?:related\s+)?(?:about|for)\s+(.+)$/i
+  ) || String(input || '').match(
+    /find\s+post\s+related\s+about\s+(.+)$/i
+  );
+
+  if (exactTopicMatch) {
+    return {
+      tool: 'reddit_scan_posts',
+      args: {
+        topic: String(exactTopicMatch[1] || '').trim(),
+        limit: Number((normalized.match(/\b(\d+)\s+posts?\b/i) || [])[1] || 0) || 10,
+      },
+    };
+  }
+
+  if (/\b(scan|find)\b/.test(normalized) && /\b(posts?|threads?)\b/.test(normalized)) {
+    return {
+      tool: 'reddit_scan_posts',
+      args: {
+        limit: Number((normalized.match(/\b(\d+)\s+posts?\b/i) || [])[1] || 0) || 10,
+      },
+    };
+  }
+
+  return null;
 }
 
 function normalizePlannerActions(parsed) {
@@ -954,6 +1030,36 @@ async function filterPostsByTopic(posts, topic, callOllama, model) {
   }
 }
 
+function keywordFilterPosts(posts, topic) {
+  const normalizedTopic = String(topic || '').toLowerCase();
+  if (!normalizedTopic.trim()) {
+    return posts;
+  }
+
+  const stopWords = new Set([
+    'about', 'our', 'the', 'and', 'for', 'with', 'this', 'that', 'from', 'into', 'your',
+    'business', 'posts', 'post', 'find', 'related', 'reddit',
+  ]);
+  const rawTerms = normalizedTopic.match(/[a-z0-9]{3,}/gi) || [];
+  const uniqueTerms = [...new Set(rawTerms.map((term) => term.toLowerCase()).filter((term) => !stopWords.has(term)))];
+
+  if (!uniqueTerms.length) {
+    return posts;
+  }
+
+  const matches = posts.filter((post) => {
+    const haystack = String([
+      post.title || '',
+      post.content || '',
+      post.postText || '',
+    ].join(' ')).toLowerCase();
+    const hitCount = uniqueTerms.reduce((count, term) => count + (haystack.includes(term) ? 1 : 0), 0);
+    return hitCount > 0;
+  });
+
+  return matches;
+}
+
 function startOperatorConsole(deps) {
   const {
     page,
@@ -968,6 +1074,7 @@ function startOperatorConsole(deps) {
     listVisibleGroups,
     listVisibleNotifications,
     listVisiblePosts,
+    listVisibleRedditPosts,
     scrapeGroupFeed,
     scrapeInboxPreviews,
     isRelevantAmazonGroupName,
@@ -993,6 +1100,8 @@ function startOperatorConsole(deps) {
     commentOnQualifiedPost,
     commentAnchoredPost,
     planObjective,
+    searchRedditPosts,
+    inspectRedditSession,
     saveNewSkill,
     postCommentOnVisiblePost,
     createNewPost,
@@ -1002,6 +1111,8 @@ function startOperatorConsole(deps) {
     upsertAgentState,
     humanJitter,
     appendRecoveryLesson,
+    visitRedditHome,
+    visitSubreddit,
   } = deps;
   const FACEBOOK_HOME_URL = 'https://www.facebook.com/';
 
@@ -1094,6 +1205,17 @@ function startOperatorConsole(deps) {
     });
     await page.waitForLoadState('networkidle').catch(() => null);
     await page.waitForTimeout(3_000);
+    context.currentPlatform = 'facebook';
+    context.currentSurface = 'feed';
+    context.currentGroup = null;
+    context.lastPosts = [];
+  }
+
+  async function openRedditHome() {
+    if (typeof visitRedditHome === 'function') {
+      await visitRedditHome();
+    }
+    context.currentPlatform = 'reddit';
     context.currentSurface = 'feed';
     context.currentGroup = null;
     context.lastPosts = [];
@@ -1124,6 +1246,9 @@ function startOperatorConsole(deps) {
     if (tool === 'help') {
       return [
         'You can ask naturally, for example:',
+        '- go to reddit',
+        '- show me 10 recent posts from r/FulfillmentByAmazon',
+        '- find reddit posts about amazon reimbursement',
         '- give me the list of joined groups',
         '- show only amazon groups',
         '- go to group 12 and find amazon lead posts',
@@ -1153,7 +1278,35 @@ function startOperatorConsole(deps) {
       const joined = await getGroupsByStatus('joined', { limit: 500 });
       const pending = await getGroupsByStatus('pending', { limit: 500 });
       const discovered = await getGroupsByStatus('discovered', { limit: 500 });
-      return `Status: ${joined.length} joined, ${pending.length} pending, ${discovered.length} discovered. Mode: ${context.executionMode}. Current group: ${context.currentGroup?.name || 'none'}.`;
+      return `Status: ${joined.length} joined, ${pending.length} pending, ${discovered.length} discovered. Mode: ${context.executionMode}. Platform: ${context.currentPlatform || 'facebook'}. Current group: ${context.currentGroup?.name || 'none'}.`;
+    }
+
+    if (tool === 'switch_platform') {
+      const platform = String(args.platform || 'facebook').toLowerCase() === 'reddit' ? 'reddit' : 'facebook';
+      if (platform === 'reddit') {
+        let redditSession = null;
+        await lock.runExclusive('operator:switch-platform-reddit', async () => {
+          await openRedditHome();
+          if (typeof inspectRedditSession === 'function') {
+            redditSession = await inspectRedditSession().catch(() => null);
+          }
+        });
+        await persistOperatorContext(state, upsertAgentState);
+        if (redditSession?.needsLogin) {
+          return 'Switched to Reddit. You do not look logged in there yet. Please log in first, then tell me what you want me to do on Reddit.';
+        }
+        if (redditSession?.uncertain) {
+          return 'Switched to Reddit. I could not confirm the login state yet. If you want replies or posting there, please make sure you are logged in first. Then tell me what you want me to do on Reddit.';
+        }
+        return 'Switched to Reddit. What do you want me to do on Reddit?';
+      }
+
+      await lock.runExclusive('operator:switch-platform-facebook', async () => {
+        await openHomeFeed();
+      });
+      context.currentPlatform = 'facebook';
+      await persistOperatorContext(state, upsertAgentState);
+      return 'Switched to Facebook.';
     }
 
     if (tool === 'debug_mode') {
@@ -1222,6 +1375,7 @@ function startOperatorConsole(deps) {
 
       groups = groups.slice(0, limit);
 
+      context.currentPlatform = 'facebook';
       context.lastListedGroups = groups;
       await persistOperatorContext(state, upsertAgentState);
       return formatGroups(groups, args.amazon_only ? 'Amazon-matching groups' : 'Tracked groups');
@@ -1249,6 +1403,7 @@ function startOperatorConsole(deps) {
       await lock.runExclusive('operator:open-group', async () => {
         await visitGroup(page, group.url);
       });
+      context.currentPlatform = 'facebook';
       context.currentSurface = 'group';
       context.currentGroup = group;
       context.lastPosts = [];
@@ -1308,6 +1463,7 @@ function startOperatorConsole(deps) {
           await lock.runExclusive('operator:open-group-for-show-posts', async () => {
             await visitGroup(page, selected.url);
           });
+          context.currentPlatform = 'facebook';
           context.currentSurface = 'group';
           context.currentGroup = selected;
           context.lastPosts = [];
@@ -1320,12 +1476,13 @@ function startOperatorConsole(deps) {
           : currentPosts().slice(0, Math.max(1, Number(args.limit || currentPosts().length)));
         return formatOriginalPosts(chosenPosts, 'Current posts');
       }
-      if (context.currentGroup?.url && typeof listVisiblePosts === 'function') {
+      if ((context.currentSurface === 'feed' || context.currentGroup?.url) && typeof listVisiblePosts === 'function') {
         const visiblePostsResult = await lock.runExclusive('operator:list-visible-posts', async () =>
           listVisiblePosts({
             limit: Math.max(1, Number(args.limit || 12)),
             scrollRounds: 3,
             returnMeta: true,
+            validationMode: 'engagement',
           })
         );
         const visiblePosts = Array.isArray(visiblePostsResult?.posts) ? visiblePostsResult.posts : [];
@@ -1337,7 +1494,7 @@ function startOperatorConsole(deps) {
           );
           logDebug(
             context,
-            `visible post debug: url=${debugInfo.url || page.url()} feed_container=${debugInfo.feedContainerStatus?.found ? 'yes' : 'no'} top_level_articles=${debugInfo.feedContainerStatus?.topLevelArticleCount || 0}`
+            `visible post debug: url=${debugInfo.url || page.url()} feed_container=${debugInfo.feedContainerStatus?.found ? 'yes' : 'no'} top_level_articles=${debugInfo.feedContainerStatus?.topLevelArticleCount || 0} validation=${debugInfo.validationMode || 'engagement'}`
           );
           for (const rejection of (debugInfo.rejections || []).slice(0, 20)) {
             logDebug(
@@ -1369,7 +1526,12 @@ function startOperatorConsole(deps) {
           const chosenPosts = args.random
             ? [...context.lastPosts].sort(() => Math.random() - 0.5).slice(0, Math.max(1, Number(args.limit || 5)))
             : context.lastPosts.slice(0, Math.max(1, Number(args.limit || context.lastPosts.length)));
-          return formatOriginalPosts(chosenPosts, `Visible posts in ${context.currentGroup.name || context.currentGroup.label}`);
+          return formatOriginalPosts(
+            chosenPosts,
+            context.currentSurface === 'feed'
+              ? 'Visible posts in your home feed'
+              : `Visible posts in ${context.currentGroup.name || context.currentGroup.label}`
+          );
         }
       }
       if (context.currentGroup?.name) {
@@ -1379,6 +1541,163 @@ function startOperatorConsole(deps) {
         return 'I opened your home feed, but I could not read visible original posts right now.';
       }
       return summarizeRecentPostsFromDb(getCollections, callOllama, model);
+    }
+
+    if (tool === 'reddit_show_posts') {
+      const subreddit = String(args.subreddit || '').trim();
+      if (!subreddit) {
+        return 'I need a subreddit name like r/FulfillmentByAmazon.';
+      }
+
+      await lock.runExclusive('operator:reddit-open-subreddit', async () => {
+        await visitSubreddit(subreddit);
+      });
+      context.currentPlatform = 'reddit';
+      context.currentSurface = `subreddit:${subreddit}`;
+      context.currentGroup = null;
+
+      const result = await lock.runExclusive('operator:reddit-list-posts', async () =>
+        listVisibleRedditPosts({
+          limit: Math.max(1, Number(args.limit || 10)),
+          scrollRounds: 2,
+          returnMeta: true,
+        })
+      );
+
+      const posts = Array.isArray(result?.posts) ? result.posts : [];
+      if (context.debugMode) {
+        logDebug(
+          context,
+          `reddit post scan: url=${result?.debug?.url || page.url()} cards=${result?.debug?.articleCount || 0} kept=${result?.debug?.keptCount || 0}`
+        );
+      }
+
+      context.lastPosts = posts.map((post) => ({
+        post_id: post.postId,
+        post_url: post.postUrl,
+        content: post.postText,
+        title: post.title,
+        author: post.authorName || 'Unknown',
+        visible_index: post.visibleIndex,
+        platform: 'reddit',
+        subreddit: post.subreddit || subreddit,
+      }));
+      await persistOperatorContext(state, upsertAgentState);
+
+      if (!context.lastPosts.length) {
+        return `I opened r/${subreddit}, but I couldn't find visible Reddit posts right now.`;
+      }
+
+      return formatOriginalPosts(
+        context.lastPosts.slice(0, Math.max(1, Number(args.limit || context.lastPosts.length))),
+        `Visible posts in r/${subreddit}`
+      );
+    }
+
+    if (tool === 'reddit_search_posts') {
+      const query = String(args.query || '').trim();
+      if (!query) {
+        return 'I need a Reddit search query.';
+      }
+
+      await lock.runExclusive('operator:reddit-search', async () => {
+        await searchRedditPosts(query);
+      });
+      context.currentPlatform = 'reddit';
+      context.currentSurface = 'search';
+      context.currentGroup = null;
+
+      const result = await lock.runExclusive('operator:reddit-search-posts', async () =>
+        listVisibleRedditPosts({
+          limit: Math.max(1, Number(args.limit || 10)),
+          scrollRounds: 2,
+          returnMeta: true,
+        })
+      );
+      const posts = Array.isArray(result?.posts) ? result.posts : [];
+      context.lastPosts = posts.map((post) => ({
+        post_id: post.postId,
+        post_url: post.postUrl,
+        content: post.postText,
+        title: post.title,
+        author: post.authorName || 'Unknown',
+        visible_index: post.visibleIndex,
+        platform: 'reddit',
+        subreddit: post.subreddit || '',
+      }));
+      await persistOperatorContext(state, upsertAgentState);
+
+      if (!context.lastPosts.length) {
+        return `I searched Reddit for "${query}", but I couldn't find visible posts right now.`;
+      }
+
+      return formatOriginalPosts(context.lastPosts, `Reddit posts for "${query}"`);
+    }
+
+    if (tool === 'reddit_scan_posts') {
+      if (context.currentPlatform !== 'reddit') {
+        return 'Switch to Reddit first, then I can scan the current Reddit page.';
+      }
+
+      const topic = String(args.topic || '').trim();
+      const isRedditHome = String(context.currentSurface || '').toLowerCase() === 'feed';
+      if (isRedditHome && topic) {
+        await lock.runExclusive('operator:reddit-search-from-home', async () => {
+          await searchRedditPosts(topic);
+        });
+        context.currentSurface = `search:${topic}`;
+        context.lastPosts = [];
+      }
+
+      if (isRedditHome && !topic) {
+        return 'I am on the Reddit home page right now. Tell me a subreddit like r/FulfillmentByAmazon or ask me to search Reddit for a topic.';
+      }
+
+      let posts = currentPosts().filter((post) => String(post.platform || '').toLowerCase() === 'reddit');
+      if (!posts.length) {
+        const result = await lock.runExclusive('operator:reddit-scan-current-page', async () =>
+          listVisibleRedditPosts({
+            limit: Math.max(1, Number(args.limit || 10)),
+            scrollRounds: 2,
+            returnMeta: true,
+          })
+        );
+        posts = (Array.isArray(result?.posts) ? result.posts : []).map((post) => ({
+          post_id: post.postId,
+          post_url: post.postUrl,
+          content: post.postText,
+          title: post.title,
+          author: post.authorName || 'Unknown',
+          visible_index: post.visibleIndex,
+          platform: 'reddit',
+          subreddit: post.subreddit || '',
+        }));
+        if (context.debugMode) {
+          logDebug(
+            context,
+            `reddit post scan: url=${result?.debug?.url || page.url()} cards=${result?.debug?.articleCount || 0} kept=${result?.debug?.keptCount || 0}`
+          );
+        }
+        context.lastPosts = posts;
+        await persistOperatorContext(state, upsertAgentState);
+      }
+
+      const keywordMatched = topic ? keywordFilterPosts(posts, topic) : posts;
+      const filtered = topic && keywordMatched.length
+        ? await filterPostsByTopic(keywordMatched, topic, callOllama, model)
+        : keywordMatched;
+      const limit = Math.max(1, Number(args.limit || filtered.length || 10));
+
+      if (!filtered.length) {
+        return topic
+          ? `I checked the current Reddit posts but found nothing clearly related to "${topic}".`
+          : 'I checked the current Reddit posts, but I could not find visible posts right now.';
+      }
+
+      return formatOriginalPosts(
+        filtered.slice(0, limit),
+        topic ? `Matched Reddit posts for "${topic}"` : 'Visible Reddit posts'
+      );
     }
 
     if (tool === 'like_post') {
@@ -1425,6 +1744,7 @@ function startOperatorConsole(deps) {
         await lock.runExclusive('operator:open-group-for-random-likes', async () => {
           await visitGroup(page, targetGroup.url);
         });
+        context.currentPlatform = 'facebook';
         context.currentSurface = 'group';
         context.currentGroup = targetGroup;
         context.lastPosts = [];
@@ -1432,21 +1752,21 @@ function startOperatorConsole(deps) {
 
       let recentPosts = await lock.runExclusive('operator:scrape-random-like-posts', async () =>
         (typeof listVisiblePosts === 'function'
-          ? listVisiblePosts({ limit: Math.max(requestedCount * 2, 12), scrollRounds: 2 })
-          : scrapeGroupFeed(page, { limit: Math.max(requestedCount * 2, 12), scrollRounds: 2 }))
+          ? listVisiblePosts({ limit: Math.max(requestedCount * 2, 12), scrollRounds: 2, validationMode: 'engagement' })
+          : scrapeGroupFeed(page, { limit: Math.max(requestedCount * 2, 12), scrollRounds: 2, validationMode: 'engagement' }))
       );
 
       if (recentPosts.length < requestedCount) {
         recentPosts = await lock.runExclusive('operator:scrape-random-like-posts-more', async () =>
           (typeof listVisiblePosts === 'function'
-            ? listVisiblePosts({ limit: Math.max(requestedCount * 3, 15), scrollRounds: 5 })
-            : scrapeGroupFeed(page, { limit: Math.max(requestedCount * 3, 15), scrollRounds: 5 }))
+            ? listVisiblePosts({ limit: Math.max(requestedCount * 3, 15), scrollRounds: 5, validationMode: 'engagement' })
+            : scrapeGroupFeed(page, { limit: Math.max(requestedCount * 3, 15), scrollRounds: 5, validationMode: 'engagement' }))
         );
       }
 
       if (!recentPosts.length) {
         await persistOperatorContext(state, upsertAgentState);
-        return `I opened ${targetGroup.name}, but I couldn't find visible posts to like right now.`;
+        return `I opened ${surface === 'feed' ? 'your home feed' : targetGroup.name}, but I couldn't find visible posts to like right now.`;
       }
 
       let likedCount = 0;
@@ -1458,7 +1778,7 @@ function startOperatorConsole(deps) {
       candidatePosts.forEach((post) => {
         logDebug(
           context,
-          `like candidate ${post.postId || post.visibleIndex}: visibleIndex=${post.visibleIndex} selection=${selection}`
+          `like candidate ${post.postId || post.visibleIndex}: visibleIndex=${post.visibleIndex} selection=${selection} controls=${(post.controlNames || []).join(',') || 'none'}`
         );
       });
 
@@ -1522,6 +1842,7 @@ function startOperatorConsole(deps) {
         await lock.runExclusive('operator:open-group-for-random-comments', async () => {
           await visitGroup(page, targetGroup.url);
         });
+        context.currentPlatform = 'facebook';
         context.currentSurface = 'group';
         context.currentGroup = targetGroup;
         context.lastPosts = [];
@@ -1529,15 +1850,15 @@ function startOperatorConsole(deps) {
 
       let visiblePosts = await lock.runExclusive('operator:list-visible-posts-for-random-comments', async () =>
         (typeof listVisiblePosts === 'function'
-          ? listVisiblePosts({ limit: Math.max(requestedCount * 2, 10), scrollRounds: 2 })
-          : scrapeGroupFeed(page, { limit: Math.max(requestedCount * 2, 10), scrollRounds: 2 }))
+          ? listVisiblePosts({ limit: Math.max(requestedCount * 2, 10), scrollRounds: 2, validationMode: 'engagement' })
+          : scrapeGroupFeed(page, { limit: Math.max(requestedCount * 2, 10), scrollRounds: 2, validationMode: 'engagement' }))
       );
 
       if (visiblePosts.length < requestedCount) {
         visiblePosts = await lock.runExclusive('operator:list-visible-posts-for-random-comments-more', async () =>
           (typeof listVisiblePosts === 'function'
-            ? listVisiblePosts({ limit: Math.max(requestedCount * 3, 15), scrollRounds: 5 })
-            : scrapeGroupFeed(page, { limit: Math.max(requestedCount * 3, 15), scrollRounds: 5 }))
+            ? listVisiblePosts({ limit: Math.max(requestedCount * 3, 15), scrollRounds: 5, validationMode: 'engagement' })
+            : scrapeGroupFeed(page, { limit: Math.max(requestedCount * 3, 15), scrollRounds: 5, validationMode: 'engagement' }))
         );
       }
 
@@ -1552,7 +1873,7 @@ function startOperatorConsole(deps) {
       candidatePosts.forEach((post) => {
         logDebug(
           context,
-          `comment candidate ${post.postId || post.visibleIndex}: visibleIndex=${post.visibleIndex} selection=${selection}`
+          `comment candidate ${post.postId || post.visibleIndex}: visibleIndex=${post.visibleIndex} selection=${selection} controls=${(post.controlNames || []).join(',') || 'none'}`
         );
       });
       let commentedCount = 0;
@@ -1654,6 +1975,10 @@ function startOperatorConsole(deps) {
       const allowed = await maybeConfirm(`Post this comment on post ${args.post_index}`);
       if (!allowed) {
         return `Draft kept for post ${args.post_index}:\n${draft.reply}`;
+      }
+
+      if (context.currentPlatform === 'reddit') {
+        return `Reddit live commenting is not wired yet.\n\nDraft comment for post ${args.post_index}:\n${draft.reply}`;
       }
 
       await lock.runExclusive('operator:comment-post', async () => {
@@ -1860,6 +2185,14 @@ function startOperatorConsole(deps) {
   }
 
   async function fallbackPlan(raw) {
+    const platformScoped = inferPlatformScopedIntent(raw, context);
+    if (platformScoped) {
+      return {
+        assistantReply: '',
+        actions: [platformScoped],
+      };
+    }
+
     const routed = await routeOperatorIntent(raw, {
       callOllama,
       model,
@@ -1911,6 +2244,44 @@ function startOperatorConsole(deps) {
           tool: 'debug_mode',
           args: {
             enabled: routed.enabled,
+          },
+        }],
+      };
+    }
+
+    if (routed.type === 'switch_platform') {
+      return {
+        assistantReply: '',
+        actions: [{
+          tool: 'switch_platform',
+          args: {
+            platform: routed.platform || 'facebook',
+          },
+        }],
+      };
+    }
+
+    if (routed.type === 'reddit_show_posts') {
+      return {
+        assistantReply: '',
+        actions: [{
+          tool: 'reddit_show_posts',
+          args: {
+            subreddit: routed.subreddit,
+            limit: routed.limit || 10,
+          },
+        }],
+      };
+    }
+
+    if (routed.type === 'reddit_search_posts') {
+      return {
+        assistantReply: '',
+        actions: [{
+          tool: 'reddit_search_posts',
+          args: {
+            query: routed.query,
+            limit: routed.limit || 10,
           },
         }],
       };
@@ -2065,10 +2436,13 @@ function startOperatorConsole(deps) {
       'draft_post',
     ]);
     let objectivePlan = null;
+    const platformScopedIntent = inferPlatformScopedIntent(raw, context);
     const directIntent = inferDirectActionIntent(raw);
 
-    if (directIntent) {
-      const plan = await fallbackPlan(raw);
+    if (platformScopedIntent || directIntent) {
+      const plan = platformScopedIntent
+        ? { assistantReply: '', actions: [platformScopedIntent] }
+        : await fallbackPlan(raw);
       if (plan.assistantReply) {
         console.log(plan.assistantReply);
         outputs.push(plan.assistantReply);
@@ -2280,6 +2654,7 @@ module.exports = {
   answerOperatorQuestion,
   buildDashboard,
   inferIntentHeuristically,
+  inferPlatformScopedIntent,
   planOperatorMessage,
   resolveNamedGroup,
   routeOperatorIntent,

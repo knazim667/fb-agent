@@ -11,6 +11,7 @@ const { createGroupsApi } = require('./browser/groups');
 const { createInteractionsApi } = require('./browser/interactions');
 const { createNotificationsApi } = require('./browser/notifications');
 const { createPerceptionApi } = require('./browser/perception');
+const { REDDIT_BASE_URL, createRedditApi } = require('./browser/reddit');
 
 chromium.use(StealthPlugin());
 
@@ -207,6 +208,16 @@ const {
   executeAgentAction,
   getSimplifiedDOM,
 } = createPerceptionApi();
+const {
+  inspectRedditSession,
+  listVisibleRedditPosts,
+  normalizeSubredditName,
+  searchPosts: searchRedditPosts,
+  visitRedditHome,
+  visitSubreddit,
+} = createRedditApi({
+  randomBetween,
+});
 
 async function launchBrowser({
   headless = false,
@@ -330,6 +341,7 @@ async function openTaskGroups(page, taskInputPath = DEFAULT_TASK_INPUT_PATH) {
 module.exports = {
   DEFAULT_TASK_INPUT_PATH,
   DEFAULT_USER_DATA_DIR,
+  REDDIT_BASE_URL,
   closeBrowser,
   anchorVisiblePost,
   clickLike,
@@ -352,15 +364,18 @@ module.exports = {
   getSimplifiedDOM,
   handleJoinGroup,
   humanJitter,
+  inspectRedditSession,
   likeAnchoredPost,
   launchBrowser,
   extractVisiblePostAnchors,
   listVisibleGroups: listVisibleJoinedGroups,
   listVisibleNotifications,
   listVisiblePosts,
+  listVisibleRedditPosts,
   loadGroupFeedPosts,
   markNotificationsRead,
   lightHumanPause,
+  normalizeSubredditName,
   openTaskGroups,
   parseActivityToHours,
   postComment,
@@ -372,7 +387,10 @@ module.exports = {
   scrapeInboxPreviews,
   scrapeNotifications,
   scrapeGroupFeed,
+  searchRedditPosts,
   sendInboxReply,
   verifyAnchoredAction,
   visitGroup,
+  visitRedditHome,
+  visitSubreddit,
 };

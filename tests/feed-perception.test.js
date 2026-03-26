@@ -62,7 +62,49 @@ test('isVisiblePostCandidate allows missing timestamp when other post signals ar
       bodyText: 'Super results on Walmart USA with strong order volume and profit details.',
       actionControlCount: 3,
       timestampText: '',
+      validationMode: 'engagement',
+      controlNames: ['like', 'comment', 'share'],
     }),
     true
+  );
+});
+
+test('isVisiblePostCandidate accepts top-level engagement posts with like and reply controls', () => {
+  assert.equal(
+    isVisiblePostCandidate({
+      authorName: 'Courtney Turner',
+      bodyText: 'I think my issue is that sometimes items are similar but different manufacturers and descriptions.',
+      actionControlCount: 2,
+      timestampText: '1y',
+      validationMode: 'engagement',
+      controlNames: ['like', 'reply'],
+    }),
+    true
+  );
+});
+
+test('isVisiblePostCandidate keeps business scanning stricter than engagement', () => {
+  const candidate = {
+    authorName: 'Seller Example',
+    bodyText: 'Sharing a quick update from this week about pricing and product movement.',
+    actionControlCount: 1,
+    timestampText: '',
+    controlNames: ['like'],
+  };
+
+  assert.equal(
+    isVisiblePostCandidate({
+      ...candidate,
+      validationMode: 'engagement',
+    }),
+    true
+  );
+
+  assert.equal(
+    isVisiblePostCandidate({
+      ...candidate,
+      validationMode: 'business',
+    }),
+    false
   );
 });

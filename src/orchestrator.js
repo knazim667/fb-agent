@@ -58,6 +58,7 @@ const {
   getSimplifiedDOM,
   handleJoinGroup,
   humanJitter,
+  inspectRedditSession,
   inspectGroupActivity,
   inspectGroupMembershipStatus,
   isCreatePostComposerVisible,
@@ -68,11 +69,13 @@ const {
   listVisibleGroups,
   listVisibleNotifications,
   listVisiblePosts,
+  listVisibleRedditPosts,
   markNotificationsRead,
   postComment,
   postCommentOnVisiblePost,
   readTaskInput,
   classifyPageState,
+  searchRedditPosts,
   scrapeGroupFeed,
   scrapeInboxPreviews,
   scrapeJoinApprovalNotifications,
@@ -80,6 +83,8 @@ const {
   scrapeNotifications,
   sendInboxReply,
   visitGroup,
+  visitRedditHome,
+  visitSubreddit,
 } = require('./browser');
 const {
   appendThreadHistory,
@@ -602,7 +607,7 @@ function normalizePostUrl(url = '') {
 }
 
 async function extractLeadPostsFromCurrentPage(page, groupLabel, skill, state, topic = '') {
-  const visiblePosts = await listVisiblePosts(page, { limit: 12, scrollRounds: 1 });
+  const visiblePosts = await listVisiblePosts(page, { limit: 12, scrollRounds: 1, validationMode: 'business' });
   const posts = visiblePosts.map((post) => ({
     visible_index: post.visibleIndex,
     post_id: post.postId,
@@ -745,7 +750,7 @@ async function scanGroupWithReasoningLoop(page, group, skill, state, options = {
     return [];
   }
 
-  const immediatelyVisiblePosts = await listVisiblePosts(page, { limit: 8, scrollRounds: 1 }).catch(() => []);
+  const immediatelyVisiblePosts = await listVisiblePosts(page, { limit: 8, scrollRounds: 1, validationMode: 'business' }).catch(() => []);
 
   if (!immediatelyVisiblePosts.length) {
     const loopResult = await runPerceiveReasonActLoop(page, {
@@ -1284,7 +1289,7 @@ async function scanGroupFeed(page, group, skill, goalSummary, state) {
     return [];
   }
 
-  const scrapedPosts = await listVisiblePosts(page, { limit: 18, scrollRounds: 2 });
+  const scrapedPosts = await listVisiblePosts(page, { limit: 18, scrollRounds: 2, validationMode: 'business' });
   await updateGroupLastScanned(group.url, new Date());
   state.scrapedPosts += scrapedPosts.length;
   console.log(`Scraped ${scrapedPosts.length} posts from ${group.label}`);
@@ -1854,6 +1859,7 @@ async function runAssistantSession(options = {}) {
       listVisibleGroups: () => listVisibleGroups(browser.page, { limit: 200, scrollRounds: 8 }),
       listVisibleNotifications: (optionsArg) => listVisibleNotifications(browser.page, optionsArg),
       listVisiblePosts: (optionsArg) => listVisiblePosts(browser.page, optionsArg),
+      listVisibleRedditPosts: (optionsArg) => listVisibleRedditPosts(browser.page, optionsArg),
       isRelevantAmazonGroupName,
       getCollections,
       callOllama,
@@ -1882,6 +1888,7 @@ async function runAssistantSession(options = {}) {
       commentOnQualifiedPost: (candidate, options) => commentOnQualifiedPost(browser.page, skill, candidate, state, options),
       commentAnchoredPost: (visibleIndex, text, options) => commentAnchoredPost(browser.page, visibleIndex, text, options),
       planObjective: (payload, options) => planObjective(payload, options),
+      searchRedditPosts: (query) => searchRedditPosts(browser.page, query),
       saveNewSkill,
       postCommentOnVisiblePost: (visibleIndex, text) => postCommentOnVisiblePost(browser.page, visibleIndex, text),
       createNewPost,
@@ -1893,7 +1900,10 @@ async function runAssistantSession(options = {}) {
       replyToNotificationItem: (notification) => replyToNotificationItem(browser.page, skill, state, notification),
       upsertAgentState,
       humanJitter,
+      inspectRedditSession: () => inspectRedditSession(browser.page),
       appendRecoveryLesson,
+      visitRedditHome: () => visitRedditHome(browser.page),
+      visitSubreddit: (subreddit) => visitSubreddit(browser.page, subreddit),
       runQueuedJobs: () => runQueuedJobs(runtimeContext),
     });
 
