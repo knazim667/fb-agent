@@ -207,6 +207,13 @@ test('heuristic router maps reddit login inspection', () => {
   );
 });
 
+test('heuristic router maps facebook scan phrasing', () => {
+  assert.deepEqual(
+    inferIntentHeuristically('search on facebook about amazon reimbursement, amazon inventory issues, amazon fees'),
+    { type: 'scan' }
+  );
+});
+
 test('heuristic router maps subreddit post listing', () => {
   const intent = inferIntentHeuristically('show me 10 recent posts from r/FulfillmentByAmazon');
   assert.equal(intent.type, 'reddit_show_posts');
@@ -239,6 +246,14 @@ test('platform scoped reddit scan is ignored outside reddit', () => {
   const intent = inferPlatformScopedIntent(
     'find post related about our amazon hidden money business',
     { currentPlatform: 'facebook' }
+  );
+  assert.equal(intent, null);
+});
+
+test('platform scoped reddit scan is ignored when facebook is explicitly requested', () => {
+  const intent = inferPlatformScopedIntent(
+    'search on facebook about amazon reimbursement, amazon inventory issues, amazon fees',
+    { currentPlatform: 'reddit' }
   );
   assert.equal(intent, null);
 });
