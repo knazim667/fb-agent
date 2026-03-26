@@ -209,9 +209,11 @@ const {
   getSimplifiedDOM,
 } = createPerceptionApi();
 const {
+  classifyRedditPage,
   inspectRedditSession,
   listVisibleRedditPosts,
   normalizeSubredditName,
+  observeRedditPage,
   searchPosts: searchRedditPosts,
   visitRedditHome,
   visitSubreddit,
@@ -342,6 +344,7 @@ module.exports = {
   DEFAULT_TASK_INPUT_PATH,
   DEFAULT_USER_DATA_DIR,
   REDDIT_BASE_URL,
+  classifyRedditPage,
   closeBrowser,
   anchorVisiblePost,
   clickLike,
@@ -376,6 +379,7 @@ module.exports = {
   markNotificationsRead,
   lightHumanPause,
   normalizeSubredditName,
+  observeRedditPage,
   openTaskGroups,
   parseActivityToHours,
   postComment,

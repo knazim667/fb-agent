@@ -46,6 +46,7 @@ function ensureOperatorContext(state) {
       lastPosts: [],
       lastNotifications: [],
       lastDraft: null,
+      lastObservedRedditUrl: '',
       conversationHistory: [],
     };
   }
@@ -83,6 +84,7 @@ async function persistOperatorContext(state, upsertAgentState) {
     lastPosts: context.lastPosts,
     lastNotifications: context.lastNotifications,
     lastDraft: context.lastDraft,
+    lastObservedRedditUrl: context.lastObservedRedditUrl || '',
     conversationHistory: context.conversationHistory.slice(-12),
   });
 }
@@ -1102,6 +1104,7 @@ function startOperatorConsole(deps) {
     planObjective,
     searchRedditPosts,
     inspectRedditSession,
+    observeRedditPage,
     saveNewSkill,
     postCommentOnVisiblePost,
     createNewPost,
@@ -1209,6 +1212,7 @@ function startOperatorConsole(deps) {
     context.currentSurface = 'feed';
     context.currentGroup = null;
     context.lastPosts = [];
+    context.lastObservedRedditUrl = '';
   }
 
   async function openRedditHome() {
@@ -1216,9 +1220,91 @@ function startOperatorConsole(deps) {
       await visitRedditHome();
     }
     context.currentPlatform = 'reddit';
-    context.currentSurface = 'feed';
+    context.currentSurface = 'reddit_home';
     context.currentGroup = null;
     context.lastPosts = [];
+    context.lastObservedRedditUrl = '';
+  }
+
+  async function observePlatformPage(options = {}) {
+    if (String(context.currentPlatform || 'facebook').toLowerCase() === 'reddit' && typeof observeRedditPage === 'function') {
+      const observation = await observeRedditPage(options);
+      context.currentSurface = observation.state || context.currentSurface || 'reddit_unknown';
+      return observation;
+    }
+
+    return {
+      platform: 'facebook',
+      state: context.currentSurface === 'group' ? 'facebook_group_feed' : 'facebook_feed',
+      url: page.url(),
+    };
+  }
+
+  function planNextAction({ goal, observation, args = {} }) {
+    if (observation?.platform !== 'reddit') {
+      return { type: 'none' };
+    }
+
+    if (observation.state === 'reddit_login') {
+      return { type: 'answer', message: 'You are not logged in on Reddit yet. Please log in first, then tell me what you want me to do on Reddit.' };
+    }
+
+    if (goal === 'switch_platform') {
+      return { type: 'none' };
+    }
+
+    if (goal === 'reddit_scan_posts') {
+      const topic = String(args.topic || '').trim();
+      if (observation.state === 'reddit_home' && !topic) {
+        return { type: 'answer', message: 'I am on the Reddit home page right now. Tell me a subreddit like r/FulfillmentByAmazon or ask me to search Reddit for a topic.' };
+      }
+      if (observation.state === 'reddit_home' && topic) {
+        return { type: 'search', query: topic };
+      }
+    }
+
+    return { type: 'none' };
+  }
+
+  async function executePlannedAction(plan) {
+    if (!plan || plan.type === 'none') {
+      return null;
+    }
+
+    if (plan.type === 'search') {
+      await lock.runExclusive('operator:reddit-plan-search', async () => {
+        await searchRedditPosts(plan.query);
+      });
+      context.currentPlatform = 'reddit';
+      context.currentSurface = `reddit_search_results:${plan.query}`;
+      context.currentGroup = null;
+      context.lastPosts = [];
+      return { type: 'search', query: plan.query };
+    }
+
+    return null;
+  }
+
+  async function verifyOutcome({ expectedStates = [] } = {}) {
+    const observation = await observePlatformPage();
+    const ok = !expectedStates.length || expectedStates.includes(observation.state);
+    return {
+      ok,
+      observation,
+    };
+  }
+
+  function storeRedditPosts(posts = []) {
+    context.lastPosts = posts.map((post) => ({
+      post_id: post.postId,
+      post_url: post.postUrl,
+      content: post.postText,
+      title: post.title,
+      author: post.authorName || 'Unknown',
+      visible_index: post.visibleIndex,
+      platform: 'reddit',
+      subreddit: post.subreddit || '',
+    }));
   }
 
   async function resolveTargetGroup(args = {}) {
@@ -1284,18 +1370,15 @@ function startOperatorConsole(deps) {
     if (tool === 'switch_platform') {
       const platform = String(args.platform || 'facebook').toLowerCase() === 'reddit' ? 'reddit' : 'facebook';
       if (platform === 'reddit') {
-        let redditSession = null;
         await lock.runExclusive('operator:switch-platform-reddit', async () => {
           await openRedditHome();
-          if (typeof inspectRedditSession === 'function') {
-            redditSession = await inspectRedditSession().catch(() => null);
-          }
         });
+        const observation = await observePlatformPage();
         await persistOperatorContext(state, upsertAgentState);
-        if (redditSession?.needsLogin) {
+        if (observation?.state === 'reddit_login' || observation?.needsLogin) {
           return 'Switched to Reddit. You do not look logged in there yet. Please log in first, then tell me what you want me to do on Reddit.';
         }
-        if (redditSession?.uncertain) {
+        if (observation?.uncertain) {
           return 'Switched to Reddit. I could not confirm the login state yet. If you want replies or posting there, please make sure you are logged in first. Then tell me what you want me to do on Reddit.';
         }
         return 'Switched to Reddit. What do you want me to do on Reddit?';
@@ -1553,37 +1636,28 @@ function startOperatorConsole(deps) {
         await visitSubreddit(subreddit);
       });
       context.currentPlatform = 'reddit';
-      context.currentSurface = `subreddit:${subreddit}`;
+      context.currentSurface = `reddit_subreddit_feed:${subreddit}`;
       context.currentGroup = null;
 
-      const result = await lock.runExclusive('operator:reddit-list-posts', async () =>
-        listVisibleRedditPosts({
-          limit: Math.max(1, Number(args.limit || 10)),
-          scrollRounds: 2,
-          returnMeta: true,
-        })
-      );
-
-      const posts = Array.isArray(result?.posts) ? result.posts : [];
+      const observation = await observePlatformPage({
+        includePosts: true,
+        limit: Math.max(1, Number(args.limit || 10)),
+        scrollRounds: 2,
+      });
+      const posts = Array.isArray(observation?.posts) ? observation.posts : [];
       if (context.debugMode) {
         logDebug(
           context,
-          `reddit post scan: url=${result?.debug?.url || page.url()} cards=${result?.debug?.articleCount || 0} kept=${result?.debug?.keptCount || 0}`
+          `reddit observe: state=${observation?.state || 'unknown'} url=${observation?.url || page.url()} cards=${observation?.postsDebug?.articleCount || observation?.articleCount || 0} kept=${observation?.postsDebug?.keptCount || posts.length}`
         );
       }
-
-      context.lastPosts = posts.map((post) => ({
-        post_id: post.postId,
-        post_url: post.postUrl,
-        content: post.postText,
-        title: post.title,
-        author: post.authorName || 'Unknown',
-        visible_index: post.visibleIndex,
-        platform: 'reddit',
-        subreddit: post.subreddit || subreddit,
-      }));
+      storeRedditPosts(posts.map((post) => ({ ...post, subreddit: post.subreddit || subreddit })));
+      context.lastObservedRedditUrl = observation?.url || page.url();
       await persistOperatorContext(state, upsertAgentState);
 
+      if (observation?.state === 'reddit_login' || observation?.needsLogin) {
+        return 'Reddit opened, but you are not logged in there yet. Please log in first, then ask again.';
+      }
       if (!context.lastPosts.length) {
         return `I opened r/${subreddit}, but I couldn't find visible Reddit posts right now.`;
       }
@@ -1604,29 +1678,31 @@ function startOperatorConsole(deps) {
         await searchRedditPosts(query);
       });
       context.currentPlatform = 'reddit';
-      context.currentSurface = 'search';
+      context.currentSurface = `reddit_search_results:${query}`;
       context.currentGroup = null;
 
-      const result = await lock.runExclusive('operator:reddit-search-posts', async () =>
-        listVisibleRedditPosts({
-          limit: Math.max(1, Number(args.limit || 10)),
-          scrollRounds: 2,
-          returnMeta: true,
-        })
-      );
-      const posts = Array.isArray(result?.posts) ? result.posts : [];
-      context.lastPosts = posts.map((post) => ({
-        post_id: post.postId,
-        post_url: post.postUrl,
-        content: post.postText,
-        title: post.title,
-        author: post.authorName || 'Unknown',
-        visible_index: post.visibleIndex,
-        platform: 'reddit',
-        subreddit: post.subreddit || '',
-      }));
+      const verification = await verifyOutcome({
+        expectedStates: ['reddit_search_results', 'reddit_subreddit_feed', 'reddit_post_detail'],
+      });
+      const observation = await observePlatformPage({
+        includePosts: true,
+        limit: Math.max(1, Number(args.limit || 10)),
+        scrollRounds: 2,
+      });
+      const posts = Array.isArray(observation?.posts) ? observation.posts : [];
+      if (context.debugMode) {
+        logDebug(
+          context,
+          `reddit observe: state=${observation?.state || 'unknown'} url=${observation?.url || page.url()} verify=${verification.ok ? 'ok' : 'mismatch'} cards=${observation?.postsDebug?.articleCount || observation?.articleCount || 0} kept=${observation?.postsDebug?.keptCount || posts.length}`
+        );
+      }
+      storeRedditPosts(posts);
+      context.lastObservedRedditUrl = observation?.url || page.url();
       await persistOperatorContext(state, upsertAgentState);
 
+      if (observation?.state === 'reddit_login' || observation?.needsLogin) {
+        return 'Reddit search opened, but you are not logged in there yet. Please log in first, then ask again.';
+      }
       if (!context.lastPosts.length) {
         return `I searched Reddit for "${query}", but I couldn't find visible posts right now.`;
       }
@@ -1640,29 +1716,45 @@ function startOperatorConsole(deps) {
       }
 
       const topic = String(args.topic || '').trim();
-      const isRedditHome = String(context.currentSurface || '').toLowerCase() === 'feed';
-      if (isRedditHome && topic) {
-        await lock.runExclusive('operator:reddit-search-from-home', async () => {
-          await searchRedditPosts(topic);
-        });
-        context.currentSurface = `search:${topic}`;
-        context.lastPosts = [];
+      let observation = await observePlatformPage();
+      if (context.debugMode) {
+        logDebug(
+          context,
+          `reddit observe: state=${observation?.state || 'unknown'} url=${observation?.url || page.url()} logged_in=${observation?.loggedIn ? 'yes' : 'no'} search_visible=${observation?.searchVisible ? 'yes' : 'no'}`
+        );
       }
 
-      if (isRedditHome && !topic) {
-        return 'I am on the Reddit home page right now. Tell me a subreddit like r/FulfillmentByAmazon or ask me to search Reddit for a topic.';
+      const plan = planNextAction({
+        goal: 'reddit_scan_posts',
+        observation,
+        args,
+      });
+
+      if (plan.type === 'answer') {
+        return plan.message;
+      }
+
+      if (plan.type !== 'none') {
+        await executePlannedAction(plan);
+        const verified = await verifyOutcome({
+          expectedStates: ['reddit_search_results', 'reddit_subreddit_feed', 'reddit_post_detail'],
+        });
+        observation = verified.observation;
+        if (!verified.ok && context.debugMode) {
+          logDebug(context, `reddit verify: expected search/subreddit/detail but saw ${observation?.state || 'unknown'}`);
+        }
       }
 
       let posts = currentPosts().filter((post) => String(post.platform || '').toLowerCase() === 'reddit');
-      if (!posts.length) {
-        const result = await lock.runExclusive('operator:reddit-scan-current-page', async () =>
-          listVisibleRedditPosts({
-            limit: Math.max(1, Number(args.limit || 10)),
-            scrollRounds: 2,
-            returnMeta: true,
-          })
-        );
-        posts = (Array.isArray(result?.posts) ? result.posts : []).map((post) => ({
+      const currentUrl = page.url();
+      const cachedUrl = String(context.lastObservedRedditUrl || '');
+      if (!posts.length || (currentUrl && cachedUrl && currentUrl !== cachedUrl)) {
+        observation = await observePlatformPage({
+          includePosts: true,
+          limit: Math.max(1, Number(args.limit || 10)),
+          scrollRounds: 2,
+        });
+        posts = Array.isArray(observation?.posts) ? observation.posts.map((post) => ({
           post_id: post.postId,
           post_url: post.postUrl,
           content: post.postText,
@@ -1671,14 +1763,15 @@ function startOperatorConsole(deps) {
           visible_index: post.visibleIndex,
           platform: 'reddit',
           subreddit: post.subreddit || '',
-        }));
+        })) : [];
         if (context.debugMode) {
           logDebug(
             context,
-            `reddit post scan: url=${result?.debug?.url || page.url()} cards=${result?.debug?.articleCount || 0} kept=${result?.debug?.keptCount || 0}`
+            `reddit observe: state=${observation?.state || 'unknown'} url=${observation?.url || page.url()} cards=${observation?.postsDebug?.articleCount || observation?.articleCount || 0} kept=${observation?.postsDebug?.keptCount || posts.length}`
           );
         }
         context.lastPosts = posts;
+        context.lastObservedRedditUrl = observation?.url || currentUrl;
         await persistOperatorContext(state, upsertAgentState);
       }
 

@@ -2,6 +2,35 @@
 
 const REDDIT_BASE_URL = 'https://www.reddit.com';
 
+function classifyRedditPage({
+  url = '',
+  needsLogin = false,
+} = {}) {
+  const normalizedUrl = String(url || '');
+
+  if (needsLogin || /\/login(?:\/|$)|\/register(?:\/|$)/i.test(normalizedUrl)) {
+    return 'reddit_login';
+  }
+
+  if (/\/r\/[^/]+\/comments\//i.test(normalizedUrl)) {
+    return 'reddit_post_detail';
+  }
+
+  if (/\/search(?:\/|\?|$)/i.test(normalizedUrl)) {
+    return 'reddit_search_results';
+  }
+
+  if (/\/r\/[^/?#]+\/?$/i.test(normalizedUrl)) {
+    return 'reddit_subreddit_feed';
+  }
+
+  if (/^https?:\/\/(?:www\.)?reddit\.com\/?(?:[?#].*)?$/i.test(normalizedUrl)) {
+    return 'reddit_home';
+  }
+
+  return 'reddit_unknown';
+}
+
 function createRedditApi({
   randomBetween,
 }) {
@@ -228,11 +257,111 @@ function createRedditApi({
     return extracted.posts || [];
   }
 
+  async function observeRedditPage(page, { includePosts = false, limit = 10, scrollRounds = 1 } = {}) {
+    await page.waitForLoadState('domcontentloaded').catch(() => null);
+    await page.waitForTimeout(800);
+
+    const session = await inspectRedditSession(page).catch(() => ({
+      loggedIn: false,
+      needsLogin: false,
+      uncertain: true,
+    }));
+
+    const surface = await page.evaluate(() => {
+      function normalize(text) {
+        return String(text || '').replace(/\s+/g, ' ').trim();
+      }
+
+      function isVisible(node) {
+        if (!node) {
+          return false;
+        }
+        const style = window.getComputedStyle(node);
+        const rect = node.getBoundingClientRect();
+        return style.display !== 'none'
+          && style.visibility !== 'hidden'
+          && rect.width > 0
+          && rect.height > 0;
+      }
+
+      const searchVisible = Array.from(document.querySelectorAll(
+        'faceplate-search-input input, input[type="search"], input[placeholder*="Search"], input[aria-label*="Search"]'
+      )).some((node) => isVisible(node));
+
+      const loginVisible = Array.from(document.querySelectorAll(
+        'a[href*="/login"], a[href*="/register"], button'
+      )).some((node) => {
+        if (!isVisible(node)) {
+          return false;
+        }
+        const text = normalize(node.innerText || node.getAttribute('aria-label') || '');
+        return /log in|sign up|continue with google|continue with email|continue with apple/i.test(text);
+      });
+
+      const subredditLink = Array.from(document.querySelectorAll('a[href^="/r/"]'))
+        .find((node) => isVisible(node) && /^\/r\/[^/]+\/?$/i.test(node.getAttribute('href') || ''));
+      const subreddit = normalize(subredditLink?.getAttribute('href') || '').replace(/^\/r\//i, '').replace(/\/+$/g, '');
+
+      const articleCount = Array.from(document.querySelectorAll(
+        'shreddit-post, article[data-testid="post-container"], div[data-testid="post-container"], article'
+      )).filter((node) => isVisible(node)).length;
+
+      return {
+        loginVisible,
+        searchVisible,
+        subreddit,
+        articleCount,
+        bodyPreview: normalize(document.body?.innerText || '').slice(0, 300),
+      };
+    }).catch(() => ({
+      loginVisible: false,
+      searchVisible: false,
+      subreddit: '',
+      articleCount: 0,
+      bodyPreview: '',
+    }));
+
+    const state = classifyRedditPage({
+      url: page.url(),
+      needsLogin: session.needsLogin,
+    });
+
+    let posts = [];
+    let postsDebug = null;
+    if (includePosts && ['reddit_home', 'reddit_subreddit_feed', 'reddit_search_results', 'reddit_post_detail'].includes(state)) {
+      const result = await listVisibleRedditPosts(page, {
+        limit,
+        scrollRounds,
+        returnMeta: true,
+      }).catch(() => ({ posts: [], debug: null }));
+      posts = Array.isArray(result?.posts) ? result.posts : [];
+      postsDebug = result?.debug || null;
+    }
+
+    return {
+      platform: 'reddit',
+      state,
+      url: page.url(),
+      loggedIn: session.loggedIn,
+      needsLogin: session.needsLogin,
+      uncertain: session.uncertain,
+      searchVisible: surface.searchVisible,
+      loginVisible: surface.loginVisible,
+      subreddit: surface.subreddit || '',
+      articleCount: surface.articleCount || 0,
+      bodyPreview: surface.bodyPreview || '',
+      posts,
+      postsDebug,
+    };
+  }
+
   return {
     REDDIT_BASE_URL,
+    classifyRedditPage,
     inspectRedditSession,
     listVisibleRedditPosts,
     normalizeSubredditName,
+    observeRedditPage,
     searchPosts,
     visitRedditHome,
     visitSubreddit,
@@ -241,5 +370,6 @@ function createRedditApi({
 
 module.exports = {
   REDDIT_BASE_URL,
+  classifyRedditPage,
   createRedditApi,
 };
