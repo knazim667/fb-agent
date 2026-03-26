@@ -355,9 +355,121 @@ function createRedditApi({
     };
   }
 
+  async function commentOnRedditPost(page, { postUrl, text }) {
+    const normalizedText = String(text || '').trim();
+    if (!postUrl) {
+      throw new Error('I need a Reddit post URL before I can comment.');
+    }
+    if (!normalizedText) {
+      throw new Error('I need comment text before I can post on Reddit.');
+    }
+
+    if (page.url() !== postUrl) {
+      await page.goto(postUrl, {
+        waitUntil: 'domcontentloaded',
+        timeout: 90_000,
+      });
+      await page.waitForLoadState('networkidle').catch(() => null);
+      await page.waitForTimeout(2_000);
+    }
+
+    const session = await inspectRedditSession(page);
+    if (session.needsLogin || !session.loggedIn) {
+      throw new Error('Reddit is not logged in.');
+    }
+
+    const editorSelectors = [
+      'faceplate-comment-composer textarea',
+      'shreddit-composer textarea',
+      'textarea[placeholder*="What are your thoughts"]',
+      'div[contenteditable="true"][role="textbox"]',
+      '[data-testid="comment-submission-form-richtext-input"] div[contenteditable="true"]',
+    ];
+
+    let editor = null;
+    for (const selector of editorSelectors) {
+      const candidate = page.locator(selector).first();
+      const visible = await candidate.isVisible().catch(() => false);
+      if (visible) {
+        editor = candidate;
+        break;
+      }
+    }
+
+    if (!editor) {
+      const trigger = page.locator('button:has-text("Comment"), button:has-text("Add a comment"), a:has-text("Comment")').first();
+      if (await trigger.isVisible().catch(() => false)) {
+        await trigger.click({ delay: randomBetween(60, 140) }).catch(() => null);
+        await page.waitForTimeout(1_000);
+      }
+
+      for (const selector of editorSelectors) {
+        const candidate = page.locator(selector).first();
+        const visible = await candidate.isVisible().catch(() => false);
+        if (visible) {
+          editor = candidate;
+          break;
+        }
+      }
+    }
+
+    if (!editor) {
+      throw new Error('Reddit comment editor was not visible.');
+    }
+
+    await editor.scrollIntoViewIfNeeded().catch(() => null);
+    await editor.click({ delay: randomBetween(60, 140) }).catch(() => null);
+    await page.waitForTimeout(randomBetween(150, 300));
+
+    const tagName = await editor.evaluate((node) => node.tagName.toLowerCase()).catch(() => 'div');
+    if (tagName === 'textarea') {
+      await editor.fill('');
+      await editor.type(normalizedText, { delay: randomBetween(45, 110) });
+    } else {
+      await page.keyboard.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A').catch(() => null);
+      await page.keyboard.press('Backspace').catch(() => null);
+      await page.keyboard.type(normalizedText, { delay: randomBetween(45, 110) });
+    }
+
+    await page.waitForTimeout(600);
+
+    const submitSelectors = [
+      'button[type="submit"]',
+      'button:has-text("Comment")',
+      'faceplate-comment-composer button[type="submit"]',
+    ];
+
+    let submit = null;
+    for (const selector of submitSelectors) {
+      const candidate = page.locator(selector).filter({ hasText: /comment/i }).first();
+      const visible = await candidate.isVisible().catch(() => false);
+      const enabled = await candidate.isEnabled().catch(() => false);
+      if (visible && enabled) {
+        submit = candidate;
+        break;
+      }
+    }
+
+    if (!submit) {
+      throw new Error('Reddit comment submit button was not enabled.');
+    }
+
+    await submit.click({ delay: randomBetween(60, 140) });
+    await page.waitForLoadState('networkidle').catch(() => null);
+    await page.waitForTimeout(2_000);
+
+    const bodyText = await page.locator('body').innerText().catch(() => '');
+    if (!String(bodyText || '').includes(normalizedText.slice(0, Math.min(24, normalizedText.length)))) {
+      throw new Error('Reddit comment did not appear after posting.');
+    }
+
+    return true;
+  }
+
   return {
     REDDIT_BASE_URL,
     classifyRedditPage,
+    commentOnRedditPost,
     inspectRedditSession,
     listVisibleRedditPosts,
     normalizeSubredditName,

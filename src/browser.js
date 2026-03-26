@@ -210,6 +210,7 @@ const {
 } = createPerceptionApi();
 const {
   classifyRedditPage,
+  commentOnRedditPost,
   inspectRedditSession,
   listVisibleRedditPosts,
   normalizeSubredditName,
@@ -346,6 +347,7 @@ module.exports = {
   REDDIT_BASE_URL,
   classifyRedditPage,
   closeBrowser,
+  commentOnRedditPost,
   anchorVisiblePost,
   clickLike,
   clickLikeOnVisiblePost,

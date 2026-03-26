@@ -1105,6 +1105,7 @@ function startOperatorConsole(deps) {
     searchRedditPosts,
     inspectRedditSession,
     observeRedditPage,
+    commentOnRedditPost,
     saveNewSkill,
     postCommentOnVisiblePost,
     createNewPost,
@@ -1209,7 +1210,7 @@ function startOperatorConsole(deps) {
     await page.waitForLoadState('networkidle').catch(() => null);
     await page.waitForTimeout(3_000);
     context.currentPlatform = 'facebook';
-    context.currentSurface = 'feed';
+    context.currentSurface = 'facebook_home_feed';
     context.currentGroup = null;
     context.lastPosts = [];
     context.lastObservedRedditUrl = '';
@@ -1233,15 +1234,60 @@ function startOperatorConsole(deps) {
       return observation;
     }
 
+    const url = page.url();
+    const bodyText = await page.locator('body').innerText().catch(() => '');
+    const normalizedBody = String(bodyText || '').toLowerCase();
+    const composerVisible = await page.locator("div[role=\"dialog\"] div[role=\"textbox\"][contenteditable=\"true\"], div[role=\"textbox\"][contenteditable=\"true\"][aria-label*=\"Create\"], div[aria-label*=\"What's on your mind\"]").first().isVisible().catch(() => false);
+    const notificationsVisible = /\/notifications/i.test(url)
+      || await page.locator('[aria-label*="Notifications"], a[href*="/notifications"]').first().isVisible().catch(() => false);
+    const groupUrl = /\/groups\//i.test(url);
+    const postDetail = /\/posts\/|story_fbid=|\/permalink\//i.test(url);
+    const loginState = /checkpoint|login/i.test(url) || /log in|password|create new account|forgot password/i.test(normalizedBody);
+
+    let stateName = 'facebook_unknown';
+    if (loginState) {
+      stateName = 'facebook_login';
+    } else if (notificationsVisible) {
+      stateName = 'facebook_notifications';
+    } else if (composerVisible) {
+      stateName = 'facebook_composer';
+    } else if (postDetail) {
+      stateName = 'facebook_post_detail';
+    } else if (groupUrl) {
+      stateName = 'facebook_group_feed';
+    } else if (/facebook\.com/i.test(url)) {
+      stateName = 'facebook_home_feed';
+    }
+
+    let posts = [];
+    let postsDebug = null;
+    if (options.includePosts && typeof listVisiblePosts === 'function' && ['facebook_group_feed', 'facebook_home_feed', 'facebook_post_detail'].includes(stateName)) {
+      const result = await listVisiblePosts({
+        limit: Math.max(1, Number(options.limit || 10)),
+        scrollRounds: Number(options.scrollRounds || 2),
+        returnMeta: true,
+        validationMode: options.validationMode || 'engagement',
+      }).catch(() => ({ posts: [], debug: null }));
+      posts = Array.isArray(result?.posts) ? result.posts : [];
+      postsDebug = result?.debug || null;
+    }
+
     return {
       platform: 'facebook',
-      state: context.currentSurface === 'group' ? 'facebook_group_feed' : 'facebook_feed',
-      url: page.url(),
+      state: stateName,
+      url,
+      composerVisible,
+      notificationsVisible,
+      posts,
+      postsDebug,
     };
   }
 
   function planNextAction({ goal, observation, args = {} }) {
     if (observation?.platform !== 'reddit') {
+      if (observation?.state === 'facebook_login') {
+        return { type: 'answer', message: 'Facebook needs login or attention first. Please log in or clear the checkpoint, then tell me what to do next.' };
+      }
       return { type: 'none' };
     }
 
@@ -1387,8 +1433,12 @@ function startOperatorConsole(deps) {
       await lock.runExclusive('operator:switch-platform-facebook', async () => {
         await openHomeFeed();
       });
+      const observation = await observePlatformPage();
       context.currentPlatform = 'facebook';
       await persistOperatorContext(state, upsertAgentState);
+      if (observation?.state === 'facebook_login') {
+        return 'Switched to Facebook. Facebook needs login or a checkpoint check first. Please take care of that, then tell me what to do next.';
+      }
       return 'Switched to Facebook.';
     }
 
@@ -1487,7 +1537,7 @@ function startOperatorConsole(deps) {
         await visitGroup(page, group.url);
       });
       context.currentPlatform = 'facebook';
-      context.currentSurface = 'group';
+      context.currentSurface = 'facebook_group_feed';
       context.currentGroup = group;
       context.lastPosts = [];
       logDebug(context, `Opened group URL: ${group.url || 'unknown-url'}`);
@@ -1547,7 +1597,7 @@ function startOperatorConsole(deps) {
             await visitGroup(page, selected.url);
           });
           context.currentPlatform = 'facebook';
-          context.currentSurface = 'group';
+          context.currentSurface = 'facebook_group_feed';
           context.currentGroup = selected;
           context.lastPosts = [];
         }
@@ -1559,7 +1609,7 @@ function startOperatorConsole(deps) {
           : currentPosts().slice(0, Math.max(1, Number(args.limit || currentPosts().length)));
         return formatOriginalPosts(chosenPosts, 'Current posts');
       }
-      if ((context.currentSurface === 'feed' || context.currentGroup?.url) && typeof listVisiblePosts === 'function') {
+      if ((/^facebook_home_feed$/i.test(String(context.currentSurface || '')) || context.currentGroup?.url) && typeof listVisiblePosts === 'function') {
         const visiblePostsResult = await lock.runExclusive('operator:list-visible-posts', async () =>
           listVisiblePosts({
             limit: Math.max(1, Number(args.limit || 12)),
@@ -1611,7 +1661,7 @@ function startOperatorConsole(deps) {
             : context.lastPosts.slice(0, Math.max(1, Number(args.limit || context.lastPosts.length)));
           return formatOriginalPosts(
             chosenPosts,
-            context.currentSurface === 'feed'
+            /^facebook_home_feed$/i.test(String(context.currentSurface || ''))
               ? 'Visible posts in your home feed'
               : `Visible posts in ${context.currentGroup.name || context.currentGroup.label}`
           );
@@ -1620,7 +1670,7 @@ function startOperatorConsole(deps) {
       if (context.currentGroup?.name) {
         return `I opened ${context.currentGroup.name}, but I could not read visible original posts right now.`;
       }
-      if (context.currentSurface === 'feed') {
+      if (/^facebook_home_feed$/i.test(String(context.currentSurface || ''))) {
         return 'I opened your home feed, but I could not read visible original posts right now.';
       }
       return summarizeRecentPostsFromDb(getCollections, callOllama, model);
@@ -1831,6 +1881,15 @@ function startOperatorConsole(deps) {
         await lock.runExclusive('operator:open-feed-for-random-likes', async () => {
           await openHomeFeed();
         });
+        const observation = await observePlatformPage({
+          includePosts: true,
+          limit: Math.max(requestedCount * 2, 12),
+          scrollRounds: 2,
+          validationMode: 'engagement',
+        });
+        if (observation?.state === 'facebook_login') {
+          return 'Facebook needs login or checkpoint review before I can like posts there.';
+        }
       } else if (!targetGroup?.url) {
         return 'I need a valid joined group first. Open one first, or include the group name more clearly.';
       } else {
@@ -1838,7 +1897,7 @@ function startOperatorConsole(deps) {
           await visitGroup(page, targetGroup.url);
         });
         context.currentPlatform = 'facebook';
-        context.currentSurface = 'group';
+        context.currentSurface = 'facebook_group_feed';
         context.currentGroup = targetGroup;
         context.lastPosts = [];
       }
@@ -1929,6 +1988,15 @@ function startOperatorConsole(deps) {
         await lock.runExclusive('operator:open-feed-for-random-comments', async () => {
           await openHomeFeed();
         });
+        const observation = await observePlatformPage({
+          includePosts: true,
+          limit: Math.max(requestedCount * 2, 12),
+          scrollRounds: 2,
+          validationMode: 'engagement',
+        });
+        if (observation?.state === 'facebook_login') {
+          return 'Facebook needs login or checkpoint review before I can comment there.';
+        }
       } else if (!targetGroup?.url) {
         return 'I need a valid joined group first. Open one first, or include the group name more clearly.';
       } else {
@@ -1936,7 +2004,7 @@ function startOperatorConsole(deps) {
           await visitGroup(page, targetGroup.url);
         });
         context.currentPlatform = 'facebook';
-        context.currentSurface = 'group';
+        context.currentSurface = 'facebook_group_feed';
         context.currentGroup = targetGroup;
         context.lastPosts = [];
       }
@@ -2071,7 +2139,13 @@ function startOperatorConsole(deps) {
       }
 
       if (context.currentPlatform === 'reddit') {
-        return `Reddit live commenting is not wired yet.\n\nDraft comment for post ${args.post_index}:\n${draft.reply}`;
+        await lock.runExclusive('operator:reddit-comment-post', async () => {
+          await commentOnRedditPost({
+            postUrl: post.post_url,
+            text: draft.reply,
+          });
+        });
+        return `Comment posted on Reddit post ${args.post_index}.`;
       }
 
       await lock.runExclusive('operator:comment-post', async () => {
@@ -2236,6 +2310,16 @@ function startOperatorConsole(deps) {
         const post = currentPosts()[Number(draft.target?.post_index) - 1];
         if (!post) {
           return 'The saved draft comment no longer matches the current post list.';
+        }
+
+        if (context.currentPlatform === 'reddit' && post?.post_url) {
+          await lock.runExclusive('operator:post-last-reddit-comment-draft', async () => {
+            await commentOnRedditPost({
+              postUrl: post.post_url,
+              text: draft.text,
+            });
+          });
+          return `Posted the last draft comment to Reddit post ${draft.target?.post_index}.`;
         }
 
         await lock.runExclusive('operator:post-last-comment-draft', async () => {
