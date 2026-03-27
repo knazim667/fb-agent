@@ -1716,6 +1716,17 @@ function startOperatorConsole(deps) {
       visible_index: post.visibleIndex,
       platform: 'reddit',
       subreddit: post.subreddit || '',
+      text_from_dom: post.textFromDom || '',
+      text_from_visible_fallback: post.textFromVisibleFallback || '',
+      text_from_images: post.textFromImages || '',
+      visual_summary: post.visualSummary || '',
+      confidence_score: Number(post.confidenceScore || 0),
+      matched_lead_signals: Array.isArray(post.matchedLeadSignals) ? post.matchedLeadSignals : [],
+      dom_text_len: Number(post.domTextLength || 0),
+      fallback_text_len: Number(post.fallbackTextLength || 0),
+      image_text_len: Number(post.imageTextLength || 0),
+      vision_used: Boolean(post.visionUsed),
+      attached_images_count: Number(post.attachedImagesCount || 0),
     }));
   }
 
@@ -1729,6 +1740,17 @@ function startOperatorConsole(deps) {
       selector_id: post.selectorId || '',
       platform: 'facebook',
       group: context.currentGroup?.name || context.currentGroup?.label || '',
+      text_from_dom: post.textFromDom || '',
+      text_from_visible_fallback: post.textFromVisibleFallback || '',
+      text_from_images: post.textFromImages || '',
+      visual_summary: post.visualSummary || '',
+      confidence_score: Number(post.confidenceScore || 0),
+      matched_lead_signals: Array.isArray(post.matchedLeadSignals) ? post.matchedLeadSignals : [],
+      dom_text_len: Number(post.domTextLength || 0),
+      fallback_text_len: Number(post.fallbackTextLength || 0),
+      image_text_len: Number(post.imageTextLength || 0),
+      vision_used: Boolean(post.visionUsed),
+      attached_images_count: Number(post.attachedImagesCount || 0),
     }));
   }
 
@@ -1810,7 +1832,7 @@ function startOperatorConsole(deps) {
     }
     for (const kept of (observation?.posts || []).slice(0, 10)) {
       lines.push(
-        `kept post ${kept.visibleIndex || '?'}: raw_len=${kept.rawTextLength || 0} clean_len=${kept.cleanedTextLength || 0} fallback=${kept.fallbackUsed ? 'yes' : 'no'} confidence=${kept.extractionConfidence || 'unknown'} signals=${kept.painSignalCount || 0}`
+        `kept post ${kept.visibleIndex || '?'}: dom_text_len=${kept.domTextLength || 0} fallback_text_len=${kept.fallbackTextLength || kept.cleanedTextLength || 0} image_text_len=${kept.imageTextLength || 0} raw_len=${kept.rawTextLength || 0} fallback=${kept.fallbackUsed ? 'yes' : 'no'} vision_used=${kept.visionUsed ? 'yes' : 'no'} attached_images_count=${kept.attachedImagesCount || 0} confidence=${kept.extractionConfidence || 'unknown'} matched_signals=${(kept.matchedLeadSignals || []).join(',') || 'none'}`
       );
     }
     if (!(observation?.posts || []).length && debugInfo.rejections?.[0]?.sampleText) {
@@ -1858,17 +1880,30 @@ function startOperatorConsole(deps) {
     const ranked = [];
     for (const post of posts.slice(0, 12)) {
       try {
+        const combinedContent = [
+          post.title || '',
+          post.content || post.postText || '',
+          post.text_from_dom || '',
+          post.text_from_visible_fallback || '',
+          post.text_from_images || '',
+          post.visual_summary || '',
+        ].filter(Boolean).join('\n');
         const scoreResult = await scorePostAgainstSkill({
-          content: post.content || post.postText || '',
+          content: combinedContent,
           author: post.author || 'Unknown',
           post_id: post.post_id || post.postId || '',
         }, skill, {
           model,
           timeoutMs: 20_000,
         });
+        const existingSignals = Array.isArray(post.matched_lead_signals)
+          ? post.matched_lead_signals
+          : Array.isArray(post.matchedLeadSignals)
+            ? post.matchedLeadSignals
+            : [];
         ranked.push({
           ...post,
-          relevance_score: scoreResult?.score || 0,
+          relevance_score: Math.max(Number(scoreResult?.score || 0), existingSignals.length ? existingSignals.length + 4 : 0),
           lead_temperature: scoreResult?.lead_temperature || 'COLD',
           recommended_action: scoreResult?.lead_temperature === 'HOT'
             ? 'comment_publicly'
@@ -1889,8 +1924,37 @@ function startOperatorConsole(deps) {
 
   function formatLeadDecisionDebug(posts = []) {
     return posts.slice(0, 10).map((post, index) => (
-      `candidate ${index + 1}: temp=${post.lead_temperature || 'unknown'} action=${post.recommended_action || 'none'} score=${post.relevance_score ?? 'n/a'} reason=${post._leadScore?.reason || 'n/a'}`
+      `candidate ${index + 1}: temp=${post.lead_temperature || 'unknown'} action=${post.recommended_action || 'none'} score=${post.relevance_score ?? 'n/a'} dom_text_len=${post.dom_text_len || post.domTextLength || 0} fallback_text_len=${post.fallback_text_len || post.fallbackTextLength || 0} image_text_len=${post.image_text_len || post.imageTextLength || 0} vision_used=${post.vision_used || post.visionUsed ? 'yes' : 'no'} attached_images_count=${post.attached_images_count || post.attachedImagesCount || 0} matched_signals=${(post.matched_lead_signals || post.matchedLeadSignals || []).join(',') || 'none'} reason=${post._leadScore?.reason || 'n/a'}`
     ));
+  }
+
+  function toBusinessCandidate(post = {}, extra = {}) {
+    return {
+      post_id: post.postId || post.post_id || '',
+      post_url: post.postUrl || post.post_url || '',
+      content: post.postText || post.content || '',
+      title: post.title || '',
+      author: post.authorName || post.author || 'Unknown',
+      visible_index: post.visibleIndex || post.visible_index,
+      selector_id: post.selectorId || post.selector_id || '',
+      platform: post.platform || '',
+      text_from_dom: post.textFromDom || post.text_from_dom || '',
+      text_from_visible_fallback: post.textFromVisibleFallback || post.text_from_visible_fallback || '',
+      text_from_images: post.textFromImages || post.text_from_images || '',
+      visual_summary: post.visualSummary || post.visual_summary || '',
+      confidence_score: Number(post.confidenceScore || post.confidence_score || 0),
+      matched_lead_signals: Array.isArray(post.matchedLeadSignals)
+        ? post.matchedLeadSignals
+        : Array.isArray(post.matched_lead_signals)
+          ? post.matched_lead_signals
+          : [],
+      dom_text_len: Number(post.domTextLength || post.dom_text_len || 0),
+      fallback_text_len: Number(post.fallbackTextLength || post.fallback_text_len || 0),
+      image_text_len: Number(post.imageTextLength || post.image_text_len || 0),
+      vision_used: Boolean(post.visionUsed || post.vision_used),
+      attached_images_count: Number(post.attachedImagesCount || post.attached_images_count || 0),
+      ...extra,
+    };
   }
 
   async function reviewCandidatePosts(posts = [], {
@@ -1900,8 +1964,20 @@ function startOperatorConsole(deps) {
   } = {}) {
     const reviews = [];
     for (const post of posts) {
-      const text = [post.title || '', post.content || post.postText || ''].filter(Boolean).join('\n');
+      const text = [
+        post.title || '',
+        post.content || post.postText || '',
+        post.text_from_dom || post.textFromDom || '',
+        post.text_from_visible_fallback || post.textFromVisibleFallback || '',
+        post.text_from_images || post.textFromImages || '',
+        post.visual_summary || post.visualSummary || '',
+      ].filter(Boolean).join('\n');
       const semantic = inspectSemanticLeadSignals(text, signals);
+      const multimodalSignals = Array.isArray(post.matched_lead_signals)
+        ? post.matched_lead_signals
+        : Array.isArray(post.matchedLeadSignals)
+          ? post.matchedLeadSignals
+          : [];
       let modelReview = null;
       if (typeof scorePostAgainstSkill === 'function') {
         try {
@@ -1919,7 +1995,8 @@ function startOperatorConsole(deps) {
       }
 
       const modelScore = Number(modelReview?.score || 0);
-      const combinedScore = Math.max(modelScore, semantic.score);
+      const multimodalBoost = Math.min(multimodalSignals.length, 3);
+      const combinedScore = Math.max(modelScore, semantic.score + multimodalBoost);
       const lowerWarm = semantic.warmTrigger;
       const leadTemperature = combinedScore >= 8
         ? 'HOT'
@@ -1934,7 +2011,7 @@ function startOperatorConsole(deps) {
       reviews.push({
         ...post,
         platform,
-        matchedSignals: semantic.matchedSignals,
+        matchedSignals: [...new Set([...semantic.matchedSignals, ...multimodalSignals])],
         semanticScore: semantic.score,
         relevance_score: combinedScore,
         lead_temperature: leadTemperature,
@@ -1982,16 +2059,10 @@ function startOperatorConsole(deps) {
       }
       const posts = Array.isArray(observation?.posts) ? observation.posts : [];
       for (const post of posts) {
-        collected.push({
-          post_id: post.postId,
-          post_url: post.postUrl,
-          content: post.postText,
-          author: post.authorName || 'Unknown',
-          visible_index: post.visibleIndex,
-          selector_id: post.selectorId || '',
+        collected.push(toBusinessCandidate(post, {
           platform: 'facebook',
           group: group.name || '',
-        });
+        }));
       }
       if (collected.length >= limit * 2) {
         break;
@@ -2045,16 +2116,10 @@ function startOperatorConsole(deps) {
       }
       const posts = Array.isArray(observation?.posts) ? observation.posts : [];
       for (const post of posts) {
-        collected.push({
-          post_id: post.postId,
-          post_url: post.postUrl,
-          content: post.postText,
-          title: post.title,
-          author: post.authorName || 'Unknown',
-          visible_index: post.visibleIndex,
+        collected.push(toBusinessCandidate(post, {
           platform: 'reddit',
           subreddit: post.subreddit || subreddit,
-        });
+        }));
       }
       if (collected.length >= limit * 2) {
         break;
@@ -2406,13 +2471,7 @@ function startOperatorConsole(deps) {
           }
         }
         const quickRank = await rankPostsForBusinessTopic(
-          dedupePostsByIdentity(collectedPosts.map((post) => ({
-            post_id: post.postId,
-            post_url: post.postUrl,
-            content: post.postText,
-            author: post.authorName || 'Unknown',
-            visible_index: post.visibleIndex,
-            selector_id: post.selectorId || '',
+          dedupePostsByIdentity(collectedPosts.map((post) => toBusinessCandidate(post, {
             platform: 'facebook',
           }))),
           topic
@@ -2422,13 +2481,7 @@ function startOperatorConsole(deps) {
         }
       }
 
-      const dedupedPosts = dedupePostsByIdentity(collectedPosts.map((post) => ({
-        post_id: post.postId,
-        post_url: post.postUrl,
-        content: post.postText,
-        author: post.authorName || 'Unknown',
-        visible_index: post.visibleIndex,
-        selector_id: post.selectorId || '',
+      const dedupedPosts = dedupePostsByIdentity(collectedPosts.map((post) => toBusinessCandidate(post, {
         platform: 'facebook',
       })));
       const signalMatched = signals.length ? filterPostsBySignalTerms(dedupedPosts, signals) : dedupedPosts;
@@ -2838,13 +2891,7 @@ function startOperatorConsole(deps) {
               scrollRounds: 2,
             });
             const queryPosts = Array.isArray(observation?.posts)
-              ? observation.posts.map((post) => ({
-                  post_id: post.postId,
-                  post_url: post.postUrl,
-                  content: post.postText,
-                  title: post.title,
-                  author: post.authorName || 'Unknown',
-                  visible_index: post.visibleIndex,
+              ? observation.posts.map((post) => toBusinessCandidate(post, {
                   platform: 'reddit',
                   subreddit: post.subreddit || '',
                 }))
@@ -2865,13 +2912,7 @@ function startOperatorConsole(deps) {
           limit: Math.max(1, Number(args.limit || 10)),
           scrollRounds: 2,
         });
-        posts = Array.isArray(observation?.posts) ? observation.posts.map((post) => ({
-          post_id: post.postId,
-          post_url: post.postUrl,
-          content: post.postText,
-          title: post.title,
-          author: post.authorName || 'Unknown',
-          visible_index: post.visibleIndex,
+        posts = Array.isArray(observation?.posts) ? observation.posts.map((post) => toBusinessCandidate(post, {
           platform: 'reddit',
           subreddit: post.subreddit || '',
         })) : [];
@@ -3092,13 +3133,9 @@ function startOperatorConsole(deps) {
             } else if (Number.isFinite(Number(post.visibleIndex)) && typeof clickLikeOnVisiblePost === 'function') {
               await clickLikeOnVisiblePost(Number(post.visibleIndex));
             } else {
-              await likeQualifiedPost({
-                post_id: post.postId,
-                post_url: post.postUrl,
+              await likeQualifiedPost(toBusinessCandidate(post, {
                 group: targetGroup.name,
-                author: post.authorName,
-                content: post.postText,
-              });
+              }));
             }
           });
           likedCount += 1;
@@ -3202,14 +3239,10 @@ function startOperatorConsole(deps) {
           break;
         }
 
-        const candidate = {
-          post_id: post.postId || `visible-post-${post.visibleIndex}`,
-          post_url: post.postUrl || '',
-          content: post.postText || '',
-          author: post.authorName || 'Unknown',
+        const candidate = toBusinessCandidate(post, {
           group: targetGroup.name,
           visible_index: post.visibleIndex,
-        };
+        });
 
         try {
           const draft = await draftCommentForCandidate(candidate, {

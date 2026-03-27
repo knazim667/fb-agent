@@ -140,3 +140,20 @@ test('isVisiblePostCandidate keeps partial-confidence business candidates with p
     true
   );
 });
+
+test('isVisiblePostCandidate keeps image-backed candidates even when dom body is weak', () => {
+  assert.equal(
+    isVisiblePostCandidate({
+      authorName: 'Seller Example',
+      bodyText: '',
+      actionControlCount: 1,
+      timestampText: '',
+      validationMode: 'business',
+      controlNames: ['like'],
+      attachedImagesCount: 1,
+      imageTextLength: 24,
+      visibleTextLength: 0,
+    }),
+    true
+  );
+});

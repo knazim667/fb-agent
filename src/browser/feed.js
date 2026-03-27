@@ -1,5 +1,15 @@
 'use strict';
 
+const {
+  analyzeImageWithVision,
+  buildVisionFilePath,
+  detectLeadSignals,
+  ensureVisionDir,
+  mergePostReading,
+  normalizeText,
+  uniqueStrings,
+} = require('./multimodal');
+
 const ABSOLUTE_TIMESTAMP_PATTERN = /^(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)(?:\s+\d{1,2})(?:,\s*\d{4})?(?:\s+at\s+\d{1,2}:\d{2}(?:\s?[ap]m)?)?$/i;
 const RELATIVE_TIMESTAMP_PATTERN = /^(?:just now|now|today|yesterday|\d+\s*(?:m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days|w|week|weeks|y|yr|yrs|year|years))(?:\s+ago)?$/i;
 
@@ -25,6 +35,17 @@ function classifyFacebookPageMode({ articleCount = 0, bodyText = '', url = '' } 
   return 'feed';
 }
 
+function extractPostDomText({
+  structuredBodyText = '',
+  deepBodyText = '',
+} = {}) {
+  return normalizeText(structuredBodyText || deepBodyText || '');
+}
+
+function extractVisibleArticleText(text = '') {
+  return normalizeText(text);
+}
+
 function isVisiblePostCandidate({
   authorName = '',
   bodyText = '',
@@ -35,6 +56,9 @@ function isVisiblePostCandidate({
   pageMode = 'feed',
   fallbackUsed = false,
   painSignalCount = 0,
+  attachedImagesCount = 0,
+  imageTextLength = 0,
+  visibleTextLength = 0,
 } = {}) {
   const normalizedAuthor = String(authorName || '').trim();
   const normalizedBody = String(bodyText || '').trim();
@@ -51,7 +75,10 @@ function isVisiblePostCandidate({
   const fallbackMinBodyLength = pageMode === 'search_results' ? 8 : 12;
   const bodyPasses = normalizedBody.length >= minBodyLength
     || (fallbackUsed && normalizedBody.length >= fallbackMinBodyLength)
-    || (fallbackUsed && painSignalCount > 0 && normalizedBody.length >= 8);
+    || (fallbackUsed && painSignalCount > 0 && normalizedBody.length >= 8)
+    || visibleTextLength >= Math.max(8, fallbackMinBodyLength)
+    || imageTextLength >= 8
+    || attachedImagesCount > 0;
   if (!bodyPasses) {
     return false;
   }
@@ -61,24 +88,178 @@ function isVisiblePostCandidate({
       return false;
     }
     if (!(hasComment || hasShare || hasReply || actionControlCount >= 2)) {
-      if (!(fallbackUsed && painSignalCount > 0 && actionControlCount >= 1)) {
+      if (!(fallbackUsed && painSignalCount > 0 && actionControlCount >= 1) && !(attachedImagesCount > 0 && actionControlCount >= 1)) {
         return false;
       }
     }
-    return Boolean(normalizedAuthor || normalizedTimestamp || painSignalCount > 0);
+    return Boolean(normalizedAuthor || normalizedTimestamp || painSignalCount > 0 || attachedImagesCount > 0 || visibleTextLength > 0);
   }
 
   if (!hasLike && actionControlCount < 1) {
     return false;
   }
 
-  return Boolean(normalizedAuthor || normalizedTimestamp || fallbackUsed || painSignalCount > 0);
+  return Boolean(normalizedAuthor || normalizedTimestamp || fallbackUsed || painSignalCount > 0 || attachedImagesCount > 0 || visibleTextLength > 0);
 }
 
 function createFeedApi({
   FACEBOOK_BASE_URL,
   randomBetween,
 }) {
+  async function capturePostScreenshot(page, selectorId = '') {
+    const normalized = String(selectorId || '').trim();
+    if (!normalized) {
+      return null;
+    }
+    await ensureVisionDir().catch(() => null);
+    const locator = page.locator(`[data-agent-visible-post-id="${normalized}"]`).first();
+    const visible = await locator.isVisible().catch(() => false);
+    if (!visible) {
+      return null;
+    }
+    const screenshotPath = buildVisionFilePath('facebook-post', '.png');
+    await locator.screenshot({ path: screenshotPath, type: 'png' }).catch(() => null);
+    return screenshotPath;
+  }
+
+  async function captureAttachedImageScreenshots(page, imageSelectorIds = []) {
+    const screenshots = [];
+    await ensureVisionDir().catch(() => null);
+    for (const selectorId of imageSelectorIds.slice(0, 3)) {
+      const normalized = String(selectorId || '').trim();
+      if (!normalized) {
+        continue;
+      }
+      const locator = page.locator(`[data-agent-visible-image-id="${normalized}"]`).first();
+      const visible = await locator.isVisible().catch(() => false);
+      if (!visible) {
+        continue;
+      }
+      const screenshotPath = buildVisionFilePath('facebook-image', '.png');
+      await locator.screenshot({ path: screenshotPath, type: 'png' }).catch(() => null);
+      screenshots.push(screenshotPath);
+    }
+    return screenshots;
+  }
+
+  async function analyzePostScreenshotWithVision(imagePath = '') {
+    return analyzeImageWithVision(
+      imagePath,
+      'Read this Facebook post screenshot. Extract the post text, summarize what the seller is saying, and identify lead signals related to reimbursements, lost inventory, fee issues, payout confusion, settlement confusion, or profit leakage.'
+    );
+  }
+
+  async function analyzeAttachedImagesWithVision(imagePaths = []) {
+    const analyses = [];
+    for (const imagePath of imagePaths.slice(0, 3)) {
+      const result = await analyzeImageWithVision(
+        imagePath,
+        'Read this attached image from a social post. If it looks like Amazon Seller Central, inventory, settlement, payout, fee, reimbursement, or dashboard data, extract the useful text and summarize the money-loss signal.'
+      );
+      analyses.push(result);
+    }
+
+    const used = analyses.some((item) => item?.used);
+    const text = uniqueStrings(analyses.map((item) => item?.text || '')).join('\n').trim();
+    const summary = uniqueStrings(analyses.map((item) => item?.summary || '')).join('\n').trim();
+    const signals = uniqueStrings(analyses.flatMap((item) => Array.isArray(item?.signals) ? item.signals : []));
+    const confidence = analyses.length
+      ? Number((analyses.reduce((sum, item) => sum + Number(item?.confidence || 0), 0) / analyses.length).toFixed(2))
+      : 0;
+
+    return {
+      used,
+      text,
+      summary,
+      signals,
+      confidence,
+    };
+  }
+
+  async function enrichAnchorsMultimodally(page, anchors = [], { validationMode = 'engagement' } = {}) {
+    const enriched = [];
+    for (const anchor of anchors) {
+      const domText = normalizeText(anchor.textFromDom || '');
+      const fallbackText = normalizeText(anchor.textFromVisibleFallback || '');
+      const needsVision = domText.length < 24 || fallbackText.length < 24 || Number(anchor.attachedImagesCount || 0) > 0;
+
+      let screenshotAnalysis = {
+        used: false,
+        text: '',
+        summary: '',
+        signals: [],
+        confidence: 0,
+      };
+      let attachedImageAnalysis = {
+        used: false,
+        text: '',
+        summary: '',
+        signals: [],
+        confidence: 0,
+      };
+
+      if (needsVision) {
+        const postScreenshotPath = await capturePostScreenshot(page, anchor.selectorId);
+        if (postScreenshotPath) {
+          screenshotAnalysis = await analyzePostScreenshotWithVision(postScreenshotPath);
+        }
+      }
+
+      if (Number(anchor.attachedImagesCount || 0) > 0) {
+        const imageScreenshots = await captureAttachedImageScreenshots(page, anchor.attachedImageSelectorIds || []);
+        if (imageScreenshots.length) {
+          attachedImageAnalysis = await analyzeAttachedImagesWithVision(imageScreenshots);
+        }
+      }
+
+      const imageText = uniqueStrings([
+        anchor.imageAltText || '',
+        screenshotAnalysis.text,
+        attachedImageAnalysis.text,
+      ]).join('\n').trim();
+      const visualSummary = uniqueStrings([
+        screenshotAnalysis.summary,
+        attachedImageAnalysis.summary,
+      ]).join('\n').trim();
+      const reading = mergePostReading({
+        author: anchor.authorName || '',
+        textFromDom: domText,
+        textFromVisibleFallback: fallbackText,
+        textFromImages: imageText,
+        visualSummary,
+        attachedImagesCount: Number(anchor.attachedImagesCount || 0),
+        existingSignals: [
+          ...(Array.isArray(anchor.matchedLeadSignals) ? anchor.matchedLeadSignals : []),
+          ...(Array.isArray(screenshotAnalysis.signals) ? screenshotAnalysis.signals : []),
+          ...(Array.isArray(attachedImageAnalysis.signals) ? attachedImageAnalysis.signals : []),
+        ],
+      });
+
+      enriched.push({
+        ...anchor,
+        postText: reading.merged_text || anchor.postText || '',
+        textFromDom: reading.text_from_dom,
+        textFromVisibleFallback: reading.text_from_visible_fallback,
+        textFromImages: reading.text_from_images,
+        visualSummary: reading.visual_summary,
+        confidenceScore: reading.confidence_score,
+        matchedLeadSignals: reading.lead_signals_matched,
+        domTextLength: reading.text_from_dom.length,
+        fallbackTextLength: reading.text_from_visible_fallback.length,
+        imageTextLength: reading.text_from_images.length,
+        visionUsed: Boolean(screenshotAnalysis.used || attachedImageAnalysis.used),
+        attachedImagesCount: Number(anchor.attachedImagesCount || 0),
+        extractionConfidence: reading.confidence_score >= 0.85
+          ? 'structured'
+          : reading.confidence_score >= 0.65
+            ? 'partial'
+            : 'visual',
+        validationMode,
+      });
+    }
+    return enriched;
+  }
+
   function extractPostIdFromHref(href) {
     if (!href) {
       return null;
@@ -360,6 +541,18 @@ function createFeedApi({
         return texts.join('\n').trim();
       }
 
+      function extractPostDomText(article, headerBottom, actionTop) {
+        const structuredBodyText = extractMainBodyText(article, headerBottom, actionTop);
+        const deepBodyText = structuredBodyText
+          ? ''
+          : extractDeepArticleText(article, actionTop);
+        return {
+          structuredBodyText,
+          deepBodyText,
+          domText: normalize(structuredBodyText || deepBodyText),
+        };
+      }
+
       function stripUiNoiseFromText(text) {
         return normalize(
           String(text || '')
@@ -417,6 +610,41 @@ function createFeedApi({
           texts.push(cleaned);
         }
         return texts.join('\n').trim();
+      }
+
+      function collectAttachedImages(article, headerBottom) {
+        const images = [];
+        const seen = new Set();
+        const nodes = Array.from(article.querySelectorAll('img'));
+        for (const node of nodes) {
+          if (!isVisible(node)) {
+            continue;
+          }
+          const rect = node.getBoundingClientRect();
+          if (rect.width < 90 || rect.height < 90) {
+            continue;
+          }
+          if (rect.top < headerBottom - 40) {
+            continue;
+          }
+          const src = node.getAttribute('src') || '';
+          const altText = normalize(node.getAttribute('alt') || node.getAttribute('aria-label') || '');
+          const key = `${Math.round(rect.top)}|${Math.round(rect.left)}|${src.slice(0, 80)}`;
+          if (seen.has(key)) {
+            continue;
+          }
+          seen.add(key);
+          const selectorId = node.getAttribute('data-agent-visible-image-id') || `agent-visible-image-${images.length + 1}-${Math.round(rect.top)}`;
+          node.setAttribute('data-agent-visible-image-id', selectorId);
+          images.push({
+            selectorId,
+            altText,
+            src,
+            width: Math.round(rect.width),
+            height: Math.round(rect.height),
+          });
+        }
+        return images;
       }
 
       function countPainSignals(text) {
@@ -553,37 +781,57 @@ function createFeedApi({
 
         const headerBottom = findHeaderBoundary(article, authorNode, timestampNode);
         const actionTop = findActionBarTop(article, actionControls);
-        const structuredBodyText = extractMainBodyText(article, headerBottom, actionTop);
-        const deepBodyText = structuredBodyText
-          ? ''
-          : extractDeepArticleText(article, actionTop);
-        const rawFallbackArticleText = (structuredBodyText || deepBodyText)
+        const domExtraction = extractPostDomText(article, headerBottom, actionTop);
+        const structuredBodyText = domExtraction.structuredBodyText;
+        const deepBodyText = domExtraction.deepBodyText;
+        const rawFallbackArticleText = domExtraction.domText
           ? ''
           : extractFullVisibleArticleText(article);
-        const rawText = structuredBodyText || deepBodyText || rawFallbackArticleText;
-        const cleanedFallbackText = rawFallbackArticleText ? cleanFallbackArticleText(rawFallbackArticleText) : '';
-        const mainBodyText = structuredBodyText || deepBodyText || cleanedFallbackText;
+        const rawText = domExtraction.domText || rawFallbackArticleText;
+        const cleanedFallbackText = rawFallbackArticleText ? extractVisibleArticleText(cleanFallbackArticleText(rawFallbackArticleText)) : '';
+        const mainBodyText = domExtraction.domText || cleanedFallbackText;
+        const attachedImages = collectAttachedImages(article, headerBottom);
+        const imageAltText = attachedImages
+          .map((item) => normalize(item.altText))
+          .filter(Boolean)
+          .join('\n')
+          .trim();
         const fallbackUsed = !structuredBodyText && Boolean(deepBodyText || cleanedFallbackText);
         const minBodyLength = pageMode === 'search_results' ? 8 : 15;
         const rawTextLength = normalize(rawText).length;
         const cleanedTextLength = normalize(mainBodyText).length;
-        const painSignalCount = countPainSignals(mainBodyText);
+        const visibleFallbackLength = normalize(cleanedFallbackText).length;
+        const imageTextLength = normalize(imageAltText).length;
+        const painSignalCount = countPainSignals([mainBodyText, imageAltText].filter(Boolean).join('\n'));
         const hasMeaningfulFallbackText = fallbackUsed
           && (cleanedTextLength >= Math.max(10, minBodyLength - 3) || painSignalCount > 0);
-        if ((!mainBodyText || cleanedTextLength < minBodyLength) && !hasMeaningfulFallbackText) {
+        const hasVisibleContent = rawTextLength > 0 || visibleFallbackLength > 0 || attachedImages.length > 0;
+        if ((!mainBodyText || cleanedTextLength < minBodyLength) && !hasMeaningfulFallbackText && !hasVisibleContent) {
           reject(
             articleIndex,
             'no_body_between_header_and_action_bar',
-            `raw_len=${rawTextLength};clean_len=${cleanedTextLength};fallback=${fallbackUsed ? 'yes' : 'no'};signals=${painSignalCount}`,
+            `raw_len=${rawTextLength};clean_len=${cleanedTextLength};fallback=${fallbackUsed ? 'yes' : 'no'};images=${attachedImages.length};signals=${painSignalCount}`,
             article
           );
           continue;
         }
 
         const authorName = normalize(authorNode?.innerText || '') || 'Unknown';
+        const mergedVisibleText = [mainBodyText, imageAltText].filter(Boolean).join('\n').trim();
+        const matchedLeadSignals = (() => {
+          const text = String(mergedVisibleText || '').toLowerCase();
+          const signals = [];
+          if (/\breimburse(?:ment|ments)?\b/.test(text)) signals.push('reimbursement');
+          if (/\blost inventory\b|\bmissing inventory\b|\bmissing units?\b|\breceived less than shipped\b/.test(text)) signals.push('inventory discrepancy');
+          if (/\bfees?\b|\bfee error\b|\bovercharging fees\b/.test(text)) signals.push('high fees');
+          if (/\bsettlement\b|\bpayout\b/.test(text)) signals.push('settlement or payout confusion');
+          if (/\bprofit\b|\bmargins?\b|\bmoney is disappearing\b/.test(text)) signals.push('profit leakage');
+          if (/\bseller central\b|\bsettlement report\b|\bmanage fba inventory\b/.test(text)) signals.push('amazon dashboard screenshot');
+          return signals;
+        })();
         if (!isVisiblePostCandidate({
           authorName: authorName === 'Unknown' ? '' : authorName,
-          bodyText: mainBodyText,
+          bodyText: mergedVisibleText || mainBodyText,
           actionControlCount: [...actionControls, replyButton].filter(Boolean).length,
           timestampText,
           validationMode,
@@ -591,11 +839,14 @@ function createFeedApi({
           pageMode,
           fallbackUsed,
           painSignalCount,
+          attachedImagesCount: attachedImages.length,
+          imageTextLength,
+          visibleTextLength: Math.max(rawTextLength, visibleFallbackLength),
         })) {
           reject(
             articleIndex,
             'invalid_visible_post_candidate',
-            `mode=${validationMode};controls=${controlNames.join(',') || 'none'};body_len=${cleanedTextLength};raw_len=${rawTextLength};fallback=${fallbackUsed ? 'yes' : 'no'};signals=${painSignalCount}`,
+            `mode=${validationMode};controls=${controlNames.join(',') || 'none'};body_len=${cleanedTextLength};fallback_len=${visibleFallbackLength};image_len=${imageTextLength};raw_len=${rawTextLength};fallback=${fallbackUsed ? 'yes' : 'no'};images=${attachedImages.length};signals=${painSignalCount}`,
             article
           );
           continue;
@@ -611,7 +862,7 @@ function createFeedApi({
           articleIndex,
           authorName,
           timestampText,
-          postText: mainBodyText,
+          postText: mergedVisibleText || mainBodyText,
           postUrl,
           anchorConfidence: timestampConfidence,
           selectorId,
@@ -621,6 +872,17 @@ function createFeedApi({
           rawTextLength,
           cleanedTextLength,
           painSignalCount,
+          textFromDom: domExtraction.domText,
+          textFromVisibleFallback: cleanedFallbackText,
+          textFromImages: imageAltText,
+          domTextLength: normalize(domExtraction.domText).length,
+          fallbackTextLength: visibleFallbackLength,
+          imageTextLength,
+          attachedImagesCount: attachedImages.length,
+          attachedImageSelectorIds: attachedImages.map((item) => item.selectorId),
+          imageAltText,
+          matchedLeadSignals,
+          visionUsed: false,
         });
 
         if (anchors.length >= limit) {
@@ -711,6 +973,17 @@ function createFeedApi({
         rawTextLength: Number(rawAnchor.rawTextLength || 0),
         cleanedTextLength: Number(rawAnchor.cleanedTextLength || 0),
         painSignalCount: Number(rawAnchor.painSignalCount || 0),
+        textFromDom: rawAnchor.textFromDom || '',
+        textFromVisibleFallback: rawAnchor.textFromVisibleFallback || '',
+        textFromImages: rawAnchor.textFromImages || '',
+        domTextLength: Number(rawAnchor.domTextLength || 0),
+        fallbackTextLength: Number(rawAnchor.fallbackTextLength || 0),
+        imageTextLength: Number(rawAnchor.imageTextLength || 0),
+        attachedImagesCount: Number(rawAnchor.attachedImagesCount || 0),
+        attachedImageSelectorIds: Array.isArray(rawAnchor.attachedImageSelectorIds) ? rawAnchor.attachedImageSelectorIds : [],
+        imageAltText: rawAnchor.imageAltText || '',
+        matchedLeadSignals: Array.isArray(rawAnchor.matchedLeadSignals) ? rawAnchor.matchedLeadSignals : [],
+        visionUsed: Boolean(rawAnchor.visionUsed),
       });
 
       if (anchors.length >= limit) {
@@ -718,13 +991,15 @@ function createFeedApi({
       }
     }
 
+    const enrichedAnchors = await enrichAnchorsMultimodally(page, anchors, { validationMode });
+
     if (returnMeta) {
       return {
-        posts: anchors,
+        posts: enrichedAnchors,
         debug: {
           articleCount: Number(extracted?.articleCount || 0),
           url: String(extracted?.url || page.url() || ''),
-          keptCount: anchors.length,
+          keptCount: enrichedAnchors.length,
           pageMode: String(extracted?.pageMode || 'unknown'),
           validationMode: String(extracted?.validationMode || validationMode || 'engagement'),
           feedContainerStatus: extracted?.feedContainerStatus || {
@@ -739,7 +1014,7 @@ function createFeedApi({
       };
     }
 
-    return anchors;
+    return enrichedAnchors;
   }
 
   async function scrapeGroupFeed(page, { limit = 20, scrollRounds = 5, validationMode = 'business' } = {}) {
@@ -766,6 +1041,8 @@ function createFeedApi({
 module.exports = {
   createFeedApi,
   classifyFacebookPageMode,
+  extractPostDomText,
+  extractVisibleArticleText,
   isVisiblePostCandidate,
   looksLikeFacebookTimestamp,
 };

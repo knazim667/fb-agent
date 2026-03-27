@@ -1,5 +1,14 @@
 'use strict';
 
+const {
+  analyzeImageWithVision,
+  buildVisionFilePath,
+  ensureVisionDir,
+  mergePostReading,
+  normalizeText,
+  uniqueStrings,
+} = require('./multimodal');
+
 const REDDIT_BASE_URL = 'https://www.reddit.com';
 
 function classifyRedditPage({
@@ -31,9 +40,78 @@ function classifyRedditPage({
   return 'reddit_unknown';
 }
 
+function extractPostDomText({
+  title = '',
+  body = '',
+} = {}) {
+  return normalizeText([title, body].filter(Boolean).join('\n'));
+}
+
+function extractVisibleArticleText(text = '') {
+  return normalizeText(text);
+}
+
 function createRedditApi({
   randomBetween,
 }) {
+  async function capturePostScreenshot(page, selectorId = '') {
+    const normalized = String(selectorId || '').trim();
+    if (!normalized) {
+      return null;
+    }
+    await ensureVisionDir().catch(() => null);
+    const locator = page.locator(`[data-agent-reddit-post-id="${normalized}"]`).first();
+    const visible = await locator.isVisible().catch(() => false);
+    if (!visible) {
+      return null;
+    }
+    const screenshotPath = buildVisionFilePath('reddit-post', '.png');
+    await locator.screenshot({ path: screenshotPath, type: 'png' }).catch(() => null);
+    return screenshotPath;
+  }
+
+  async function captureAttachedImageScreenshots(page, imageSelectorIds = []) {
+    const screenshots = [];
+    await ensureVisionDir().catch(() => null);
+    for (const selectorId of imageSelectorIds.slice(0, 3)) {
+      const locator = page.locator(`[data-agent-reddit-image-id="${String(selectorId || '').trim()}"]`).first();
+      const visible = await locator.isVisible().catch(() => false);
+      if (!visible) {
+        continue;
+      }
+      const screenshotPath = buildVisionFilePath('reddit-image', '.png');
+      await locator.screenshot({ path: screenshotPath, type: 'png' }).catch(() => null);
+      screenshots.push(screenshotPath);
+    }
+    return screenshots;
+  }
+
+  async function analyzePostScreenshotWithVision(imagePath = '') {
+    return analyzeImageWithVision(
+      imagePath,
+      'Read this Reddit post screenshot. Extract visible text, summarize the seller problem, and identify Amazon reimbursement, inventory, fee, payout, settlement, or profit-leak signals.'
+    );
+  }
+
+  async function analyzeAttachedImagesWithVision(imagePaths = []) {
+    const analyses = [];
+    for (const imagePath of imagePaths.slice(0, 3)) {
+      analyses.push(await analyzeImageWithVision(
+        imagePath,
+        'Read this attached Reddit image. If it shows Amazon Seller Central, inventory, settlement, payout, reimbursement, or fee information, extract useful text and summarize the issue.'
+      ));
+    }
+    return {
+      used: analyses.some((item) => item?.used),
+      text: uniqueStrings(analyses.map((item) => item?.text || '')).join('\n').trim(),
+      summary: uniqueStrings(analyses.map((item) => item?.summary || '')).join('\n').trim(),
+      signals: uniqueStrings(analyses.flatMap((item) => Array.isArray(item?.signals) ? item.signals : [])),
+      confidence: analyses.length
+        ? Number((analyses.reduce((sum, item) => sum + Number(item?.confidence || 0), 0) / analyses.length).toFixed(2))
+        : 0,
+    };
+  }
+
   function normalizeSubredditName(value = '') {
     return String(value || '').trim().replace(/^r\//i, '').replace(/^\/?r\//i, '').replace(/^\/+|\/+$/g, '');
   }
@@ -183,6 +261,66 @@ function createRedditApi({
         return '';
       }
 
+      function stripUiNoise(text) {
+        return normalize(
+          String(text || '')
+            .replace(/\b(?:upvote|downvote|share|award|reply|comment|comments|sort by: best|best|top|new)\b/gi, ' ')
+            .replace(/\s+/g, ' ')
+        );
+      }
+
+      function extractVisibleArticleText(card) {
+        const texts = [];
+        const seen = new Set();
+        const nodes = Array.from(card.querySelectorAll('h1, h2, h3, p, div, span, a'));
+        for (const node of nodes) {
+          if (!isVisible(node)) {
+            continue;
+          }
+          const text = stripUiNoise(node.innerText || '');
+          if (!text || text.length < 3) {
+            continue;
+          }
+          const key = text.toLowerCase();
+          if (seen.has(key)) {
+            continue;
+          }
+          seen.add(key);
+          texts.push(text);
+        }
+        return texts.join('\n').trim();
+      }
+
+      function collectAttachedImages(card) {
+        const images = [];
+        const seen = new Set();
+        const nodes = Array.from(card.querySelectorAll('img'));
+        for (const node of nodes) {
+          if (!isVisible(node)) {
+            continue;
+          }
+          const rect = node.getBoundingClientRect();
+          if (rect.width < 90 || rect.height < 90) {
+            continue;
+          }
+          const src = node.getAttribute('src') || '';
+          const altText = normalize(node.getAttribute('alt') || node.getAttribute('aria-label') || '');
+          const key = `${src.slice(0, 80)}|${Math.round(rect.width)}|${Math.round(rect.height)}`;
+          if (seen.has(key)) {
+            continue;
+          }
+          seen.add(key);
+          const selectorId = node.getAttribute('data-agent-reddit-image-id') || `agent-reddit-image-${images.length + 1}-${Math.round(rect.top)}`;
+          node.setAttribute('data-agent-reddit-image-id', selectorId);
+          images.push({
+            selectorId,
+            altText,
+            src,
+          });
+        }
+        return images;
+      }
+
       const containers = Array.from(document.querySelectorAll(
         'shreddit-post, article[data-testid="post-container"], div[data-testid="post-container"], article'
       )).filter((node, index, all) => isVisible(node) && all.indexOf(node) === index);
@@ -206,6 +344,9 @@ function createRedditApi({
           getText(card, ['[slot="text-body"]', 'div[data-click-id="text"]', '[data-testid="post-content"]'])
           || Array.from(card.querySelectorAll('p')).map((node) => normalize(node.innerText)).filter(Boolean).join(' ')
         );
+        const visibleFallback = extractVisibleArticleText(card);
+        const attachedImages = collectAttachedImages(card);
+        const imageAltText = attachedImages.map((item) => item.altText).filter(Boolean).join('\n').trim();
         const dedupeKey = `${href}|${title}`;
 
         if (!title || !href) {
@@ -222,6 +363,9 @@ function createRedditApi({
         }
         seen.add(dedupeKey);
 
+        const selectorId = card.getAttribute('data-agent-reddit-post-id') || `agent-reddit-post-${posts.length + 1}`;
+        card.setAttribute('data-agent-reddit-post-id', selectorId);
+
         posts.push({
           visibleIndex: posts.length + 1,
           articleIndex: index,
@@ -230,8 +374,19 @@ function createRedditApi({
           title,
           authorName: author || 'Unknown',
           subreddit: subreddit || '',
-          postText: normalize([title, body].filter(Boolean).join('\n')),
+          postText: normalize([title, body || visibleFallback || imageAltText].filter(Boolean).join('\n')),
           summary: title,
+          selectorId,
+          textFromDom: normalize([title, body].filter(Boolean).join('\n')),
+          textFromVisibleFallback: visibleFallback,
+          textFromImages: imageAltText,
+          domTextLength: normalize([title, body].filter(Boolean).join('\n')).length,
+          fallbackTextLength: visibleFallback.length,
+          imageTextLength: imageAltText.length,
+          attachedImagesCount: attachedImages.length,
+          attachedImageSelectorIds: attachedImages.map((item) => item.selectorId),
+          visionUsed: false,
+          matchedLeadSignals: [],
         });
 
         if (posts.length >= limit) {
@@ -250,11 +405,77 @@ function createRedditApi({
       };
     }, { limit: Math.max(1, limit) });
 
-    if (returnMeta) {
-      return extracted;
+    const multimodalPosts = [];
+    for (const post of Array.isArray(extracted?.posts) ? extracted.posts : []) {
+      const domText = normalizeText(post.textFromDom || '');
+      const fallbackText = normalizeText(post.textFromVisibleFallback || '');
+      let screenshotAnalysis = {
+        used: false,
+        text: '',
+        summary: '',
+        signals: [],
+        confidence: 0,
+      };
+      let imageAnalysis = {
+        used: false,
+        text: '',
+        summary: '',
+        signals: [],
+        confidence: 0,
+      };
+
+      const needsVision = domText.length < 24 || fallbackText.length < 24 || Number(post.attachedImagesCount || 0) > 0;
+      if (needsVision) {
+        const screenshotPath = await capturePostScreenshot(page, post.selectorId);
+        if (screenshotPath) {
+          screenshotAnalysis = await analyzePostScreenshotWithVision(screenshotPath);
+        }
+      }
+
+      if (Number(post.attachedImagesCount || 0) > 0) {
+        const imagePaths = await captureAttachedImageScreenshots(page, post.attachedImageSelectorIds || []);
+        if (imagePaths.length) {
+          imageAnalysis = await analyzeAttachedImagesWithVision(imagePaths);
+        }
+      }
+
+      const reading = mergePostReading({
+        author: post.authorName || '',
+        textFromDom: domText,
+        textFromVisibleFallback: fallbackText,
+        textFromImages: uniqueStrings([post.textFromImages || '', screenshotAnalysis.text, imageAnalysis.text]).join('\n'),
+        visualSummary: uniqueStrings([screenshotAnalysis.summary, imageAnalysis.summary]).join('\n'),
+        attachedImagesCount: Number(post.attachedImagesCount || 0),
+        existingSignals: [
+          ...(Array.isArray(screenshotAnalysis.signals) ? screenshotAnalysis.signals : []),
+          ...(Array.isArray(imageAnalysis.signals) ? imageAnalysis.signals : []),
+        ],
+      });
+
+      multimodalPosts.push({
+        ...post,
+        postText: reading.merged_text || post.postText || '',
+        textFromDom: reading.text_from_dom,
+        textFromVisibleFallback: reading.text_from_visible_fallback,
+        textFromImages: reading.text_from_images,
+        visualSummary: reading.visual_summary,
+        confidenceScore: reading.confidence_score,
+        matchedLeadSignals: reading.lead_signals_matched,
+        visionUsed: Boolean(screenshotAnalysis.used || imageAnalysis.used),
+        domTextLength: reading.text_from_dom.length,
+        fallbackTextLength: reading.text_from_visible_fallback.length,
+        imageTextLength: reading.text_from_images.length,
+      });
     }
 
-    return extracted.posts || [];
+    if (returnMeta) {
+      return {
+        ...extracted,
+        posts: multimodalPosts,
+      };
+    }
+
+    return multimodalPosts;
   }
 
   async function observeRedditPage(page, { includePosts = false, limit = 10, scrollRounds = 1 } = {}) {
@@ -484,4 +705,6 @@ module.exports = {
   REDDIT_BASE_URL,
   classifyRedditPage,
   createRedditApi,
+  extractPostDomText,
+  extractVisibleArticleText,
 };
