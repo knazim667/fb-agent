@@ -784,6 +784,17 @@ function plannerToolGuide() {
   ].join('\n');
 }
 
+function buildOperatingPolicySummary(workspace = {}) {
+  const sections = [
+    excerpt(workspace.agents || '', 1200),
+    excerpt(workspace.soul || '', 900),
+    excerpt(workspace.user || '', 700),
+    excerpt(workspace.memory || '', 700),
+  ].filter(Boolean);
+
+  return sections.join('\n\n').trim();
+}
+
 function buildPlannerContext(message, state, taskInput) {
   const context = ensureOperatorContext(state);
   const workspace = state.workspaceContext || {};
@@ -807,6 +818,7 @@ function buildPlannerContext(message, state, taskInput) {
 
   return JSON.stringify({
     task_goal: taskInput?.active_skill || 'general_facebook_management',
+    operating_policy: buildOperatingPolicySummary(workspace),
     workspace: {
       agents: excerpt(workspace.agents || '', 800),
       soul: excerpt(workspace.soul || '', 600),
@@ -856,20 +868,24 @@ async function planOperatorMessage(message, deps) {
   } = deps;
 
   const prompt = [
-    'You are the planner for a Facebook account manager agent.',
-    'Treat the user message as a top-level objective.',
-    'Read the user message, current context, and choose the smallest useful tool plan.',
+    'You are the next-step controller for a skill-driven browser operator.',
+    'Treat the user message as a real-world goal, not just a command label.',
+    'Read the user message, current context, active skills, and choose the smallest useful browser action plan.',
     'Decompose the objective using the chosen family: business_scan, general_engagement, or drafting.',
     'Understand the meaning, not exact commands.',
+    'Use the skill files as operating policy when choosing what to search, ignore, or act on.',
+    'Prefer action over explanation. Do not stop at planning when a browser action can be taken safely now.',
     'If the user asks for Amazon-related groups only, use list_groups with amazon_only=true.',
     'If the user refers to a numbered group or post, use the current list indexes from context.',
     'If the user asks to go to a group and then find lead posts, use open_group then scan_current_group.',
     'If the user asks for general Facebook engagement or recent/raw posts, do not force a business-only filter.',
     'If the user asks to draft, show the draft first. Do not publish in the same step unless they explicitly ask to post.',
-    'Use the Amazon skill only when the content clearly fits that business context. Otherwise act like a polite high-value human account manager.',
+    'Use the Amazon skill only when the content clearly fits that business context. Otherwise act like a calm human operator.',
     'If the user asks for a draft, do not post unless execution mode and user intent clearly allow it.',
+    'After explicit approval of a draft, switch to execution mode and publish immediately instead of looping back to another draft step.',
     'Prefer multi-step plans when the user asks for a sequence.',
     'Do not repeat list_groups if the user is clearly referring to an existing numbered list already in context.',
+    'If results are weak, adapt with broader browsing or manual exploration instead of stopping early.',
     'Return JSON only with this shape:',
     '{"assistant_reply":"short optional note","actions":[{"tool":"tool_name","args":{}}]}',
     '',
@@ -3986,7 +4002,7 @@ function startOperatorConsole(deps) {
       return outputs;
     }
 
-    if (objectivePlan?.steps?.length) {
+    if (context.debugMode && objectivePlan?.steps?.length) {
       const planText = [
         `Objective: ${objectivePlan.objective || raw} [${objectivePlan.family || 'general_engagement'}]`,
         ...objectivePlan.steps.slice(0, 5).map((step, index) => `${index + 1}. ${step}`),
@@ -4175,7 +4191,7 @@ function startOperatorConsole(deps) {
   void queueSessionEvent('session_started', {
     sessionLogPath,
   });
-  console.log('Operator console ready. Speak naturally and I will plan the steps.');
+  console.log('Operator console ready. Speak naturally and I will work the browser step by step.');
   rl.prompt();
   return rl;
 }

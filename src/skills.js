@@ -22,6 +22,17 @@ function extractHeading(content = '') {
   return match ? match[1].trim() : '';
 }
 
+function extractBulletItems(sectionText = '') {
+  return tokenize(
+    String(sectionText || '')
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => /^[-*]\s+/.test(line))
+      .map((line) => line.replace(/^[-*]\s+/, '').trim())
+      .join('\n')
+  );
+}
+
 function extractSection(content = '', heading = '') {
   const target = String(heading || '').trim().toLowerCase();
   if (!target) {
@@ -30,17 +41,24 @@ function extractSection(content = '', heading = '') {
 
   const lines = String(content || '').split(/\r?\n/);
   let collecting = false;
+  let targetDepth = 0;
   const buffer = [];
 
   for (const line of lines) {
-    const headingMatch = line.match(/^#{1,6}\s+(.+?)\s*$/);
+    const headingMatch = line.match(/^(#{1,6})\s+(.+?)\s*$/);
     if (headingMatch) {
-      const currentHeading = String(headingMatch[1] || '').trim().toLowerCase();
+      const depth = String(headingMatch[1] || '').length;
+      const currentHeading = String(headingMatch[2] || '').trim().toLowerCase();
       if (collecting) {
-        break;
+        if (depth <= targetDepth) {
+          break;
+        }
+        buffer.push(line);
+        continue;
       }
       if (currentHeading === target) {
         collecting = true;
+        targetDepth = depth;
       }
       continue;
     }
@@ -55,17 +73,23 @@ function extractSection(content = '', heading = '') {
 
 function parseSkillMetadata(entry, content = '') {
   const title = extractHeading(content) || entry.name.replace(/\.md$/i, '');
-  const mission = extractSection(content, 'Mission');
-  const goal = extractSection(content, 'Goal') || extractSection(content, 'Business Goal');
+  const mission = extractSection(content, 'Mission') || extractSection(content, 'Role');
+  const goal = extractSection(content, 'Goal') || extractSection(content, 'Business Goal') || extractSection(content, 'Purpose');
   const audience = extractSection(content, 'Audience');
-  const expertise = extractSection(content, 'Expertise') || extractSection(content, 'Core Knowledge');
+  const expertise = extractSection(content, 'Expertise') || extractSection(content, 'Core Knowledge') || extractSection(content, 'Focus Areas');
   const tone = extractSection(content, 'Tone');
-  const leadSignals = extractSection(content, 'Lead Signals');
+  const leadSignals = extractSection(content, 'Lead Signals') || extractSection(content, 'When To Escalate To Hidden Money Offer');
   const searchThemes = extractSection(content, 'High-Value Search Themes');
   const goodLeadExamples = extractSection(content, 'Good Lead Examples');
   const weakSignals = extractSection(content, 'Weak Or Non-Lead Cases')
     || extractSection(content, 'What Not To Do')
     || extractSection(content, 'Avoid');
+  const focusAreas = extractSection(content, 'Focus Areas') || extractSection(content, 'Where To Engage');
+  const commentRules = extractSection(content, 'Comment Rules') || extractSection(content, 'Rules');
+  const positioning = extractSection(content, 'Positioning');
+  const commentTypes = extractSection(content, 'Comment Types');
+  const dmRules = extractSection(content, 'DM Rules');
+  const dailyActivity = extractSection(content, 'Daily Activity');
   const sourceText = [
     title,
     mission,
@@ -77,6 +101,12 @@ function parseSkillMetadata(entry, content = '') {
     searchThemes,
     goodLeadExamples,
     weakSignals,
+    focusAreas,
+    commentRules,
+    positioning,
+    commentTypes,
+    dmRules,
+    dailyActivity,
     entry.name,
   ].filter(Boolean).join('\n');
 
@@ -94,6 +124,13 @@ function parseSkillMetadata(entry, content = '') {
     searchThemes,
     goodLeadExamples,
     weakSignals,
+    focusAreas,
+    commentRules,
+    positioning,
+    commentTypes,
+    dmRules,
+    dailyActivity,
+    signalKeywords: extractBulletItems([leadSignals, focusAreas, commentTypes].filter(Boolean).join('\n')),
     keywords: tokenize(sourceText),
   };
 }
