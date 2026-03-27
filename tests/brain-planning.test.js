@@ -6,6 +6,7 @@ const assert = require('node:assert/strict');
 const {
   buildSkillDecisionContext,
   buildObjectiveChecklist,
+  inferBehaviorMode,
   inferObjectiveFamily,
   interpretObjectiveForBrowser,
 } = require('../src/brain');
@@ -139,4 +140,53 @@ test('buildSkillDecisionContext keeps pure visibility engagement separate from a
   assert.ok(policy.loadedSkillIds.includes('visibility_engagement'));
   assert.equal(policy.loadedSkillIds.includes('amazon_hidden_money'), false);
   assert.equal(policy.loadedSkillIds.includes('amazon_expert'), false);
+});
+
+test('inferBehaviorMode keeps visibility work human-first with no business overlay', () => {
+  assert.deepEqual(
+    inferBehaviorMode({
+      objective: 'using visibility engagement skill can you randomly comment on 5 random post from feed',
+      family: 'general_engagement',
+      relevantSkill: 'amazon_hidden_money',
+      skillPolicy: {
+        loadedSkillIds: ['visibility_engagement'],
+      },
+    }),
+    {
+      behaviorMode: 'visibility',
+      businessOverlayActive: false,
+    }
+  );
+});
+
+test('inferBehaviorMode enables business overlay for lead hunt', () => {
+  assert.deepEqual(
+    inferBehaviorMode({
+      objective: 'find leads about amazon reimbursement and settlement confusion',
+      family: 'business_scan',
+      relevantSkill: 'amazon_hidden_money',
+      skillPolicy: {
+        loadedSkillIds: ['amazon_hidden_money', 'amazon_expert'],
+      },
+    }),
+    {
+      behaviorMode: 'lead_hunt',
+      businessOverlayActive: true,
+    }
+  );
+});
+
+test('interpretObjectiveForBrowser exposes visibility mode for general engagement', async () => {
+  const plan = await interpretObjectiveForBrowser({
+    objective: 'using visibility engagement skill can you randomly comment on 5 random post from feed',
+    currentPlatform: 'facebook',
+    currentSurface: 'facebook_home_feed',
+    relevantSkill: 'amazon_hidden_money',
+    family: 'general_engagement',
+  }, {
+    disableModel: true,
+  });
+
+  assert.equal(plan.behaviorMode, 'visibility');
+  assert.equal(plan.businessOverlayActive, false);
 });

@@ -43,6 +43,8 @@ function ensureOperatorContext(state) {
       executionMode: 'confirm',
       debugMode: false,
       dryRunMode: false,
+      behaviorMode: 'social',
+      businessOverlayActive: false,
       currentPlatform: 'facebook',
       currentSurface: 'group',
       currentGroup: null,
@@ -69,6 +71,10 @@ function ensureOperatorContext(state) {
     state.operatorContext.currentPlatform = 'facebook';
   }
 
+  if (!state.operatorContext.behaviorMode) {
+    state.operatorContext.behaviorMode = 'social';
+  }
+
   return state.operatorContext;
 }
 
@@ -85,6 +91,8 @@ async function persistOperatorContext(state, upsertAgentState) {
     executionMode: context.executionMode,
     debugMode: Boolean(context.debugMode),
     dryRunMode: Boolean(context.dryRunMode),
+    behaviorMode: context.behaviorMode || 'social',
+    businessOverlayActive: Boolean(context.businessOverlayActive),
     currentPlatform: context.currentPlatform || 'facebook',
     currentSurface: context.currentSurface || 'group',
     currentGroup: context.currentGroup,
@@ -1244,6 +1252,84 @@ function summarizeSkillInfluence(objectiveProfile = null) {
   return skillIds.join(', ');
 }
 
+function isBusinessSkillId(id = '') {
+  return /amazon_hidden_money|amazon_expert/i.test(String(id || '').trim());
+}
+
+function resolveRuntimeBehaviorMode({
+  objectiveProfile = null,
+  objectivePlan = null,
+  raw = '',
+} = {}) {
+  const normalized = String(raw || '').toLowerCase();
+  const profileMode = String(objectiveProfile?.behaviorMode || '').trim();
+  const loadedSkills = Array.isArray(objectiveProfile?.skillPolicy?.loadedSkillIds)
+    ? objectiveProfile.skillPolicy.loadedSkillIds
+    : [];
+  const businessOverlayFromSkills = loadedSkills.some((id) => isBusinessSkillId(id));
+  const visibilityRequested = /\bvisibility\b|\bwarm up\b|\bwarm-up\b|\blike\b|\bcomment\b|\breply\b/.test(normalized);
+  const family = String(objectiveProfile?.family || objectivePlan?.family || '').trim();
+
+  let behaviorMode = profileMode || 'social';
+  if (!profileMode) {
+    if (family === 'business_scan') {
+      behaviorMode = 'lead_hunt';
+    } else if (family === 'drafting' && businessOverlayFromSkills) {
+      behaviorMode = 'business_execution';
+    } else if (visibilityRequested) {
+      behaviorMode = 'visibility';
+    }
+  }
+
+  const businessOverlayActive = Boolean(objectiveProfile?.businessOverlayActive)
+    || (['lead_hunt', 'business_execution'].includes(behaviorMode) && businessOverlayFromSkills);
+
+  return {
+    behaviorMode,
+    businessOverlayActive,
+  };
+}
+
+function explainCandidateSelection(post = {}, {
+  behaviorMode = 'social',
+  businessOverlayActive = false,
+} = {}) {
+  const readableLength = Math.max(
+    Number(post.fallback_text_len || post.fallbackTextLength || 0),
+    Number(post.dom_text_len || post.domTextLength || 0),
+    Number(post.image_text_len || post.imageTextLength || 0),
+    String(post.content || post.postText || '').trim().length
+  );
+  const matchedSignals = Array.isArray(post.matched_lead_signals)
+    ? post.matched_lead_signals
+    : Array.isArray(post.matchedLeadSignals)
+      ? post.matchedLeadSignals
+      : [];
+
+  if (behaviorMode === 'lead_hunt' || behaviorMode === 'business_execution') {
+    return {
+      selectedFor: 'lead',
+      reason: matchedSignals.length
+        ? `lead signals: ${matchedSignals.join(', ')}`
+        : businessOverlayActive
+          ? 'business overlay review'
+          : 'lead review',
+    };
+  }
+
+  if (behaviorMode === 'visibility') {
+    return {
+      selectedFor: 'visibility',
+      reason: readableLength >= 24 ? 'readable niche post for profile warmth' : 'light community visibility',
+    };
+  }
+
+  return {
+    selectedFor: 'social',
+    reason: readableLength >= 24 ? 'readable human post for natural engagement' : 'general social browsing',
+  };
+}
+
 function renderDryRunPreview({
   title = 'Dry run preview',
   items = [],
@@ -1828,6 +1914,7 @@ function startOperatorConsole(deps) {
   function formatFacebookObservationDebug(observation) {
     const debugInfo = observation?.postsDebug || {};
     const lines = [
+      `facebook mode: mode=${context.behaviorMode || 'social'} business_overlay=${context.businessOverlayActive ? 'yes' : 'no'}`,
       `facebook observe: state=${observation?.state || 'unknown'} url=${observation?.url || page.url()} cards=${debugInfo.articleCount || 0} candidate_roots=${debugInfo.candidateRootCount || debugInfo.articleCount || 0} readable=${debugInfo.readableTextCount || 0} extraction_failures=${debugInfo.extractionFailureCount || 0} eligible=${debugInfo.eligibleCount || debugInfo.keptCount || (observation?.posts || []).length} inspected=${debugInfo.inspectedArticleCount || debugInfo.articleCount || 0} kept=${debugInfo.keptCount || (observation?.posts || []).length}`,
     ];
     if (debugInfo.feedContainerStatus) {
@@ -3153,17 +3240,27 @@ function startOperatorConsole(deps) {
       if (context.dryRunMode) {
         return renderDryRunPreview({
           title: `Dry run for ${selection === 'first' ? 'first' : 'random'} likes in ${surface === 'feed' ? 'your home feed' : targetGroup.name}`,
-          items: candidatePosts.slice(0, requestedCount).map((post, index) => ({
-            label: post.authorName || post.title || `Post ${index + 1}`,
-            temperature: post.lead_temperature || 'unknown',
-            reason: excerpt(post.postText || '', 160),
-            action: 'like only',
-          })),
+          items: candidatePosts.slice(0, requestedCount).map((post, index) => {
+            const selection = explainCandidateSelection(post, {
+              behaviorMode: context.behaviorMode,
+              businessOverlayActive: context.businessOverlayActive,
+            });
+            return {
+              label: post.authorName || post.title || `Post ${index + 1}`,
+              temperature: post.lead_temperature || context.behaviorMode,
+              reason: `${selection.reason}. ${excerpt(post.postText || '', 160)}`,
+              action: `${selection.selectedFor}: like only`,
+            };
+          }),
         });
       }
 
       candidatePosts.forEach((post) => {
-        traceDebug(`like candidate ${post.postId || post.visibleIndex}: visibleIndex=${post.visibleIndex} selection=${selection} controls=${(post.controlNames || []).join(',') || 'none'}`);
+        const selectionReason = explainCandidateSelection(post, {
+          behaviorMode: context.behaviorMode,
+          businessOverlayActive: context.businessOverlayActive,
+        });
+        traceDebug(`like candidate ${post.postId || post.visibleIndex}: visibleIndex=${post.visibleIndex} selection=${selection} mode=${context.behaviorMode} selected_for=${selectionReason.selectedFor} reason=${selectionReason.reason} controls=${(post.controlNames || []).join(',') || 'none'}`);
       });
 
       for (const post of candidatePosts) {
@@ -3275,16 +3372,26 @@ function startOperatorConsole(deps) {
       if (context.dryRunMode) {
         return renderDryRunPreview({
           title: `Dry run for ${selection === 'first' ? 'first' : 'random'} comments in ${surface === 'feed' ? 'your home feed' : targetGroup.name}`,
-          items: candidatePosts.slice(0, requestedCount).map((post, index) => ({
-            label: post.authorName || post.title || `Post ${index + 1}`,
-            temperature: post.lead_temperature || 'unknown',
-            reason: excerpt(post.postText || '', 160),
-            action: 'comment publicly',
-          })),
+          items: candidatePosts.slice(0, requestedCount).map((post, index) => {
+            const selection = explainCandidateSelection(post, {
+              behaviorMode: context.behaviorMode,
+              businessOverlayActive: context.businessOverlayActive,
+            });
+            return {
+              label: post.authorName || post.title || `Post ${index + 1}`,
+              temperature: post.lead_temperature || context.behaviorMode,
+              reason: `${selection.reason}. ${excerpt(post.postText || '', 160)}`,
+              action: `${selection.selectedFor}: comment publicly`,
+            };
+          }),
         });
       }
       candidatePosts.forEach((post) => {
-        traceDebug(`comment candidate ${post.postId || post.visibleIndex}: visibleIndex=${post.visibleIndex} selection=${selection} controls=${(post.controlNames || []).join(',') || 'none'}`);
+        const selectionReason = explainCandidateSelection(post, {
+          behaviorMode: context.behaviorMode,
+          businessOverlayActive: context.businessOverlayActive,
+        });
+        traceDebug(`comment candidate ${post.postId || post.visibleIndex}: visibleIndex=${post.visibleIndex} selection=${selection} mode=${context.behaviorMode} selected_for=${selectionReason.selectedFor} reason=${selectionReason.reason} controls=${(post.controlNames || []).join(',') || 'none'}`);
       });
       let commentedCount = 0;
       const errors = [];
@@ -4060,17 +4167,26 @@ function startOperatorConsole(deps) {
           model,
         }).catch(() => null)
       : null;
+    const runtimeBehavior = resolveRuntimeBehaviorMode({
+      objectiveProfile,
+      objectivePlan,
+      raw,
+    });
+    context.behaviorMode = runtimeBehavior.behaviorMode;
+    context.businessOverlayActive = runtimeBehavior.businessOverlayActive;
 
     void queueSessionEvent('objective_profile', {
       raw,
       family: objectiveProfile?.family || objectivePlan?.family || '',
+      behaviorMode: runtimeBehavior.behaviorMode,
+      businessOverlayActive: runtimeBehavior.businessOverlayActive,
       topic: objectiveProfile?.topic || objectivePlan?.topic || '',
       searchPasses: objectiveProfile?.searchPasses || [],
       skills: objectiveProfile?.skillPolicy?.loadedSkillIds || [],
     });
 
     if (context.debugMode && objectiveProfile) {
-      traceDebug(`goal plan: family=${objectiveProfile.family || 'unknown'} topic=${objectiveProfile.topic || raw} skills=${summarizeSkillInfluence(objectiveProfile)}`);
+      traceDebug(`goal plan: family=${objectiveProfile.family || 'unknown'} mode=${runtimeBehavior.behaviorMode} business_overlay=${runtimeBehavior.businessOverlayActive ? 'yes' : 'no'} topic=${objectiveProfile.topic || raw} skills=${summarizeSkillInfluence(objectiveProfile)}`);
       const passes = Array.isArray(objectiveProfile.searchPasses) ? objectiveProfile.searchPasses : [];
       for (const pass of passes.slice(0, 4)) {
         const queries = Array.isArray(pass?.queries) ? pass.queries.filter(Boolean) : [];

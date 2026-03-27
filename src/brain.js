@@ -1135,6 +1135,46 @@ function buildHeuristicSearchPlan({
   };
 }
 
+function inferBehaviorMode({
+  objective = '',
+  family = '',
+  relevantSkill = '',
+  skillPolicy = null,
+} = {}) {
+  const normalized = String(objective || '').toLowerCase();
+  const loadedSkillIds = Array.isArray(skillPolicy?.loadedSkillIds) ? skillPolicy.loadedSkillIds : [];
+  const businessSkillActive = [relevantSkill, ...loadedSkillIds]
+    .some((id) => /amazon_hidden_money|amazon_expert/i.test(String(id || '')));
+  const visibilityActive = loadedSkillIds.includes('visibility_engagement')
+    || /\bvisibility\b|\bwarm up\b|\bwarm-up\b|\blike\b|\bcomment\b|\breply\b/.test(normalized);
+
+  if (family === 'business_scan') {
+    return {
+      behaviorMode: 'lead_hunt',
+      businessOverlayActive: businessSkillActive,
+    };
+  }
+
+  if (family === 'drafting') {
+    return {
+      behaviorMode: businessSkillActive ? 'business_execution' : 'social',
+      businessOverlayActive: businessSkillActive,
+    };
+  }
+
+  if (visibilityActive) {
+    return {
+      behaviorMode: 'visibility',
+      businessOverlayActive: false,
+    };
+  }
+
+  return {
+    behaviorMode: 'social',
+    businessOverlayActive: false,
+  };
+}
+
 async function interpretObjectiveForBrowser({
   objective,
   currentPlatform = 'facebook',
@@ -1163,6 +1203,12 @@ async function interpretObjectiveForBrowser({
     topic,
     skillPolicy,
   });
+  const behavior = inferBehaviorMode({
+    objective: normalizedObjective,
+    family: resolvedFamily,
+    relevantSkill,
+    skillPolicy,
+  });
 
   if (options.disableModel) {
     return {
@@ -1171,6 +1217,9 @@ async function interpretObjectiveForBrowser({
       platform: currentPlatform,
       surface: currentSurface,
       relevantSkill,
+      behaviorMode: behavior.behaviorMode,
+      businessOverlayActive: behavior.businessOverlayActive,
+      skillPolicy,
       ...heuristic,
     };
   }
@@ -1233,6 +1282,8 @@ async function interpretObjectiveForBrowser({
           : resolvedFamily,
         platform: currentPlatform,
         surface: currentSurface,
+        behaviorMode: behavior.behaviorMode,
+        businessOverlayActive: behavior.businessOverlayActive,
         intent: String(parsed.intent || '').trim() || heuristic.intent,
         topic: String(parsed.topic || '').trim() || heuristic.topic,
         relevantSkill: String(parsed.relevant_skill || '').trim() || relevantSkill,
@@ -1255,6 +1306,8 @@ async function interpretObjectiveForBrowser({
     platform: currentPlatform,
     surface: currentSurface,
     relevantSkill,
+    behaviorMode: behavior.behaviorMode,
+    businessOverlayActive: behavior.businessOverlayActive,
     ...heuristic,
     reason: 'heuristic_search_plan',
     skillPolicy,
@@ -1615,6 +1668,7 @@ module.exports = {
   loadSkill,
   buildObjectiveChecklist,
   inferObjectiveFamily,
+  inferBehaviorMode,
   readAgentInsights,
   resolveSkillForTask,
   setModelRuntimeConfig,
