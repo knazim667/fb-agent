@@ -157,3 +157,35 @@ test('isVisiblePostCandidate keeps image-backed candidates even when dom body is
     true
   );
 });
+
+test('isVisiblePostCandidate keeps candidates with visible fallback text even when structured body is weak', () => {
+  assert.equal(
+    isVisiblePostCandidate({
+      authorName: 'Seller Example',
+      bodyText: '',
+      actionControlCount: 1,
+      timestampText: '',
+      validationMode: 'engagement',
+      controlNames: ['like'],
+      fallbackUsed: true,
+      visibleTextLength: 42,
+    }),
+    true
+  );
+});
+
+test('isVisiblePostCandidate keeps readable engagement candidates even with weak controls', () => {
+  assert.equal(
+    isVisiblePostCandidate({
+      authorName: '',
+      bodyText: 'I had a rough week with shipping delays but here is what helped me fix it.',
+      actionControlCount: 0,
+      timestampText: '',
+      validationMode: 'engagement',
+      controlNames: [],
+      visibleTextLength: 78,
+      fallbackUsed: true,
+    }),
+    true
+  );
+});

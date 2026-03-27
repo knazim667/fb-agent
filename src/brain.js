@@ -866,6 +866,12 @@ async function buildSkillDecisionContext({
   const catalog = await loadSkillCatalog().catch(() => []);
   const catalogById = new Map(catalog.map((item) => [item.id, item]));
   const chosenSkillIds = [];
+  const explicitAmazonFocus = /\bamazon\b|\bfba\b|\breimbursement\b|\binventory\b|\bsettlement\b|\bfees?\b|\bprofit\b|\bmargins?\b/.test(normalizedObjective);
+  const visibilityFocused = family === 'general_engagement'
+    || /\b(comment|reply|engage|visibility|warm up|warm-up|like)\b/.test(normalizedObjective);
+  const pureVisibilityEngagement = family === 'general_engagement'
+    && visibilityFocused
+    && !explicitAmazonFocus;
 
   function includeSkill(id) {
     const normalizedId = String(id || '').trim();
@@ -875,22 +881,33 @@ async function buildSkillDecisionContext({
     chosenSkillIds.push(normalizedId);
   }
 
-  includeSkill(activeSkill);
-  includeSkill(relevantSkill);
+  function includeInitialSkill(id) {
+    const normalizedId = String(id || '').trim();
+    if (!normalizedId) {
+      return;
+    }
+    if (pureVisibilityEngagement && /^amazon_(hidden_money|expert)$/i.test(normalizedId)) {
+      return;
+    }
+    includeSkill(normalizedId);
+  }
+
+  includeInitialSkill(activeSkill);
+  includeInitialSkill(relevantSkill);
 
   const bestSkill = await findBestSkillForText(normalizedObjective, {
     catalog,
     minimumScore: 3,
   }).catch(() => null);
-  includeSkill(bestSkill?.id);
+  if (!(pureVisibilityEngagement && /^amazon_(hidden_money|expert)$/i.test(String(bestSkill?.id || '')))) {
+    includeSkill(bestSkill?.id);
+  }
 
-  const amazonFocused = /amazon|fba|reimbursement|inventory|settlement|fees?|profit|margin/.test(normalizedObjective)
+  const amazonFocused = explicitAmazonFocus
     || chosenSkillIds.includes('amazon_hidden_money')
     || chosenSkillIds.includes('amazon_expert');
-  const visibilityFocused = family === 'general_engagement'
-    || /\b(comment|reply|engage|visibility|warm up|warm-up|like)\b/.test(normalizedObjective);
 
-  if (amazonFocused) {
+  if (amazonFocused && !pureVisibilityEngagement) {
     includeSkill('amazon_hidden_money');
     includeSkill('amazon_expert');
   }

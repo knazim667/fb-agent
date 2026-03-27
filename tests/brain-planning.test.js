@@ -103,7 +103,7 @@ test('buildSkillDecisionContext produces short human seller symptom queries', as
   assert.ok(policy.symptomQueries.some((item) => /payout seems low|understand this settlement report|is this normal amazon fba/i.test(item)));
 });
 
-test('buildSkillDecisionContext wires richer updated skill sections into policy', async () => {
+test('buildSkillDecisionContext wires visibility engagement skill sections into policy', async () => {
   const policy = await buildSkillDecisionContext({
     objective: 'warm up visibility with natural seller comments and move good leads toward dm',
     activeSkill: 'amazon_hidden_money',
@@ -112,6 +112,31 @@ test('buildSkillDecisionContext wires richer updated skill sections into policy'
 
   assert.ok(policy.loadedSkillIds.includes('visibility_engagement'));
   assert.ok(policy.commentTypes.some((item) => /agreement comments|light insight comments|curious comments/i.test(item)));
+  assert.ok(policy.commentRules.some((item) => /keep comments under 2 lines|sound human and natural|no direct selling/i.test(item)));
+  assert.ok(policy.dailyActivityRules.some((item) => /5–10 comments|5-10 comments|5–10 likes|5-10 likes/i.test(item)));
+});
+
+test('buildSkillDecisionContext still wires amazon escalation rules for amazon lead work', async () => {
+  const policy = await buildSkillDecisionContext({
+    objective: 'find amazon sellers with missing units, incorrect fees, and payout confusion',
+    activeSkill: 'amazon_hidden_money',
+    family: 'business_scan',
+  });
+
+  assert.ok(policy.loadedSkillIds.includes('amazon_hidden_money'));
+  assert.ok(policy.loadedSkillIds.includes('amazon_expert'));
   assert.ok(policy.escalationRules.some((item) => /missing units|incorrect fees|payout confusion/i.test(item)));
-  assert.ok(policy.dmRules.some((item) => /minimum info needed|no links unless necessary|no hard close/i.test(item)));
+});
+
+test('buildSkillDecisionContext keeps pure visibility engagement separate from amazon lead skills', async () => {
+  const policy = await buildSkillDecisionContext({
+    objective: 'using visibility engagement skill can you randomly comment on 5 random post from feed',
+    activeSkill: 'amazon_hidden_money',
+    relevantSkill: 'amazon_hidden_money',
+    family: 'general_engagement',
+  });
+
+  assert.ok(policy.loadedSkillIds.includes('visibility_engagement'));
+  assert.equal(policy.loadedSkillIds.includes('amazon_hidden_money'), false);
+  assert.equal(policy.loadedSkillIds.includes('amazon_expert'), false);
 });

@@ -96,7 +96,7 @@ function isVisiblePostCandidate({
   }
 
   if (!hasLike && actionControlCount < 1) {
-    return false;
+    return visibleTextLength >= 24 || attachedImagesCount > 0 || imageTextLength >= 12;
   }
 
   return Boolean(normalizedAuthor || normalizedTimestamp || fallbackUsed || painSignalCount > 0 || attachedImagesCount > 0 || visibleTextLength > 0);
@@ -307,11 +307,80 @@ function createFeedApi({
     }
   }
 
+  async function retryRejectedArticlesInDetail(page, rejections = [], {
+    limit = 3,
+    validationMode = 'engagement',
+  } = {}) {
+    const candidates = (Array.isArray(rejections) ? rejections : [])
+      .filter((item) => item
+        && item.postUrl
+        && (
+          item.actionBarFound
+          || item.headerFound
+          || item.imageCount > 0
+          || item.rawTextLength > 0
+          || item.cleanedTextLength > 0
+          || String(item.textPreview || '').trim().length > 0
+        ))
+      .slice(0, limit);
+
+    const recovered = [];
+    const debug = [];
+
+    for (const candidate of candidates) {
+      let tempPage = null;
+      try {
+        tempPage = await page.context().newPage();
+        await tempPage.goto(candidate.postUrl, {
+          waitUntil: 'domcontentloaded',
+          timeout: 60_000,
+        });
+        await tempPage.waitForLoadState('networkidle').catch(() => null);
+        await tempPage.waitForTimeout(2_000);
+
+        const result = await extractVisiblePostAnchors(tempPage, {
+          limit: 1,
+          scrollRounds: 1,
+          returnMeta: true,
+          validationMode,
+          enableDetailFallback: false,
+        });
+        const posts = Array.isArray(result?.posts) ? result.posts : [];
+        if (posts.length) {
+          recovered.push({
+            ...posts[0],
+            recoveredFromDetail: true,
+            detailSourceUrl: candidate.postUrl,
+          });
+        }
+        debug.push({
+          articleIndex: candidate.articleIndex,
+          attempted: true,
+          recovered: posts.length > 0,
+          postUrl: candidate.postUrl,
+        });
+      } catch (error) {
+        debug.push({
+          articleIndex: candidate.articleIndex,
+          attempted: true,
+          recovered: false,
+          postUrl: candidate.postUrl,
+          error: error.message,
+        });
+      } finally {
+        await tempPage?.close().catch(() => null);
+      }
+    }
+
+    return { recovered, debug };
+  }
+
   async function extractVisiblePostAnchors(page, {
     limit = 20,
     scrollRounds = 2,
     returnMeta = false,
     validationMode = 'engagement',
+    enableDetailFallback = true,
   } = {}) {
     await page.waitForLoadState('domcontentloaded');
     await page.waitForTimeout(randomBetween(1_000, 2_000));
@@ -500,6 +569,50 @@ function createFeedApi({
         return chunks.join('\n').trim();
       }
 
+      function extractCaptionFallbackText(article, headerBottom, actionTop) {
+        const chunks = [];
+        const seen = new Set();
+        const nodes = Array.from(article.querySelectorAll('div, span, p, blockquote'));
+
+        for (const node of nodes) {
+          if (!isVisible(node)) {
+            continue;
+          }
+          if (node.closest('form, [role="textbox"], [aria-label*="Comment"], [aria-label*="Reply"]')) {
+            continue;
+          }
+          const rect = node.getBoundingClientRect();
+          if (rect.top < headerBottom - 8) {
+            continue;
+          }
+          if (rect.top >= actionTop - 4) {
+            continue;
+          }
+          const text = normalize(node.innerText);
+          if (!text || text.length < 6) {
+            continue;
+          }
+          if (/^(like|comment|share|reply|follow|see more|top contributor|write a comment|leave a comment|sponsored|suggested for you)$/i.test(text)) {
+            continue;
+          }
+          if (looksLikeTimestamp(text)) {
+            continue;
+          }
+          const cleaned = stripUiNoiseFromText(text);
+          if (!cleaned || cleaned.length < 6) {
+            continue;
+          }
+          const key = cleaned.toLowerCase();
+          if (seen.has(key)) {
+            continue;
+          }
+          seen.add(key);
+          chunks.push(cleaned);
+        }
+
+        return chunks.join('\n').trim();
+      }
+
       function extractDeepArticleText(article, actionTop) {
         const texts = [];
         const seen = new Set();
@@ -678,18 +791,205 @@ function createFeedApi({
         });
       }
 
+      function countVisibleImages(node) {
+        return Array.from(node.querySelectorAll('img')).filter((img) => {
+          if (!isVisible(img)) {
+            return false;
+          }
+          const rect = img.getBoundingClientRect();
+          return rect.width >= 80 && rect.height >= 80;
+        }).length;
+      }
+
+      function cleanedVisibleText(node) {
+        return normalize(
+          String(node?.innerText || node?.textContent || '')
+            .replace(/\b(?:Like|Comment|Share|Reply|Follow|See more|Top contributor|Write a comment|Leave a comment|View more answers|Write an answer|Send message|Message|Sponsored|Suggested for you|Most relevant)\b/gi, ' ')
+            .replace(/\s+/g, ' ')
+        );
+      }
+
+      function countActionControls(node) {
+        return Array.from(node.querySelectorAll('button,[role="button"],a[href],span,div'))
+          .filter((child) => isVisible(child))
+          .map((child) => normalize(child.innerText || child.getAttribute('aria-label') || child.getAttribute('title') || ''))
+          .filter((text) => /(?:^|\b)(like|comment|share|reply)(?:\b|$)/i.test(text)).length;
+      }
+
+      function looksLikeUiOnlyText(text) {
+        const normalized = normalize(text).toLowerCase();
+        if (!normalized) {
+          return true;
+        }
+        return /^(?:like|comment|share|reply|follow|see more|top contributor|sponsored|suggested for you|most relevant|write a comment|leave a comment|view more answers|write an answer|\d+\s*(?:likes?|comments?))+$/.test(
+          normalized.replace(/\s+/g, ' ')
+        );
+      }
+
+      function describeNode(node) {
+        return {
+          rootTag: node?.tagName ? node.tagName.toLowerCase() : '',
+          role: node?.getAttribute?.('role') || '',
+          classSnippet: normalize((node?.getAttribute?.('class') || '').slice(0, 140)),
+          ariaLabel: normalize(node?.getAttribute?.('aria-label') || ''),
+          childCount: Number(node?.children?.length || 0),
+          textPreview: normalize(((node?.innerText || node?.textContent || '').slice(0, 300))),
+        };
+      }
+
+      function readableRootScore(node) {
+        const text = cleanedVisibleText(node).slice(0, 500);
+        const textScore = Math.min(text.length, 180);
+        const controlScore = countActionControls(node) * 80;
+        const imageScore = countVisibleImages(node) * 50;
+        const headerScore = Array.from(node.querySelectorAll('h2, h3, strong, a[role="link"], [role="link"]'))
+          .filter((child) => isVisible(child) && normalize(child.innerText || '').length >= 2)
+          .length * 12;
+        const selfTextScore = Math.min(cleanedVisibleText(node).length, 140);
+        return textScore + controlScore + imageScore + headerScore + selfTextScore;
+      }
+
+      function resolveReadableRoot(node) {
+        let best = {
+          root: node,
+          score: readableRootScore(node),
+        };
+
+        const descendants = Array.from(node.querySelectorAll('div, article, section'))
+          .filter((child) => isVisible(child))
+          .slice(0, 180);
+
+        for (const child of descendants) {
+          const score = readableRootScore(child);
+          if (score > best.score + 20) {
+            best = {
+              root: child,
+              score,
+            };
+          }
+        }
+
+        return best.root;
+      }
+
+      function findPostRootFromActionControl(control, boundaryRoot) {
+        let current = control?.parentElement || null;
+        let best = null;
+        let bestScore = 0;
+
+        while (current && current !== boundaryRoot && current !== document.body) {
+          if (isVisible(current)) {
+            const rect = current.getBoundingClientRect();
+            if (rect.width >= 240 && rect.height >= 96) {
+              const score = readableRootScore(current);
+              const controls = countActionControls(current);
+              const textLen = cleanedVisibleText(current).length;
+              if ((controls >= 1 || textLen >= 18 || countVisibleImages(current) > 0) && score > bestScore) {
+                best = current;
+                bestScore = score;
+              }
+            }
+          }
+          current = current.parentElement;
+        }
+
+        return best;
+      }
+
+      function findPostRootFromTextNode(node, boundaryRoot) {
+        let current = node?.parentElement || null;
+        let best = null;
+        let bestScore = 0;
+
+        while (current && current !== boundaryRoot && current !== document.body) {
+          if (isVisible(current)) {
+            const rect = current.getBoundingClientRect();
+            const textLen = cleanedVisibleText(current).length;
+            if (rect.width >= 240 && rect.height >= 96 && textLen >= 24) {
+              const score = readableRootScore(current) + (countActionControls(current) * 40);
+              if (score > bestScore) {
+                best = current;
+                bestScore = score;
+              }
+            }
+          }
+          current = current.parentElement;
+        }
+
+        return best;
+      }
+
+      function collectCandidateRoots(container) {
+        const selectors = [
+          'div[role="article"]',
+          '[data-pagelet^="FeedUnit_"]',
+          '[data-pagelet*="FeedUnit"]',
+          '[aria-posinset]',
+        ];
+        const raw = selectors.flatMap((selector) => Array.from(container.querySelectorAll(selector)));
+        const actionControls = Array.from(container.querySelectorAll('button,[role="button"],a[href],span,div'))
+          .filter((node) => isVisible(node))
+          .filter((node) => matchesControl(node, /(?:^|\b)(like|comment|share|reply)(?:\b|$)/i));
+        const textBlocks = Array.from(container.querySelectorAll('div, span, p, a, strong, h2, h3'))
+          .filter((node) => isVisible(node))
+          .filter((node) => {
+            const text = cleanedVisibleText(node);
+            return text.length >= 28 && !looksLikeTimestamp(text) && !looksLikeUiOnlyText(text);
+          });
+        const mediaNodes = Array.from(container.querySelectorAll('img'))
+          .filter((node) => isVisible(node))
+          .filter((node) => {
+            const rect = node.getBoundingClientRect();
+            return rect.width >= 100 && rect.height >= 100;
+          });
+        const roots = [];
+        const seen = new Set();
+
+        const combinedCandidates = [
+          ...raw,
+          ...actionControls.map((node) => findPostRootFromActionControl(node, container)).filter(Boolean),
+          ...textBlocks.map((node) => findPostRootFromTextNode(node, container)).filter(Boolean),
+          ...mediaNodes.map((node) => findPostRootFromTextNode(node, container)).filter(Boolean),
+        ];
+
+        for (const candidate of combinedCandidates) {
+          if (!isVisible(candidate)) {
+            continue;
+          }
+          const resolved = resolveReadableRoot(candidate);
+          if (!resolved || !isVisible(resolved)) {
+            continue;
+          }
+          const rect = resolved.getBoundingClientRect();
+          const key = `${Math.round(rect.top)}|${Math.round(rect.left)}|${Math.round(rect.width)}|${Math.round(rect.height)}`;
+          if (seen.has(key)) {
+            continue;
+          }
+          seen.add(key);
+          roots.push(resolved);
+        }
+
+        return roots;
+      }
+
       function findBestFeedContainer() {
         const candidates = [
           ...Array.from(document.querySelectorAll('[role="feed"]')),
           ...Array.from(document.querySelectorAll('div[role="main"], main')),
-        ]
-          .filter((node, index, all) => node && isVisible(node) && all.indexOf(node) === index);
+          document.body,
+        ].filter((node, index, all) => node && isVisible(node) && all.indexOf(node) === index);
 
         let best = null;
+        const ranked = [];
         for (const candidate of candidates) {
-          const articles = getTopLevelArticles(candidate).filter((article) => isVisible(article));
+          const articles = collectCandidateRoots(candidate);
           const rect = candidate.getBoundingClientRect();
           const score = (articles.length * 10_000) + Math.max(0, Math.round(rect.width * rect.height));
+          ranked.push({
+            container: candidate,
+            articles,
+            score,
+          });
           if (!best || score > best.score) {
             best = {
               container: candidate,
@@ -699,7 +999,10 @@ function createFeedApi({
           }
         }
 
-        return best;
+        return {
+          best,
+          ranked: ranked.sort((left, right) => right.score - left.score),
+        };
       }
 
       function describeFeedContainer(choice) {
@@ -720,12 +1023,42 @@ function createFeedApi({
         };
       }
 
+      function articleLooksSponsored(article) {
+        const text = normalize((article.innerText || '').slice(0, 300));
+        return /\bsponsored\b|\bsuggested for you\b|\bpaid partnership\b/i.test(text);
+      }
+
       const feedChoice = findBestFeedContainer();
-      const feedContainerStatus = describeFeedContainer(feedChoice);
-      const articles = (feedChoice?.articles?.length ? feedChoice.articles : getTopLevelArticles(document.body))
-        .filter((article) => isVisible(article));
-      const anchors = [];
+      const feedContainerStatus = describeFeedContainer(feedChoice?.best);
+      const articles = [];
+      const seenArticleKeys = new Set();
+      for (const choice of (feedChoice?.ranked || [])) {
+        for (const article of choice.articles || []) {
+          if (!isVisible(article)) {
+            continue;
+          }
+          const rect = article.getBoundingClientRect();
+          const key = `${Math.round(rect.top)}|${Math.round(rect.left)}|${Math.round(rect.width)}|${Math.round(rect.height)}`;
+          if (seenArticleKeys.has(key)) {
+            continue;
+          }
+          seenArticleKeys.add(key);
+          articles.push(article);
+          if (articles.length >= Math.max(limit * 3, 24)) {
+            break;
+          }
+        }
+        if (articles.length >= Math.max(limit * 3, 24)) {
+          break;
+        }
+      }
+      if (!articles.length) {
+        articles.push(...collectCandidateRoots(document.body).slice(0, Math.max(limit * 3, 24)));
+      }
+        const anchors = [];
       const rejections = [];
+      let readableTextCount = 0;
+      let extractionFailureCount = 0;
       const pageMode = (() => {
         const url = window.location.href || '';
         if (/\/posts\/|story_fbid=|\/permalink\//i.test(url)) {
@@ -740,12 +1073,21 @@ function createFeedApi({
         return 'feed';
       })();
 
-      function reject(articleIndex, reason, detail = '', article = null) {
+      function reject(articleIndex, reason, detail = '', article = null, extra = {}) {
+        const selectorId = article?.getAttribute?.('data-agent-visible-post-id')
+          || `agent-visible-post-${articleIndex + 1}`;
+        if (article) {
+          article.setAttribute('data-agent-visible-post-id', selectorId);
+        }
+        const nodeMeta = article ? describeNode(article) : {};
         rejections.push({
           articleIndex,
+          selectorId,
           reason,
           detail,
           sampleText: article ? normalize((article.innerText || '').slice(0, 400)) : '',
+          ...nodeMeta,
+          ...extra,
         });
       }
 
@@ -756,8 +1098,30 @@ function createFeedApi({
           continue;
         }
 
+        const rootSelector = article.tagName
+          ? [
+              article.tagName.toLowerCase(),
+              article.getAttribute('role') ? `[role="${article.getAttribute('role')}"]` : '',
+              article.getAttribute('data-pagelet') ? `[data-pagelet="${article.getAttribute('data-pagelet')}"]` : '',
+              article.getAttribute('class')
+                ? `.${String(article.getAttribute('class') || '').trim().split(/\s+/).slice(0, 3).join('.')}`
+                : '',
+            ].join('')
+          : 'unknown';
+
+        if (articleLooksSponsored(article)) {
+          reject(articleIndex, 'sponsored_or_suggested', '', article, {
+            rootSelector,
+            detailFallbackAttempted: false,
+          });
+          continue;
+        }
+
         if (pageMode === 'post_detail' && articleIndex > 0) {
-          reject(articleIndex, 'detail_view_non_primary_article');
+          reject(articleIndex, 'detail_view_non_primary_article', '', article, {
+            rootSelector,
+            detailFallbackAttempted: false,
+          });
           continue;
         }
 
@@ -769,27 +1133,52 @@ function createFeedApi({
         const shareButton = findActionButton(article, /^share$/i);
         const actionControls = [likeButton, commentButton, shareButton].filter(Boolean);
         const controlNames = describeControls({ likeButton, commentButton, shareButton, replyButton });
+        const actionBarFound = actionControls.length > 0 || Boolean(replyButton);
         const timestampText = normalize(timestampNode?.innerText || '') || fallbackTimestampText(article);
         const timestampConfidence = timestampText
           ? (timestampNode ? 'strict' : 'fallback')
           : 'missing';
+        const selectorId = article.getAttribute('data-agent-visible-post-id')
+          || `agent-visible-post-${articleIndex + 1}`;
+        article.setAttribute('data-agent-visible-post-id', selectorId);
+        const permalinkNode = (timestampNode?.closest('a[href]')) || Array.from(article.querySelectorAll('a[href]'))
+          .find((node) => /\/posts\/|story_fbid=|\/permalink\//i.test(node.getAttribute('href') || '')) || null;
+        const rawPostUrl = permalinkNode ? permalinkNode.getAttribute('href') || '' : '';
+        const postUrl = rawPostUrl
+          ? (rawPostUrl.startsWith('http') ? rawPostUrl : `${window.location.origin}${rawPostUrl}`)
+          : '';
 
         if (pageMode !== 'search_results' && String(validationMode || 'engagement') === 'business' && actionControls.length < 2 && !replyButton) {
-          reject(articleIndex, 'weak_action_bar', `controls=${controlNames.join(',') || 'none'}`, article);
+          reject(articleIndex, 'weak_action_bar', `controls=${controlNames.join(',') || 'none'}`, article, {
+            rootSelector,
+            headerFound: Boolean(authorNode || timestampNode),
+            actionBarFound,
+            postUrl,
+            imageCount: 0,
+            rawTextLength: 0,
+            cleanedTextLength: 0,
+            detailFallbackAttempted: false,
+          });
           continue;
         }
 
         const headerBottom = findHeaderBoundary(article, authorNode, timestampNode);
         const actionTop = findActionBarTop(article, actionControls);
+        const rootInnerText = normalize(article.innerText || article.textContent || '');
+        const rootVisibleText = extractVisibleArticleText(cleanFallbackArticleText(rootInnerText));
         const domExtraction = extractPostDomText(article, headerBottom, actionTop);
         const structuredBodyText = domExtraction.structuredBodyText;
         const deepBodyText = domExtraction.deepBodyText;
-        const rawFallbackArticleText = domExtraction.domText
-          ? ''
-          : extractFullVisibleArticleText(article);
-        const rawText = domExtraction.domText || rawFallbackArticleText;
+        const captionFallbackText = extractCaptionFallbackText(article, headerBottom, actionTop);
+        const rawFallbackArticleText = extractFullVisibleArticleText(article);
+        const rawText = rootVisibleText || domExtraction.domText || captionFallbackText || rawFallbackArticleText;
         const cleanedFallbackText = rawFallbackArticleText ? extractVisibleArticleText(cleanFallbackArticleText(rawFallbackArticleText)) : '';
-        const mainBodyText = domExtraction.domText || cleanedFallbackText;
+        const tolerantFallbackText = cleanFallbackArticleText([
+          rootVisibleText,
+          captionFallbackText,
+          cleanedFallbackText,
+        ].filter(Boolean).join('\n'));
+        const mainBodyText = rootVisibleText || domExtraction.domText || tolerantFallbackText;
         const attachedImages = collectAttachedImages(article, headerBottom);
         const imageAltText = attachedImages
           .map((item) => normalize(item.altText))
@@ -803,15 +1192,29 @@ function createFeedApi({
         const visibleFallbackLength = normalize(cleanedFallbackText).length;
         const imageTextLength = normalize(imageAltText).length;
         const painSignalCount = countPainSignals([mainBodyText, imageAltText].filter(Boolean).join('\n'));
+        if (rawTextLength > 0 || cleanedTextLength > 0 || visibleFallbackLength > 0) {
+          readableTextCount += 1;
+        }
         const hasMeaningfulFallbackText = fallbackUsed
           && (cleanedTextLength >= Math.max(10, minBodyLength - 3) || painSignalCount > 0);
         const hasVisibleContent = rawTextLength > 0 || visibleFallbackLength > 0 || attachedImages.length > 0;
         if ((!mainBodyText || cleanedTextLength < minBodyLength) && !hasMeaningfulFallbackText && !hasVisibleContent) {
+          extractionFailureCount += 1;
           reject(
             articleIndex,
             'no_body_between_header_and_action_bar',
-            `raw_len=${rawTextLength};clean_len=${cleanedTextLength};fallback=${fallbackUsed ? 'yes' : 'no'};images=${attachedImages.length};signals=${painSignalCount}`,
-            article
+            `root=${rootSelector};header=${authorNode || timestampNode ? 'yes' : 'no'};action_bar=${actionBarFound ? 'yes' : 'no'};raw_len=${rawTextLength};clean_len=${cleanedTextLength};fallback=${fallbackUsed ? 'yes' : 'no'};images=${attachedImages.length};signals=${painSignalCount}`,
+            article,
+            {
+              rootSelector,
+              headerFound: Boolean(authorNode || timestampNode),
+              actionBarFound,
+              postUrl,
+              imageCount: attachedImages.length,
+              rawTextLength,
+              cleanedTextLength,
+              detailFallbackAttempted: false,
+            }
           );
           continue;
         }
@@ -843,20 +1246,25 @@ function createFeedApi({
           imageTextLength,
           visibleTextLength: Math.max(rawTextLength, visibleFallbackLength),
         })) {
+          extractionFailureCount += 1;
           reject(
             articleIndex,
             'invalid_visible_post_candidate',
-            `mode=${validationMode};controls=${controlNames.join(',') || 'none'};body_len=${cleanedTextLength};fallback_len=${visibleFallbackLength};image_len=${imageTextLength};raw_len=${rawTextLength};fallback=${fallbackUsed ? 'yes' : 'no'};images=${attachedImages.length};signals=${painSignalCount}`,
-            article
+            `root=${rootSelector};header=${authorNode || timestampNode ? 'yes' : 'no'};action_bar=${actionBarFound ? 'yes' : 'no'};mode=${validationMode};controls=${controlNames.join(',') || 'none'};body_len=${cleanedTextLength};fallback_len=${visibleFallbackLength};image_len=${imageTextLength};raw_len=${rawTextLength};fallback=${fallbackUsed ? 'yes' : 'no'};images=${attachedImages.length};signals=${painSignalCount}`,
+            article,
+            {
+              rootSelector,
+              headerFound: Boolean(authorNode || timestampNode),
+              actionBarFound,
+              postUrl,
+              imageCount: attachedImages.length,
+              rawTextLength,
+              cleanedTextLength,
+              detailFallbackAttempted: false,
+            }
           );
           continue;
         }
-        const urlNode = (timestampNode?.closest('a[href]')) || Array.from(article.querySelectorAll('a[href]'))
-          .find((node) => /\/posts\/|story_fbid=|\/permalink\//i.test(node.getAttribute('href') || '')) || null;
-        const postUrl = urlNode ? urlNode.getAttribute('href') || '' : '';
-        const selectorId = article.getAttribute('data-agent-visible-post-id')
-          || `agent-visible-post-${articleIndex + 1}`;
-        article.setAttribute('data-agent-visible-post-id', selectorId);
 
         anchors.push({
           articleIndex,
@@ -873,7 +1281,7 @@ function createFeedApi({
           cleanedTextLength,
           painSignalCount,
           textFromDom: domExtraction.domText,
-          textFromVisibleFallback: cleanedFallbackText,
+          textFromVisibleFallback: tolerantFallbackText,
           textFromImages: imageAltText,
           domTextLength: normalize(domExtraction.domText).length,
           fallbackTextLength: visibleFallbackLength,
@@ -893,6 +1301,10 @@ function createFeedApi({
       return {
         anchors,
         rejections,
+        candidateRootCount: articles.length,
+        readableTextCount,
+        extractionFailureCount,
+        eligibleCount: anchors.length,
         articleCount: articles.length,
         pageMode,
         url: window.location.href || '',
@@ -901,15 +1313,21 @@ function createFeedApi({
       };
     }, { limit: Math.max(limit * 2, 20), validationMode: String(validationMode || 'engagement') });
 
-    const desiredCount = Math.min(Math.max(1, Number(limit || 1)), 5);
-    const maxAttempts = Math.max(2, Math.min(Number(scrollRounds || 2) + 2, 6));
+    const desiredCount = Math.max(Math.max(1, Number(limit || 1)), 8);
+    const maxAttempts = Math.max(4, Math.min(Number(scrollRounds || 2) + 4, 8));
     const aggregateAnchors = [];
+    const aggregateRejections = [];
     const seenKeys = new Set();
+    const seenRejections = new Set();
     let extracted = null;
+    let inspectedArticleCount = 0;
+    let detailFallbackDebug = [];
 
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
       extracted = await extractInPage();
       const rawAnchors = Array.isArray(extracted?.anchors) ? extracted.anchors : [];
+      const rawRejections = Array.isArray(extracted?.rejections) ? extracted.rejections : [];
+      inspectedArticleCount += Number(extracted?.articleCount || 0);
 
       for (const rawAnchor of rawAnchors) {
         const href = String(rawAnchor.postUrl || '').trim();
@@ -933,19 +1351,28 @@ function createFeedApi({
         });
       }
 
+      for (const rejection of rawRejections) {
+        const key = `${rejection.articleIndex}|${rejection.reason}|${rejection.selectorId || ''}|${rejection.postUrl || ''}`;
+        if (seenRejections.has(key)) {
+          continue;
+        }
+        seenRejections.add(key);
+        aggregateRejections.push(rejection);
+      }
+
       if (aggregateAnchors.length >= desiredCount) {
         break;
       }
 
       if (attempt < maxAttempts - 1) {
-        await page.mouse.wheel(0, 900).catch(() => null);
+        await page.mouse.wheel(0, attempt === 0 ? 500 : 1000).catch(() => null);
         await page.waitForTimeout(randomBetween(1_500, 2_200));
       }
     }
 
     const anchors = [];
     const seenPostIds = new Set();
-    const normalizedRejections = Array.isArray(extracted?.rejections) ? extracted.rejections : [];
+    const normalizedRejections = aggregateRejections;
     const rawAnchors = aggregateAnchors;
 
     for (const rawAnchor of rawAnchors) {
@@ -991,13 +1418,44 @@ function createFeedApi({
       }
     }
 
+    if (enableDetailFallback && anchors.length < Math.max(1, Number(limit || 1))) {
+      const detailRetry = await retryRejectedArticlesInDetail(page, normalizedRejections, {
+        limit: Math.min(3, Math.max(1, Number(limit || 1))),
+        validationMode,
+      });
+      detailFallbackDebug = detailRetry.debug || [];
+      for (const recovered of detailRetry.recovered || []) {
+        const dedupeKey = String(recovered.postId || recovered.postUrl || recovered.selectorId || '').trim();
+        if (!dedupeKey || seenPostIds.has(dedupeKey)) {
+          continue;
+        }
+        seenPostIds.add(dedupeKey);
+        anchors.push(recovered);
+        if (anchors.length >= limit) {
+          break;
+        }
+      }
+      for (const attempt of detailFallbackDebug) {
+        const rejection = normalizedRejections.find((item) => item.articleIndex === attempt.articleIndex && item.postUrl === attempt.postUrl);
+        if (rejection) {
+          rejection.detailFallbackAttempted = true;
+          rejection.detailFallbackRecovered = Boolean(attempt.recovered);
+        }
+      }
+    }
+
     const enrichedAnchors = await enrichAnchorsMultimodally(page, anchors, { validationMode });
 
     if (returnMeta) {
       return {
         posts: enrichedAnchors,
         debug: {
+          candidateRootCount: Number(extracted?.candidateRootCount || extracted?.articleCount || 0),
           articleCount: Number(extracted?.articleCount || 0),
+          readableTextCount: Number(extracted?.readableTextCount || 0),
+          extractionFailureCount: Number(extracted?.extractionFailureCount || 0),
+          eligibleCount: Number(extracted?.eligibleCount || 0),
+          inspectedArticleCount,
           url: String(extracted?.url || page.url() || ''),
           keptCount: enrichedAnchors.length,
           pageMode: String(extracted?.pageMode || 'unknown'),
@@ -1009,6 +1467,7 @@ function createFeedApi({
             topLevelArticleCount: 0,
           },
           scanAttempts: maxAttempts,
+          detailFallbackDebug,
           rejections: normalizedRejections,
         },
       };

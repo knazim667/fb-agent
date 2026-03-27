@@ -1290,16 +1290,26 @@ function summarizeCandidateMisses(candidates = [], { fallback = '' } = {}) {
 }
 
 function summarizeObservationWithoutPromotion({
+  candidateRootCount = 0,
   articleCount = 0,
+  readableTextCount = 0,
+  extractionFailureCount = 0,
+  eligibleCount = 0,
   keptCount = 0,
   fallback = '',
+  mode = 'general',
 } = {}) {
   const lines = [];
-  if (articleCount > 0 || keptCount > 0) {
-    lines.push(`I did see visible content here: ${articleCount} articles and ${keptCount} kept candidates.`);
-    lines.push('They were not promoted yet because the extracted text was weak, partial, or not clearly tied to the business pain signals.');
+  if (candidateRootCount > 0 || articleCount > 0 || keptCount > 0 || readableTextCount > 0) {
+    lines.push(`I inspected ${candidateRootCount || articleCount} candidate ${candidateRootCount === 1 || articleCount === 1 ? 'root' : 'roots'}.`);
+    lines.push(`Readable text found in ${readableTextCount} candidates. Extraction failed on ${extractionFailureCount} candidates. ${eligibleCount || keptCount} ${eligibleCount === 1 || keptCount === 1 ? 'candidate is' : 'candidates are'} eligible so far.`);
+    lines.push(
+      mode === 'business'
+        ? 'The visible posts were not promoted yet because the readable text stayed weak, partial, or not clearly tied to the business pain signals.'
+        : 'The visible posts were not promoted yet because the readable text stayed weak, partial, or not reliable enough for safe engagement.'
+    );
   } else {
-    lines.push('I did not get enough structured candidates from the page yet.');
+    lines.push('I did not get enough candidate roots from the page yet.');
   }
   if (fallback) {
     lines.push(`Fallback tried or next: ${fallback}`);
@@ -1818,7 +1828,7 @@ function startOperatorConsole(deps) {
   function formatFacebookObservationDebug(observation) {
     const debugInfo = observation?.postsDebug || {};
     const lines = [
-      `facebook observe: state=${observation?.state || 'unknown'} url=${observation?.url || page.url()} cards=${debugInfo.articleCount || 0} kept=${debugInfo.keptCount || (observation?.posts || []).length}`,
+      `facebook observe: state=${observation?.state || 'unknown'} url=${observation?.url || page.url()} cards=${debugInfo.articleCount || 0} candidate_roots=${debugInfo.candidateRootCount || debugInfo.articleCount || 0} readable=${debugInfo.readableTextCount || 0} extraction_failures=${debugInfo.extractionFailureCount || 0} eligible=${debugInfo.eligibleCount || debugInfo.keptCount || (observation?.posts || []).length} inspected=${debugInfo.inspectedArticleCount || debugInfo.articleCount || 0} kept=${debugInfo.keptCount || (observation?.posts || []).length}`,
     ];
     if (debugInfo.feedContainerStatus) {
       lines.push(
@@ -1827,7 +1837,20 @@ function startOperatorConsole(deps) {
     }
     for (const rejection of (debugInfo.rejections || []).slice(0, 20)) {
       lines.push(
-        `rejected article ${rejection.articleIndex}: ${rejection.reason}${rejection.detail ? ` (${rejection.detail})` : ''}`
+        `rejected article ${rejection.articleIndex}: root=${rejection.rootSelector || 'unknown'} header=${rejection.headerFound ? 'yes' : 'no'} action_bar=${rejection.actionBarFound ? 'yes' : 'no'} raw_text_len=${rejection.rawTextLength || 0} cleaned_text_len=${rejection.cleanedTextLength || 0} image_count=${rejection.imageCount || 0} detail_retry=${rejection.detailFallbackAttempted ? 'yes' : 'no'} reason=${rejection.reason}${rejection.detail ? ` (${rejection.detail})` : ''}`
+      );
+      if (Number(rejection.articleIndex) < 3) {
+        lines.push(
+          `candidate snapshot ${rejection.articleIndex}: tag=${rejection.rootTag || 'unknown'} role=${rejection.role || 'none'} class=${rejection.classSnippet || 'none'} aria=${rejection.ariaLabel || 'none'} children=${rejection.childCount || 0}`
+        );
+        if (rejection.textPreview) {
+          lines.push(`candidate text ${rejection.articleIndex}: ${rejection.textPreview}`);
+        }
+      }
+    }
+    for (const attempt of (debugInfo.detailFallbackDebug || []).slice(0, 10)) {
+      lines.push(
+        `detail fallback article ${attempt.articleIndex}: attempted=${attempt.attempted ? 'yes' : 'no'} recovered=${attempt.recovered ? 'yes' : 'no'} url=${attempt.postUrl || 'none'}${attempt.error ? ` error=${attempt.error}` : ''}`
       );
     }
     for (const kept of (observation?.posts || []).slice(0, 10)) {
@@ -2710,10 +2733,26 @@ function startOperatorConsole(deps) {
         );
       }
       if (context.currentGroup?.name) {
-        return `I opened ${context.currentGroup.name}, but I could not read visible original posts right now.`;
+        return summarizeObservationWithoutPromotion({
+          candidateRootCount: Number(observation?.postsDebug?.candidateRootCount || observation?.postsDebug?.articleCount || 0),
+          articleCount: Number(observation?.postsDebug?.inspectedArticleCount || observation?.postsDebug?.articleCount || 0),
+          readableTextCount: Number(observation?.postsDebug?.readableTextCount || 0),
+          extractionFailureCount: Number(observation?.postsDebug?.extractionFailureCount || 0),
+          eligibleCount: Number(observation?.postsDebug?.eligibleCount || 0),
+          keptCount: Number(observation?.postsDebug?.keptCount || 0),
+          fallback: `I checked layered extraction, scroll retry, and detail-view fallback in ${context.currentGroup.name}, but I still could not promote any readable original posts yet.`,
+        });
       }
       if (/^facebook_home_feed$/i.test(String(context.currentSurface || ''))) {
-        return 'I opened your home feed, but I could not read visible original posts right now.';
+        return summarizeObservationWithoutPromotion({
+          candidateRootCount: Number(observation?.postsDebug?.candidateRootCount || observation?.postsDebug?.articleCount || 0),
+          articleCount: Number(observation?.postsDebug?.inspectedArticleCount || observation?.postsDebug?.articleCount || 0),
+          readableTextCount: Number(observation?.postsDebug?.readableTextCount || 0),
+          extractionFailureCount: Number(observation?.postsDebug?.extractionFailureCount || 0),
+          eligibleCount: Number(observation?.postsDebug?.eligibleCount || 0),
+          keptCount: Number(observation?.postsDebug?.keptCount || 0),
+          fallback: 'I checked layered extraction, scroll retry, and detail-view fallback on your home feed, but I still could not promote any readable original posts yet.',
+        });
       }
       return summarizeRecentPostsFromDb(getCollections, callOllama, model);
     }
@@ -3094,7 +3133,15 @@ function startOperatorConsole(deps) {
 
       if (!recentPosts.length) {
         await persistOperatorContext(state, upsertAgentState);
-        return `I opened ${surface === 'feed' ? 'your home feed' : targetGroup.name}, but I couldn't find visible posts to like right now.`;
+        return summarizeObservationWithoutPromotion({
+          candidateRootCount: Number(observation?.postsDebug?.candidateRootCount || observation?.postsDebug?.articleCount || 0),
+          articleCount: Number(observation?.postsDebug?.inspectedArticleCount || observation?.postsDebug?.articleCount || 0),
+          readableTextCount: Number(observation?.postsDebug?.readableTextCount || 0),
+          extractionFailureCount: Number(observation?.postsDebug?.extractionFailureCount || 0),
+          eligibleCount: Number(observation?.postsDebug?.eligibleCount || 0),
+          keptCount: Number(observation?.postsDebug?.keptCount || 0),
+          fallback: `I tried layered feed extraction, scroll retry, and detail-view fallback in ${surface === 'feed' ? 'your home feed' : targetGroup.name}, but I still do not have reliable posts to like yet.`,
+        });
       }
 
       let likedCount = 0;
@@ -3210,7 +3257,15 @@ function startOperatorConsole(deps) {
 
       if (!visiblePosts.length) {
         await persistOperatorContext(state, upsertAgentState);
-        return `I opened ${surface === 'feed' ? 'your home feed' : targetGroup.name}, but I couldn't find visible original posts to comment on right now.`;
+        return summarizeObservationWithoutPromotion({
+          candidateRootCount: Number(observation?.postsDebug?.candidateRootCount || observation?.postsDebug?.articleCount || 0),
+          articleCount: Number(observation?.postsDebug?.inspectedArticleCount || observation?.postsDebug?.articleCount || 0),
+          readableTextCount: Number(observation?.postsDebug?.readableTextCount || 0),
+          extractionFailureCount: Number(observation?.postsDebug?.extractionFailureCount || 0),
+          eligibleCount: Number(observation?.postsDebug?.eligibleCount || 0),
+          keptCount: Number(observation?.postsDebug?.keptCount || 0),
+          fallback: `I tried layered feed extraction, scroll retry, and detail-view fallback in ${surface === 'feed' ? 'your home feed' : targetGroup.name}, but I still do not have reliable posts to comment on yet.`,
+        });
       }
 
       const candidatePosts = selection === 'first'
